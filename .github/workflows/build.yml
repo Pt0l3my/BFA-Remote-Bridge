@@ -103,7 +103,7 @@ jobs:
           $exports -split "`n" | Select-String "SKSEPlugin"
           $deps -split "`n" | Select-String "\.dll"
 
-      - name: Lay the mod out (a Mod Organizer 2 mod: its root is the game's Data folder)
+      - name: Lay the mod out as a Mod Organizer 2 mod, its root the game's Data folder
         shell: bash
         run: |
           version=$(sed -n 's/^project(BFARemoteBridge VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
