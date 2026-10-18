@@ -687,3 +687,33 @@ TEST(ForwardBfaModels) {
     for (const auto& l : h.log)
         if (l.rfind("Check ", 0) == 0 || l.rfind("Model ", 0) == 0) std::printf("        log: %s\n", l.c_str());
 }
+
+// An input the protocol can't carry (a bool tensor): the line gets NaN, logged once per session, and no backoff.
+TEST(ForwardUnsupportedInputAnswersNan) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 1);
+    bool flags[2] = {true, false};
+    OrtValue* b = nullptr;
+    const std::int64_t shape[] = {2};
+    Ok(h.api->CreateTensorWithDataAsOrtValue(h.cpu, flags, sizeof flags, shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, &b));
+    std::vector<OrtValue*> values = in.values;
+    values[4] = b;
+    for (int k = 0; k < 3; ++k) {
+        Outputs out(h.api, 5);
+        CHECK(h.api->Run(session, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
+        CHECK(IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK_EQ(h.CountLogged("which the protocol can't carry"), 1);
+    CHECK(!h.bridge.Connection().BackingOff());
+    {
+        Outputs out(h.api, 5);  // the next proper line goes through
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    h.api->ReleaseValue(b);
+    h.api->ReleaseSession(session);
+}
