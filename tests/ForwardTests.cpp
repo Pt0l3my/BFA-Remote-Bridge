@@ -26,6 +26,7 @@
 #include "Test.h"
 #include "core/Bridge.h"
 #include "core/Scrub.h"
+#include "core/Status.h"
 
 extern char** environ;
 
@@ -364,7 +365,7 @@ TEST(ForwardIntoCallersOutputs) {
         CHECK(Bytes(h.api, outs[k]) == local[k]);
         h.api->ReleaseValue(outs[k]);
     }
-    // a caller's value of the wrong shape: the answer doesn't fit, the line gets NaN and the backoff starts
+    // a caller's value of the wrong shape: the answer doesn't fit, and the line gets NaN
     std::vector<float> wrong(3, 0.f);
     OrtValue* wv = nullptr;
     const std::int64_t wShape[] = {1, 3};
@@ -435,13 +436,16 @@ TEST(ForwardCreateSessionRefusedForEachReason) {
     fs::remove_all(broken);
 }
 
-TEST(ForwardFailuresAnswerNanAndBackOff) {
+// A failure the connection can't survive (a malformed answer, the wrong request id) pauses the bridge: NaN at once,
+// nothing more logged, until the background thread's HELLO is answered. An answer that doesn't fit the call falls back
+// without a pause. A single timeout keeps the connection; a second in a row pauses.
+TEST(ForwardFailuresAnswerNanAndPause) {
     Need();
-    for (const auto& [what, args, timeout] : std::vector<std::tuple<const char*, std::vector<std::string>, int>>{
-             {"malformed answer", {"--fault", "malformed"}, 2000},
-             {"wrong request id", {"--fault", "request-id"}, 2000},
-             {"wrong output name", {"--fault", "output-name"}, 2000},
-             {"timeout", {"--delay-ms", "1500"}, 300}}) {
+    for (const auto& [what, args, timeout, pauses] : std::vector<std::tuple<const char*, std::vector<std::string>, int, bool>>{
+             {"malformed answer", {"--fault", "malformed"}, 2000, true},
+             {"wrong request id", {"--fault", "request-id"}, 2000, true},
+             {"wrong output name", {"--fault", "output-name"}, 2000, false},
+             {"timeouts", {"--delay-ms", "1500"}, 300, true}}) {
         Server server(Models(), args);
         Settings s = On(server.Port());
         s.timeoutMs = timeout;
@@ -449,37 +453,131 @@ TEST(ForwardFailuresAnswerNanAndBackOff) {
         OrtSession* session = nullptr;
         Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));  // HELLO is fine; RUN isn't
         TinyInputs in(h.api, h.cpu, 3);
-        const auto start = Clock::now();
-        {
+        const auto run = [&] {
             Outputs out(h.api, 5);
             CHECK(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
             for (auto* v : out.v) CHECK(IsNanAnswer(h.api, v));
+        };
+        const auto start = Clock::now();
+        run();
+        if (std::string(what) == "timeouts") {
+            CHECK(!h.bridge.Connection().Paused());  // one timeout keeps the connection
+            run();
         }
-        const int lines = h.CountLogged("for the next 10 seconds");
-        CHECK_EQ(lines, 1);
-        // during the backoff: NaN at once, nothing more logged
+        CHECK_EQ(h.bridge.Connection().Paused(), pauses);
+        CHECK_EQ(h.CountLogged("until the server answers again"), pauses ? 1 : 0);
+        CHECK(h.CountLogged("tiny.onnx: not answered (") >= 1);
         const auto during = Clock::now();
         for (int k = 0; k < 20; ++k) {
             Outputs out(h.api, 5);
             CHECK(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
             CHECK(IsNanAnswer(h.api, out.v[0]));
+            if (!pauses) break;
         }
         const auto fast = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - during).count();
-        CHECK(fast < 200);
-        CHECK_EQ(h.CountLogged("for the next 10 seconds"), 1);
-        // after it: tried again (and failed again, so one more line)
-        g_now += std::chrono::seconds(11);
-        {
-            Outputs out(h.api, 5);
-            CHECK(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
+        if (pauses) {
+            CHECK(fast < 200);  // during the pause: NaN at once, nothing more logged
+            CHECK_EQ(h.CountLogged("until the server answers again"), 1);
+            // the background thread's HELLO ends the pause, and the next run tries again
+            g_now += std::chrono::seconds(1);
+            h.bridge.Connection().Tick();
+            CHECK(!h.bridge.Connection().Paused());
+            CHECK_EQ(h.CountLogged("The pause ends after 1 s"), 1);
         }
-        CHECK_EQ(h.CountLogged("for the next 10 seconds"), 2);
+        const Stats st = h.bridge.Statistics();
+        CHECK_EQ(st.forwarded, 0u);
+        const Counters c = h.bridge.Connection().Totals();
+        CHECK_EQ(c.answered, 0u);
+        CHECK_EQ(c.fallbacks, st.unanswered);
         CHECK(h.bridge.IsBridgeSession(session));  // the model stays
-        std::printf("        %s: first answer after %lld ms, 20 runs during the backoff in %lld ms\n", what,
+        std::printf("        %s: first answer after %lld ms, the next runs in %lld ms; %llu fallbacks, %llu timeouts\n", what,
                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(during - start).count()),
-                    static_cast<long long>(fast));
+                    static_cast<long long>(fast), static_cast<unsigned long long>(c.fallbacks),
+                    static_cast<unsigned long long>(c.timeouts));
         h.api->ReleaseSession(session);
     }
+}
+
+// The server answers in order: a late RUN_OK after a single timeout is read and discarded by the next run, which gets
+// its own answer on the same connection.
+TEST(ForwardLateAnswerIsDiscarded) {
+    Need();
+    Server server(Models(), {"--delay-ms", "600", "--fault-count", "1"});
+    Settings s = On(server.Port());
+    s.timeoutMs = 300;
+    s.logDetail = LogDetail::Detailed;
+    Harness h(s);
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 3);
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(IsNanAnswer(h.api, out.v[0]));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // the late answer is on its way
+    const int connects = h.bridge.Connection().Reconnects();
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK_EQ(h.bridge.Connection().Reconnects(), connects);
+    CHECK(!h.bridge.Connection().Paused());
+    CHECK_EQ(h.CountLogged("Discarded the late answer to request"), 1);
+    CHECK(h.bridge.Connection().Totals() == (Counters{1, 1, 1}));
+    h.api->ReleaseSession(session);
+}
+
+// A late ERROR that ends the connection (here 7, the server stopping), then the background thread's reconnect.
+TEST(ForwardLateClosingErrorAndTheReconnect) {
+    Need();
+    Server server(Models(), {"--delay-ms", "600", "--run-error", "7", "--fault-count", "1"});
+    Settings s = On(server.Port());
+    s.timeoutMs = 300;
+    Harness h(s);
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 3);
+    const auto run = [&] {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        return !IsNanAnswer(h.api, out.v[0]);
+    };
+    CHECK(!run());
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(!run());  // the late ERROR 7 comes first: the connection ends
+    CHECK(h.bridge.Connection().Paused());
+    CHECK(h.Logged("which ends the connection"));
+    g_now += std::chrono::seconds(1);
+    h.bridge.Connection().Tick();
+    CHECK(!h.bridge.Connection().Paused());
+    CHECK(run());
+    h.api->ReleaseSession(session);
+}
+
+// PING after a minute idle, answered by PONG on the main connection.
+TEST(ForwardIdlePing) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 3);
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+    }
+    g_now += std::chrono::seconds(61);
+    h.bridge.Connection().Tick();
+    CHECK_EQ(h.bridge.Connection().Pings(), 1);
+    CHECK(!h.bridge.Connection().Paused());
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    h.api->ReleaseSession(session);
 }
 
 TEST(ForwardServerGoneAfterLoad) {
@@ -493,7 +591,8 @@ TEST(ForwardServerGoneAfterLoad) {
     Outputs out(h.api, 5);
     CHECK(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
     CHECK(IsNanAnswer(h.api, out.v[0]));
-    CHECK_EQ(h.CountLogged("for the next 10 seconds"), 1);
+    CHECK_EQ(h.CountLogged("until the server answers again"), 1);
+    CHECK_EQ(h.CountLogged("tiny.onnx: not answered (no connection"), 1);
     h.api->ReleaseSession(session);
 }
 
@@ -561,9 +660,10 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     OrtSession* a = nullptr;
     OrtSession* b = nullptr;
     Ok(h.Create(folder / "tiny.onnx", {{"batch", 2}}, &a));
-    CHECK_EQ(h.bridge.Connection().HellosSent(), 1);
+    CHECK_EQ(h.bridge.Connection().SideHellos(), 1);
     Ok(h.Create(folder / "second.onnx", {{"batch", 2}}, &b));
-    CHECK_EQ(h.bridge.Connection().HellosSent(), 2);
+    CHECK_EQ(h.bridge.Connection().SideHellos(), 2);
+    CHECK_EQ(h.bridge.Connection().HellosSent(), 0);  // each load on a side connection of its own
     TinyInputs in(h.api, h.cpu, 9);
     const auto run = [&](OrtSession* s) {
         Outputs out(h.api, 5);
@@ -572,12 +672,14 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     };
     run(a);
     run(b);
-    CHECK_EQ(h.bridge.Connection().HellosSent(), 2);
+    CHECK_EQ(h.bridge.Connection().HellosSent(), 1);  // the main connection's, with both
     h.api->ReleaseSession(b);
-    run(a);  // the set changed: HELLO again, then RUN
-    CHECK_EQ(h.bridge.Connection().HellosSent(), 3);
+    run(a);  // a stays ready on the connection: no HELLO in the run
+    CHECK_EQ(h.bridge.Connection().HellosSent(), 1);
+    h.bridge.Connection().Tick();  // the set changed: the background says HELLO again
+    CHECK_EQ(h.bridge.Connection().HellosSent(), 2);
     run(a);
-    CHECK_EQ(h.bridge.Connection().HellosSent(), 3);
+    CHECK_EQ(h.bridge.Connection().HellosSent(), 2);
     h.api->ReleaseSession(a);
     fs::remove_all(folder);
 }
@@ -602,6 +704,26 @@ TEST(ForwardGpuModeIsLoggedAndPassedThrough) {
     Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s2, true));
     CHECK_EQ(h.CountLogged("set to GPU"), 1);
     h.api->ReleaseSession(s2);
+    // the notice on screen: once per session
+    int told = 0;
+    for (const auto& n : h.notices) told += n.kind == Notice::Kind::GpuMode;
+    CHECK_EQ(told, 1);
+    CHECK_EQ(NoticeText(Notice{Notice::Kind::GpuMode, {}, {}}, "4.3.2"),
+             std::string("BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."));
+    // not while notices aren't allowed
+    Settings quiet = On(server.Port());
+    quiet.showStatus = false;
+    Harness q(quiet);
+    OrtSession* s3 = nullptr;
+    Ok(q.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s3, true));
+    for (const auto& n : q.notices) CHECK(n.kind != Notice::Kind::GpuMode);
+    q.api->ReleaseSession(s3);
+    // nor in CPU mode
+    Harness cpu(On(server.Port()));
+    OrtSession* s4 = nullptr;
+    Ok(cpu.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s4));
+    for (const auto& n : cpu.notices) CHECK(n.kind != Notice::Kind::GpuMode);
+    cpu.api->ReleaseSession(s4);
 }
 
 TEST(ForwardOtherApiVersionsAreTheRealTable) {
@@ -713,7 +835,7 @@ TEST(ForwardUnsupportedInputAnswersNan) {
         CHECK(IsNanAnswer(h.api, out.v[0]));
     }
     CHECK_EQ(h.CountLogged("which the protocol can't carry"), 1);
-    CHECK(!h.bridge.Connection().BackingOff());
+    CHECK(!h.bridge.Connection().Paused());
     {
         Outputs out(h.api, 5);  // the next proper line goes through
         Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
@@ -783,13 +905,13 @@ TEST(ForwardNewestSessionReplacesALeakedOne) {
         Ok(h.api->Run(leaked, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
         CHECK(IsNanAnswer(h.api, out.v[0]));
     }
-    CHECK(!h.bridge.Connection().BackingOff());
+    CHECK(!h.bridge.Connection().Paused());
     {
         Outputs out(h.api, 5);
         Ok(h.api->Run(fresh, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
         CHECK(!IsNanAnswer(h.api, out.v[0]));
     }
-    CHECK_EQ(h.CountLogged("for the next 10 seconds"), 0);
+    CHECK_EQ(h.CountLogged("until the server answers again"), 0);
     h.api->ReleaseSession(fresh);
     h.api->ReleaseSession(leaked);
 }
@@ -847,7 +969,7 @@ TEST(ForwardReconnectsAfterTheServerClosesAnIdleConnection) {
         CHECK(!IsNanAnswer(h.api, out.v[0]));
     }
     CHECK(h.Logged("had closed the connection; reconnecting"));
-    CHECK_EQ(h.CountLogged("for the next 10 seconds"), 0);
+    CHECK_EQ(h.CountLogged("until the server answers again"), 0);
     CHECK_EQ(h.bridge.Statistics().forwarded, 2u);
     h.api->ReleaseSession(s);
 }

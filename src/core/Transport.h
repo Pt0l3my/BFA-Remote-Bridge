@@ -29,7 +29,8 @@ public:
     enum class Result {
         Ok,
         TimedOut,  // the deadline passed
-        Closed,    // the server closed the connection, or reset it
+        Closed,    // the server closed the connection
+        Reset,     // the connection was reset or aborted
         Failed,    // any other error
     };
 

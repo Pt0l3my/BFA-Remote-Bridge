@@ -9,7 +9,11 @@ of zeros, and one lock per session around its runs.
     python3 tools/reference_server.py --models <folder> [--host 127.0.0.1] [--port 7871] [--key KEY]
 
 It prints "LISTENING <port>" once it accepts connections (with --port 0 the system picks the port). The test
-options --delay-ms and --fault make it slow or wrong on purpose. Needs onnxruntime and numpy.
+options --delay-ms, --fault and --run-error make it slow or wrong on purpose (--fault-count limits them to the first
+runs). Needs onnxruntime and numpy.
+
+As PandorumLLM's server does: each connection's requests are answered in order, late ones too; PING is answered with
+PONG only after HELLO (before it, ERROR 1); after ERROR 1, 2, 5, 6 or 7 the connection is closed.
 """
 
 import argparse
@@ -36,7 +40,8 @@ HELLO, HELLO_OK, RUN, RUN_OK, ERROR, PING, PONG = 1, 2, 3, 4, 5, 6, 7
 READY, NOT_FOUND, DIFFERENT_FILE, FAILED_TO_LOAD, NOT_ALLOWED = 0, 1, 2, 3, 4
 
 E_MALFORMED, E_WRONG_KEY, E_UNKNOWN_MODEL, E_INFERENCE, E_TOO_LARGE, E_VERSION, E_BUSY = 1, 2, 3, 4, 5, 6, 7
-CLOSING_ERRORS = {E_MALFORMED, E_WRONG_KEY, E_VERSION}
+# after these the server closes the connection; 7 says it is busy or stopping
+CLOSING_ERRORS = {E_MALFORMED, E_WRONG_KEY, E_TOO_LARGE, E_VERSION, E_BUSY}
 MAX_NAME = 255  # bytes of a model or tensor name; longer is malformed
 
 DTYPES = {1: np.dtype("<f4"), 6: np.dtype("<i4"), 7: np.dtype("<i8"), 10: np.dtype("<f2"), 11: np.dtype("<f8")}
@@ -345,6 +350,7 @@ class Handler(socketserver.StreamRequestHandler):
     def run(self, payload, ready, cfg):
         r = Reader(payload)
         request_id = r.u32()
+        faulty = self.server.take_fault()
         try:
             model = r.str()
             if not valid_name(model):
@@ -362,13 +368,15 @@ class Handler(socketserver.StreamRequestHandler):
             raise
         if model not in ready:
             raise Refusal(E_UNKNOWN_MODEL, "%s isn't ready here" % model, request_id)
+        if faulty and cfg.delay_ms:
+            time.sleep(cfg.delay_ms / 1000.0)
+        if faulty and cfg.run_error:
+            raise Refusal(cfg.run_error, "a test option's error", request_id)
         try:
             results, micros = self.server.models.run(ready[model], feeds, outputs)
         except Exception as e:
             raise Refusal(E_INFERENCE, self.server.models.scrub(e), request_id)
-        if cfg.delay_ms:
-            time.sleep(cfg.delay_ms / 1000.0)
-        fault = cfg.fault
+        fault = cfg.fault if faulty else "none"
         if fault == "malformed":
             self.send(RUN_OK, struct.pack("<II", request_id, micros) + b"\x01")
             return
@@ -391,6 +399,16 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def take_fault(self):
+        """Whether this RUN gets the test options' delay, fault or error (all of them, or the first --fault-count)."""
+        with self.fault_lock:
+            if self.cfg.fault_count <= 0:
+                return True
+            if self.faults_used < self.cfg.fault_count:
+                self.faults_used += 1
+                return True
+            return False
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -405,11 +423,14 @@ def main(argv=None):
                         "count gives results identical to BFA's bit for bit, where another count may differ in the last bit of "
                         "a float16 model's outputs")
     p.add_argument("--allow", default=None, help="comma-separated model names this server serves (default: any)")
-    p.add_argument("--idle-seconds", type=float, default=600.0)
+    p.add_argument("--idle-seconds", type=float, default=0.0, help="close a connection idle this long (0: never, as PandorumLLM's)")
     p.add_argument("--quiet", action="store_true")
-    p.add_argument("--delay-ms", type=int, default=0, help="test option: wait this long before each RUN_OK")
+    p.add_argument("--delay-ms", type=int, default=0, help="test option: wait this long before answering each RUN")
     p.add_argument("--fault", default="none", choices=["none", "malformed", "request-id", "output-name", "output-type"],
                    help="test option: answer RUN wrongly")
+    p.add_argument("--run-error", type=int, default=0, help="test option: answer RUN with this ERROR code")
+    p.add_argument("--fault-count", type=int, default=0,
+                   help="test option: --delay-ms, --fault and --run-error apply to the first this many RUNs only (0: all)")
     cfg = p.parse_args(argv)
 
     providers = [x for x in cfg.providers.split(",") if x]
@@ -417,7 +438,9 @@ def main(argv=None):
     server = Server((cfg.host, cfg.port), Handler)
     server.cfg = cfg
     server.key = cfg.key
-    server.idle_seconds = cfg.idle_seconds
+    server.idle_seconds = cfg.idle_seconds or None
+    server.fault_lock = threading.Lock()
+    server.faults_used = 0
     server.models = Models(cfg.models, providers, allowed, cfg.optimization, cfg.threads)
     server.name = "BFA Remote Bridge reference server (onnxruntime %s)" % ort.__version__
     server.device = ", ".join(providers)

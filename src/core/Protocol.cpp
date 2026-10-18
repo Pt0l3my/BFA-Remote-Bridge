@@ -195,7 +195,11 @@ const char* ErrorCodeName(std::uint16_t code) noexcept {
 
 bool ErrorClosesConnection(std::uint16_t code) noexcept {
     return code == static_cast<std::uint16_t>(ErrorCode::Malformed) || code == static_cast<std::uint16_t>(ErrorCode::WrongKey) ||
-           code == static_cast<std::uint16_t>(ErrorCode::VersionNotSupported);
+           code == static_cast<std::uint16_t>(ErrorCode::TooLarge) || code == static_cast<std::uint16_t>(ErrorCode::VersionNotSupported);
+}
+
+bool ErrorEndsConnection(std::uint16_t code) noexcept {
+    return ErrorClosesConnection(code) || code == static_cast<std::uint16_t>(ErrorCode::Busy);
 }
 
 bool ValidModelName(std::string_view name) noexcept {

@@ -34,6 +34,7 @@ std::string NoticeText(const Notice& n, const std::string& bfaVersion) {
             return kPrefix + "the server couldn't load " + n.model + ", so lip sync is the game's own. The bridge's log says why.";
         case Notice::Kind::UnknownRuntime:
             return kPrefix + "this Better Facial Animations uses an ONNX Runtime the bridge doesn't know, so BFA runs as usual.";
+        case Notice::Kind::GpuMode: return kPrefix + "BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card.";
     }
     return {};
 }

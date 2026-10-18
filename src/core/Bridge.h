@@ -15,7 +15,8 @@
 //                   in full, the call still succeeds, with each requested output a one-element float tensor holding
 //                   NaN: BFA's output check then drops that line only (its own comment: "A failed validation fails the
 //                   line only: the session and device stay"), where an error status would make it drop the model. A
-//                   10-second backoff follows, during which runs answer so at once.
+//                   connection failure pauses the bridge (src/core/Client.h): runs answer so at once until the
+//                   background thread's HELLO is answered. Every run is counted once, answered or by its reason.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.
 //
 // Sessions made while the bridge was off are the runtime's own, and every call on them is the real one; the on/off
@@ -56,7 +57,6 @@ using OrtGetApiBaseFn = const OrtApiBase*(ORT_API_CALL*)(void) noexcept;
 struct Stats {
     std::uint64_t forwarded = 0;   // runs the server answered
     std::uint64_t unanswered = 0;  // runs answered with NaN (the line gets the game's own lip sync)
-    std::uint64_t failures = 0;    // failures that started a backoff
     std::uint64_t roundTripMicros = 0;
     std::uint64_t serverMicros = 0;
     std::uint64_t bytesUp = 0;
@@ -72,6 +72,7 @@ struct Notice {
         Missing,         // the server has no such file, or another copy of it
         CouldNotLoad,    // the server failed to load it, refused it, or answered wrongly
         UnknownRuntime,  // BFA asked for an ONNX Runtime API version the bridge doesn't know
+        GpuMode,         // BFA is set to GPU (once per session, while the bridge is on and notices are allowed)
     };
     Kind kind = Kind::Served;
     std::string model;
@@ -158,6 +159,9 @@ private:
     std::vector<proto::ModelEntry> LiveModelsLocked() const;
     void Log(Level level, const std::string& line) const;
     void NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** outputs) noexcept;
+    // A run the server didn't answer: counted (and logged unless quiet) by the client, then the NaN answer.
+    void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Clock::time_point start, std::size_t outputCount,
+                  OrtValue** outputs) noexcept;
     void Check(const OrtApi* real, OrtSession* local, const char* const* inputNames, const OrtValue* const* inputs, std::size_t inputCount,
                const char* const* outputNames, std::size_t outputCount, const std::string& model, int index, int of,
                const Client::Reply& reply);
@@ -178,6 +182,7 @@ private:
     std::map<const OrtSession*, std::unique_ptr<Session>> sessions_;
     std::uint64_t nextOrder_ = 1;
     bool gpuLogged_ = false;
+    bool gpuTold_ = false;
 
     mutable std::mutex noticeMutex_;
     NoticeSink notice_;

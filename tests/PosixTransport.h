@@ -80,7 +80,7 @@ public:
             if (k < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (k <= 0) {
                 err = std::strerror(errno);
-                return errno == EPIPE || errno == ECONNRESET ? Result::Closed : Result::Failed;
+                return errno == ECONNRESET ? Result::Reset : errno == EPIPE ? Result::Closed : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);
@@ -103,7 +103,7 @@ public:
             }
             if (k < 0) {
                 err = std::strerror(errno);
-                return errno == ECONNRESET ? Result::Closed : Result::Failed;
+                return errno == ECONNRESET ? Result::Reset : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);

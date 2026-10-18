@@ -2,16 +2,22 @@
 //
 //   load            the log (BFARemoteBridge.log in SKSE's log folder), VR refused, the messaging listener
 //   post-load       every plugin is loaded: find Better Facial Animations, read its version, attach to its lookup of
-//                   ONNX Runtime (Hook.cpp); note whether SkyrimNet is loaded, so a model load waits for its settings
+//                   ONNX Runtime (Hook.cpp); note whether SkyrimNet is loaded, so a model load waits for its settings;
+//                   and, once attached, allow the client's background thread (src/core/Client.h)
 //   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
-//   main menu,      registered them; also whenever that page is saved. After the first read, and after each change of
-//   pre-load game   the address or port, a short-lived thread looks the server's name up (and, the first time, says
-//                   HELLO with no models and logs the answer)
+//   main menu,      registered them; also whenever that page is saved. The first read with the bridge on and an
+//   pre-load game   address starts the background thread, which looks the server's name up (again after each change
+//                   of the address or port), says HELLO with no models and logs the answer
 //   game loaded     the settings again; at the first load, the status notification (setting showStatus), and the
 //                   model loads' notices held until then
 //
 // A model load's outcome comes later, on BFA's worker thread; its notice goes to the game's main thread through SKSE's
 // task interface. Nothing here waits for the network: the client's Configure never does.
+//
+// At process exit: the bridge, its client and the background thread live until the process ends and are never
+// destroyed, so nothing joins the thread in a static destructor during DLL unload (which could deadlock). Windows ends
+// the thread before any DLL detach runs; the log is never destroyed either, so no destructor meets a lock that thread
+// held, and every line is flushed as it is written.
 
 #include "plugin/Plugin.h"
 
@@ -25,14 +31,13 @@ Bridge* g_bridge = nullptr;  // lives until the game exits: BFA's worker may cal
 BfaFacts g_bfa;
 std::atomic<bool> g_skyrimNet{false};
 bool g_settingsRead = false;  // main thread only
-Settings g_lastRead;
 
 std::mutex g_noticeMutex;
 bool g_gameLoaded = false;
 std::vector<std::string> g_pending;
 std::string g_lastShown;
 
-std::shared_ptr<spdlog::logger> g_log;
+spdlog::logger* g_log = nullptr;  // never destroyed: see the top of this file
 
 void OpenLog() {
     try {
@@ -40,7 +45,7 @@ void OpenLog() {
         if (!folder) return;
         const auto path = *folder / "BFARemoteBridge.log";
         auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
-        g_log = std::make_shared<spdlog::logger>("BFARemoteBridge", std::move(sink));
+        g_log = new spdlog::logger("BFARemoteBridge", std::move(sink));
         // UTC: a local time would tell the player's time zone
         g_log->set_pattern("%Y-%m-%d %H:%M:%S.%e UTC [%l] %v", spdlog::pattern_time_type::utc);
         g_log->set_level(spdlog::level::info);
@@ -64,28 +69,7 @@ void Notify(const std::string& text) {
     if (const auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([text] { RE::DebugNotification(text.c_str()); });
 }
 
-// Off the game's threads: the name lookup, and the first time a HELLO with no models.
-void LookUp(bool probe) {
-    std::thread([probe] {
-        try {
-            Client& c = g_bridge->Connection();
-            if (!g_bridge->CurrentSettings().serverAddress.empty() && !c.Resolve())
-                Log(Level::Warn, "The server's address couldn't be looked up: lines get the game's own lip sync until the settings change");
-            if (!probe) return;
-            const ProbeResult r = c.Probe();
-            switch (r.kind) {
-                case ProbeResult::Kind::NoAddress: Log(Level::Info, "No server address is set: the bridge is idle"); break;
-                case ProbeResult::Kind::Answered: Log(Level::Info, "The server answered: " + r.server + " on " + r.device); break;
-                case ProbeResult::Kind::NoAnswer: Log(Level::Warn, "The server didn't answer: " + r.detail); break;
-                case ProbeResult::Kind::WrongKey: Log(Level::Warn, "The server refused the access key"); break;
-                default: Log(Level::Warn, "The server refused the bridge: " + r.detail); break;
-            }
-        } catch (...) {
-        }
-    }).detach();
-}
-
-// On the main thread. Never waits: the client applies the settings at its next model load or run.
+// On the main thread. Never waits: the client applies the settings at its next run or in its background thread.
 void ApplySettings(const char* when) {
     Settings s;
     std::vector<std::string> warnings;
@@ -98,14 +82,10 @@ void ApplySettings(const char* when) {
         Log(Level::Info, std::string("SkyrimNet hasn't registered the bridge's settings yet (") + when + ")");
         return;
     }
-    const bool first = !g_settingsRead;
-    const bool moved = first || s.serverAddress != g_lastRead.serverAddress || s.serverPort != g_lastRead.serverPort;
     g_settingsRead = true;
-    g_lastRead = s;
-    g_bridge->Apply(s);
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
-    if (moved && g_bfa.hooked) LookUp(first);
+    g_bridge->Apply(s);  // starts the background thread once the bridge is on with an address
 }
 
 class ConfigSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent> {
@@ -168,6 +148,7 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 g_bfa = FindAndHookBfa();
                 g_skyrimNet = SkyrimNetLoaded();
                 g_bridge->ExpectSettings(g_skyrimNet);
+                if (g_bfa.hooked) g_bridge->Connection().StartBackground();
                 break;
             case SKSE::MessagingInterface::kDataLoaded: {
                 static ConfigSink configs;

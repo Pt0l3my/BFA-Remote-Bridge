@@ -26,6 +26,7 @@ std::string ErrorText(int code) {
         case WSAEHOSTUNREACH: return "host unreachable";
         case WSAENETUNREACH: return "network unreachable";
         case WSAECONNRESET: return "reset";
+        case WSAECONNABORTED: return "aborted";
         default: return "Winsock error " + std::to_string(code);
     }
 }
@@ -113,7 +114,7 @@ public:
                 const int code = ::WSAGetLastError();
                 if (code == WSAEWOULDBLOCK) continue;
                 err = ErrorText(code);
-                return code == WSAECONNRESET || code == WSAECONNABORTED || code == WSAESHUTDOWN ? Result::Closed : Result::Failed;
+                return code == WSAECONNRESET || code == WSAECONNABORTED ? Result::Reset : code == WSAESHUTDOWN ? Result::Closed : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);
@@ -135,7 +136,7 @@ public:
                 const int code = ::WSAGetLastError();
                 if (code == WSAEWOULDBLOCK) continue;
                 err = ErrorText(code);
-                return code == WSAECONNRESET || code == WSAECONNABORTED ? Result::Closed : Result::Failed;
+                return code == WSAECONNRESET || code == WSAECONNABORTED ? Result::Reset : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);
@@ -156,7 +157,7 @@ private:
         }
         const int code = SocketError(socket_);
         err = code ? ErrorText(code) : std::string("the connection closed");
-        return Result::Closed;
+        return code == WSAECONNRESET || code == WSAECONNABORTED ? Result::Reset : Result::Closed;
     }
 
     SOCKET socket_ = INVALID_SOCKET;

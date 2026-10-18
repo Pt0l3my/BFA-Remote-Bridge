@@ -250,8 +250,10 @@ TEST(ProtocolPayloadRefusals) {
     CHECK_EQ(DTypeSize(10), std::size_t{2});
     CHECK_EQ(DTypeSize(11), std::size_t{8});
     CHECK_EQ(DTypeSize(16), std::size_t{0});
-    CHECK(ErrorClosesConnection(1) && ErrorClosesConnection(2) && ErrorClosesConnection(6));
-    CHECK(!ErrorClosesConnection(3) && !ErrorClosesConnection(4) && !ErrorClosesConnection(5) && !ErrorClosesConnection(7));
+    CHECK(ErrorClosesConnection(1) && ErrorClosesConnection(2) && ErrorClosesConnection(5) && ErrorClosesConnection(6));
+    CHECK(!ErrorClosesConnection(3) && !ErrorClosesConnection(4) && !ErrorClosesConnection(7));
+    CHECK(ErrorEndsConnection(1) && ErrorEndsConnection(2) && ErrorEndsConnection(5) && ErrorEndsConnection(6) && ErrorEndsConnection(7));
+    CHECK(!ErrorEndsConnection(3) && !ErrorEndsConnection(4) && !ErrorEndsConnection(0) && !ErrorEndsConnection(8));
     (void)Bytes;
 }
 

@@ -593,6 +593,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
 
         auto session = std::make_unique<Session>();
         session->entry.name = modelName;
+        bool tellGpu = false;
         {
             std::lock_guard lock(sessionsMutex_);
             bool gpu = false;
@@ -606,7 +607,11 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
                     "Better Facial Animations is set to GPU: with the bridge no lip-sync inference runs on this PC's graphics card, but BFA "
                     "still opens a device on it; its Force CPU setting avoids even that");
             }
+            // the notice on screen: once per session, while the bridge is on with an address (here) and notices are allowed
+            tellGpu = gpu && s.showStatus && !gpuTold_;
+            if (tellGpu) gpuTold_ = true;
         }
+        if (tellGpu) Tell(Notice{Notice::Kind::GpuMode, std::string(), std::string()});
         const std::string name = session->entry.name;
         if (!proto::ValidModelName(name)) {
             Admission a;
@@ -626,12 +631,8 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         Log(Level::Info, "Model " + name + ": " + std::to_string(session->entry.size) + " bytes, SHA-256 " + Sha256::Hex(session->entry.sha256) +
                              (overrides.empty() ? ", no overrides" : ", overrides " + overrides) + "; asking the server");
 
-        std::vector<proto::ModelEntry> live;
-        {
-            std::lock_guard lock(sessionsMutex_);
-            live = LiveModelsLocked();
-        }
-        const Admission a = client_.Admit(live, session->entry);
+        // the new model alone, on a side connection; the main connection gets the full list once the session is in
+        const Admission a = client_.Admit(session->entry);
         if (!a.Ready()) return Refuse(real, name, a);
 
         if (s.checkCalls > 0) {
@@ -717,9 +718,19 @@ void Bridge::NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** o
     }
 }
 
+void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Clock::time_point start, std::size_t outputCount,
+                      OrtValue** outputs) noexcept {
+    try {
+        client_.RecordFallback(model, fallback, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
+    } catch (...) {
+    }
+    NanAnswer(real, outputCount, outputs);
+}
+
 OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOptions* runOptions, const char* const* inputNames,
                          const OrtValue* const* inputs, std::size_t inputCount, const char* const* outputNames, std::size_t outputCount,
                          OrtValue** outputs) noexcept {
+    const Clock::time_point start = Clock::now();
     proto::ModelEntry entry;
     OrtSession* local = nullptr;
     bool superseded = false;
@@ -735,20 +746,25 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
         return nullptr;
     }
 
-    // a bridge session: from here on every path returns success, with the server's outputs or NaN ones
-    if (superseded) {  // a newer session of its model replaced it: no backoff, nothing logged
-        NanAnswer(real, outputCount, outputs);
+    // a bridge session: from here on every path returns success, with the server's outputs or NaN ones, and every run
+    // is counted once
+    const auto fallBack = [&](Why why, std::string text, bool quiet) -> OrtStatus* {
+        Fallback f;
+        f.why = why;
+        f.text = std::move(text);
+        f.quiet = quiet;
+        FallBack(real, entry.name, f, start, outputCount, outputs);
         return nullptr;
-    }
+    };
+    if (superseded)  // a newer session of its model replaced it: counted, nothing logged
+        return fallBack(Why::Other, "a newer session of the model replaced this one", true);
     std::vector<OrtValue*> created;
     Settings s;
     Client::Reply reply;
     try {
         s = CurrentSettings();
-        if (!outputs || outputCount == 0 || !outputNames || (inputCount > 0 && (!inputs || !inputNames))) {
-            NanAnswer(real, outputCount, outputs);
-            return nullptr;
-        }
+        if (!outputs || outputCount == 0 || !outputNames || (inputCount > 0 && (!inputs || !inputNames)))
+            return fallBack(Why::Other, "the call names no outputs or lacks its inputs", false);
         std::vector<Tensor> in(inputCount), given(outputCount);
         std::string why;
         bool supported = true;
@@ -775,8 +791,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 if (it != sessions_.end() && !it->second->unsupportedLogged) first = it->second->unsupportedLogged = true;
             }
             if (first) Log(Level::Warn, entry.name + ": " + why + ", which the protocol can't carry; those lines get the game's own lip sync");
-            NanAnswer(real, outputCount, outputs);
-            return nullptr;
+            return fallBack(Why::Other, why + ", which the protocol can't carry", true);
         }
 
         proto::RunRequest request;
@@ -785,19 +800,15 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
             request.inputs.push_back(proto::TensorView{inputNames[i], in[i].dtype, in[i].dims, in[i].data, in[i].bytes});
         for (std::size_t i = 0; i < outputCount; ++i) request.outputs.emplace_back(outputNames[i]);
 
-        std::string reason;
-        const Client::Outcome outcome = client_.Run(entry, request, reply, reason);
+        Fallback fallback;
+        const Client::Outcome outcome = client_.Run(entry, request, reply, fallback);
         if (outcome != Client::Outcome::Forwarded) {
-            if (outcome == Client::Outcome::Failed) {
-                std::lock_guard lock(statsMutex_);
-                ++stats_.failures;
-            }
-            NanAnswer(real, outputCount, outputs);
+            FallBack(real, entry.name, fallback, start, outputCount, outputs);
             return nullptr;
         }
 
         // the answer must fit the call exactly before anything is written
-        reason.clear();
+        std::string reason;
         const auto& got = reply.ok.outputs;
         if (got.size() != outputCount) reason = "the server returned " + std::to_string(got.size()) + " outputs, not " + std::to_string(outputCount);
         for (std::size_t i = 0; reason.empty() && i < outputCount; ++i) {
@@ -838,13 +849,8 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                     real->ReleaseValue(v);
                     v = nullptr;
                 }
-            client_.Fail(reason);
-            {
-                std::lock_guard lock(statsMutex_);
-                ++stats_.failures;
-            }
-            NanAnswer(real, outputCount, outputs);
-            return nullptr;
+            // the server answered, but its answer doesn't fit the call: counted, and the connection stays
+            return fallBack(Why::Other, reason, false);
         }
         for (std::size_t i = 0; i < outputCount; ++i) {
             if (outputs[i]) {
@@ -857,14 +863,12 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
     } catch (...) {
         for (OrtValue* v : created)
             if (v) real->ReleaseValue(v);
-        NanAnswer(real, outputCount, outputs);
-        return nullptr;
+        return fallBack(Why::Other, "the bridge failed unexpectedly", false);
     }
 
     // answered by the server: what follows only reports
     try {
         const std::uint64_t down = proto::kHeaderSize + reply.payload.size();
-        Stats snapshot;
         {
             std::lock_guard lock(statsMutex_);
             ++stats_.forwarded;
@@ -872,16 +876,12 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
             stats_.serverMicros += reply.ok.serverMicros;
             stats_.bytesUp += reply.bytesUp;
             stats_.bytesDown += down;
-            snapshot = stats_;
         }
+        client_.RecordAnswered(reply);
         if (s.logDetail == LogDetail::Detailed)
             Log(Level::Info, "RUN " + entry.name + ": round trip " + Ms(static_cast<std::uint64_t>(reply.roundTrip.count())) + " ms, server " +
                                  Ms(reply.ok.serverMicros) + " ms, " + std::to_string(reply.bytesUp) + " bytes up, " + std::to_string(down) +
                                  " bytes back");
-        if (snapshot.forwarded % 250 == 0)
-            Log(Level::Info, std::to_string(snapshot.forwarded) + " runs answered by the server, " + std::to_string(snapshot.unanswered) +
-                                 " not; average round trip " + Ms(snapshot.roundTripMicros / snapshot.forwarded) + " ms, server " +
-                                 Ms(snapshot.serverMicros / snapshot.forwarded) + " ms");
         if (local && s.checkCalls > 0) {
             int index = 0;
             {

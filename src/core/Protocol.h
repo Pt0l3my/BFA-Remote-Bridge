@@ -64,8 +64,10 @@ const char* DTypeName(std::uint8_t dtype) noexcept;
 const char* ModelStatusName(std::uint8_t status) noexcept;
 const char* ErrorCodeName(std::uint16_t code) noexcept;
 
-// The server closes the connection after these codes (1, 2 and 6).
+// The server closes the connection after these codes (1, 2, 5 and 6).
 bool ErrorClosesConnection(std::uint16_t code) noexcept;
+// The bridge treats these as the connection's end: the closing codes, and 7 (busy or stopping).
+bool ErrorEndsConnection(std::uint16_t code) noexcept;
 
 // A model's base name: not empty, no '/', '\\' or ':' (a drive letter), not "." or "..", no ".." component,
 // no control character.

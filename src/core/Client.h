@@ -1,29 +1,42 @@
 #pragma once
-// The bridge's side of the connection (docs/PROTOCOL.md): one TCP connection, guarded by a mutex (BFA may run
-// its sentiment model from another thread while its lip-sync model runs).
+// The bridge's side of the connection (docs/PROTOCOL.md, section 3): one main connection for every run, guarded by a
+// mutex (BFA may run its sentiment model from another thread while its lip-sync model runs), short-lived connections
+// of their own for model loads and status checks, and one background thread of the bridge's own.
 //
-// - Configure never waits: the settings go to a small mutex of their own with a generation count, and the next Admit
-//   or Run (which hold the connection's lock) applies them: a change to the address, port, key or timeout closes the
-//   connection and ends a backoff. The game's main thread calls it, and the connection may be busy for a minute.
+// - Configure never waits: the settings go to a small mutex of their own with a generation count, and the next Run or
+//   the background thread (which take the connection's lock) applies them: a change to the address, port, key or
+//   timeout closes the connection and ends a pause. The game's main thread calls it.
 // - Resolve looks the server's name up (getaddrinfo can't be bounded by a timeout), off the connection's lock, once per
-//   settings change; connections use the addresses it found. A failed lookup is logged once, and runs answer
-//   Skipped until the next settings change.
-// - Admit: at BFA's CreateSession, a fresh connection and HELLO listing every live bridge session's model and the new
-//   one, waiting up to kHelloTimeout for the server to load and warm it up. A running backoff doesn't stop it.
-// - Run: RUN and its answer within the timeout. HELLO is sent first when the connection is new or the set of live
-//   models changed since the last one. A reused connection the server has closed (it may close one idle for 10
-//   minutes) is opened again within the same call: when sending fails, or the connection closes before any byte of
-//   the answer, the call reconnects, says HELLO and sends again, once. Any other failure (no connection, a timeout,
-//   an ERROR, a malformed or mismatched answer, the model no longer ready) closes the connection unless the server
-//   keeps it open after that error, starts a 10-second backoff and logs its reason once; during the backoff Run
-//   answers Skipped at once, without touching the network. The first run after it reconnects.
-// - The client never sends PING.
+//   settings change; connections use the addresses it found. A failed lookup is logged once, and runs fall back until
+//   the next settings change.
+// - Admit: at BFA's CreateSession, the new model alone in a HELLO on a side connection of its own (kConnectTimeout to
+//   connect, kHelloTimeout for the server to load and warm it up), closed after the answer. The main connection is
+//   never held by a load. While a side load is in flight the background thread holds its own HELLOs (the server makes
+//   any HELLO wait for a load in progress); status checks name no model and aren't held. SetModels then lists every
+//   live model, and the background thread (or the next run) says HELLO with that list on the main connection.
+// - Run: RUN and its answer within the timeout, on the main connection. HELLO is sent first only when the connection
+//   has no answer for the run's model yet. A connection the server closed or reset, or a send that failed, is opened
+//   again within the same call, once. A RUN timeout with no byte of its answer arrived keeps the connection: the next
+//   exchange reads and discards the late answer (the server answers in order), and a late ERROR 1, 2, 5, 6 or 7 ends
+//   the connection. A second timeout in a row, a timeout in the middle of a frame, or any connection failure closes
+//   the connection and starts the pause: runs then fall back at once, without the network, until the background
+//   thread's HELLO is answered.
+// - The background thread sleeps on a condition variable between its timers: reconnecting with a backoff of 1, 2, 5,
+//   10 and 30 s (then every 30 s), its HELLO's answer ending the pause; a HELLO on the main connection when the live
+//   models changed; a PING after 60 s idle on a connection whose HELLO listed models; a status check on a connection
+//   of its own every 5 minutes when the counters changed; the summary line every 10 minutes when anything happened.
+//   It never holds the connection's lock while a run waits: connecting and HELLO go on a new connection outside the
+//   lock, swapped in under it, and its HELLO and PING on the main connection use a try-lock and give way to runs.
+//   Tick is one round of its work, which the tests call directly instead of starting the thread.
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/Log.h"
@@ -33,12 +46,81 @@
 
 namespace bfarb {
 
-constexpr std::chrono::seconds kBackoff{10};
-constexpr std::chrono::seconds kHelloTimeout{60};
+constexpr std::chrono::milliseconds kConnectTimeout{3000};  // a connect off the speech path
+constexpr std::chrono::seconds kHelloTimeout{60};           // a HELLO off the speech path, which may load a model
+constexpr std::chrono::seconds kIdlePing{60};
+constexpr std::chrono::minutes kStatusEvery{5};
+constexpr std::chrono::minutes kSummaryEvery{10};
+constexpr std::uint64_t kSummaryRuns = 250;
+constexpr std::size_t kClientStringMax = 80;  // the panel's log lines keep 80 characters until its next patch
 
-std::string ClientName();  // "BFARemoteBridge 1.0.0"
+// The background thread's wait before its next try, after `failures` failed tries since the pause began (or the last
+// success): 1, 2, 5, 10, 30 s, then 30 s.
+std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-// What a HELLO (the probe's, or Admit's) learnt.
+std::string ClientName();  // "BFARemoteBridge 1.1.0"
+
+// Why a run got no answer from the server.
+enum class Why : std::uint8_t {
+    NoConnection,     // no address looked up, couldn't connect
+    ConnectTimedOut,  // the connect took the run's whole time
+    RunTimedOut,      // no answer within the timeout (the run's HELLO's included)
+    ServerError,      // the server answered ERROR
+    NotReady,         // the server doesn't have the model ready
+    ConnectionLost,   // closed, reset or failed during the exchange
+    Paused,           // answered at once during a pause
+    Other,            // a malformed or mismatched answer, the connection busy, a replaced session, an input the protocol
+                      // can't carry
+};
+constexpr std::size_t kWhyCount = 8;
+const char* WhyName(Why why) noexcept;
+
+// How one exchange on a connection ended.
+enum class ExchangeFailure {
+    None,
+    Encode,       // nothing was sent
+    SendFailed,   // sending failed: the server may have closed the connection
+    Closed,       // the connection closed before any byte of an answer
+    Reset,        // the connection was reset before any byte of an answer
+    NoByte,       // the deadline passed with no byte of the answer arrived: the stream is still at a frame's start
+    MidFrame,     // the deadline passed in the middle of a frame, or of the send
+    Lost,         // the connection closed or failed after some bytes
+    Malformed,    // not a frame of protocol version 1, or not the answer expected
+    Refused,      // the server answered ERROR
+    LateClosing,  // a discarded late answer was an ERROR that ends the connection
+};
+
+struct Fallback {
+    Why why = Why::Other;
+    std::string text;
+    bool quiet = false;  // counted, not logged (runs answered at once without the network, after the first of a series)
+};
+
+// Cumulative from Skyrim's start. fallbacks counts every run the server didn't answer; timeouts is a part of it.
+struct Counters {
+    std::uint64_t answered = 0;
+    std::uint64_t fallbacks = 0;
+    std::uint64_t timeouts = 0;
+    bool operator==(const Counters&) const = default;
+};
+
+// The HELLO's client string: "BFARemoteBridge 1.1.0 (answered N, fallbacks N, timeouts N)", keys in that order, new
+// keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name alone when none
+// fits.
+std::string ClientString(const Counters& counters, std::size_t max = kClientStringMax);
+
+// The runs since the last summary line.
+struct Period {
+    std::uint64_t runs = 0;
+    std::uint64_t answered = 0;
+    std::array<std::uint64_t, kWhyCount> byWhy{};
+    std::uint64_t roundTripMicros = 0;
+    std::uint64_t serverMicros = 0;
+    std::uint64_t slowestMicros = 0;
+};
+std::string SummaryLine(const Period& period);
+
+// What a HELLO (a status check's, or Admit's) learnt.
 struct ProbeResult {
     enum class Kind {
         NotTried,  // the probe hasn't finished, or nothing asked it
@@ -67,28 +149,28 @@ public:
     using Now = Clock::time_point (*)();
 
     Client(TransportFactory factory, Resolver resolver, LogSink log, Now now = &Clock::now);
-    ~Client();
+    ~Client();  // stops and joins the background thread (the plugin's client is never destroyed)
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // Never waits for the connection: applied by the next Admit or Run.
+    // Never waits for the connection: applied by the next Run or the background thread.
     void Configure(const Settings& settings);
     void SetOrtVersion(const std::string& version);
 
     // Looks the latest settings' server name up and keeps the addresses. Called off the game's threads.
     bool Resolve();
 
-    // The live bridge sessions' models; the next run sends HELLO again when they changed. A name listed twice is sent
-    // once, as its newest session (the last in the list), since RUN names a model by its name alone.
+    // The live bridge sessions' models; the main connection says HELLO again when they changed. A name listed twice is
+    // sent once, as its newest session (the last in the list), since RUN names a model by its name alone.
     void SetModels(const std::vector<proto::ModelEntry>& models);
 
-    // HELLO with `live` and `model` (the newest), now, on a fresh connection, for a new session.
-    Admission Admit(const std::vector<proto::ModelEntry>& live, const proto::ModelEntry& model);
+    // HELLO with `model` alone, now, on a side connection, for a new session. Never touches the main connection.
+    Admission Admit(const proto::ModelEntry& model);
 
     enum class Outcome {
         Forwarded,  // reply holds RUN_OK
-        Skipped,    // a backoff, no address looked up, or another run holding the connection past the timeout
-        Failed,     // the backoff has started and the reason is logged
+        Skipped,    // answered at once, without the network (a pause, a model not ready, no address looked up, ...)
+        Failed,     // tried, and the server didn't answer it
     };
     struct Reply {
         std::vector<std::uint8_t> payload;
@@ -96,40 +178,77 @@ public:
         std::chrono::microseconds roundTrip{0};
         std::size_t bytesUp = 0;
     };
-    // Sends RUN for `model` (one SetModels listed) with request.requestId set here.
-    Outcome Run(const proto::ModelEntry& model, proto::RunRequest& request, Reply& reply, std::string& reason);
+    // Sends RUN for `model` (one SetModels listed) with request.requestId set here. Anything but Forwarded fills
+    // fallback; the caller records every run once, with RecordAnswered or RecordFallback.
+    Outcome Run(const proto::ModelEntry& model, proto::RunRequest& request, Reply& reply, Fallback& fallback);
 
-    // A failure found after a RUN_OK (its outputs didn't fit the call): closes the connection, starts the backoff and
-    // logs the reason.
-    void Fail(const std::string& reason);
+    // Each run counted once: the counters, the summary line at each 250 runs, and each fallback's log line (its model,
+    // its reason and the time it took) unless it is quiet.
+    void RecordAnswered(const Reply& reply);
+    void RecordFallback(const std::string& model, const Fallback& fallback, std::chrono::microseconds took);
+    Counters Totals() const;
 
-    // Whether a backoff is running now (for the tests; it waits for the connection's lock).
-    bool BackingOff() const;
+    // Whether the pause is on: runs fall back at once until the background HELLO is answered.
+    bool Paused() const noexcept;
 
-    // A fresh connection of its own: HELLO with no models, the answer, then closed. Never touches the main connection,
-    // its lock or the backoff.
+    // A connection of its own: HELLO with no models and the counters in its client string, the answer, then closed.
+    // Never touches the main connection, its lock or the pause, and never waits for a side load.
     ProbeResult Probe();
 
-    // For the tests: the HELLO messages and the connections made on the main connection so far.
-    int HellosSent() const;
-    int Reconnects() const;
+    // The background thread: allowed by StartBackground, it starts while the bridge is on with a server address
+    // (now, or at a later Configure). StopBackground ends and joins it.
+    void StartBackground();
+    void StopBackground();
+    // One round of the background work, due by the client's clock: the time of the next one.
+    Clock::time_point Tick();
+
+    // For the tests.
+    int HellosSent() const;  // on the main connection
+    int SideHellos() const;
+    int Reconnects() const;  // main connections opened
+    int Pings() const;
+    int SideLoadsInFlight() const noexcept;
 
 private:
     struct Listed {
         proto::ModelEntry entry;
-        std::uint8_t status = 0xFF;  // not asked yet
-        std::string detail;
     };
-    enum class Failure { None, Early, TimedOut, Late };
+    // What the main connection's last HELLO_OK said of a model.
+    struct Answered {
+        proto::ModelEntry entry;
+        std::uint8_t status = 0xFF;
+        std::string detail;
+        bool told = false;  // a fallback for it not being ready was logged
+    };
+    struct Snapshot;
+    class SideLoad;
 
+    // Under mutex_.
     void ApplyPendingLocked();
     bool EndpointsLocked(std::vector<Endpoint>& out, std::string& reason, bool lookUpNow);
-    bool EnsureConnected(Clock::time_point deadline, std::string& reason);
-    bool Hello(Clock::time_point deadline, ProbeResult& result, std::string& reason, Failure* failure = nullptr);
-    bool Exchange(proto::MsgType type, const std::vector<std::uint8_t>& payload, Clock::time_point deadline, proto::Header& header,
-                  std::vector<std::uint8_t>& answer, std::string& reason, Failure* failure = nullptr);
-    void FailLocked(const std::string& reason, bool keepConnection);
-    void CloseLocked() noexcept;
+    bool ConnectMainLocked(int timeoutMs, std::string& reason, bool& timedOut);
+    bool HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failure, std::string& reason);
+    void StartPauseLocked(const std::string& reason);
+    void EndPauseLocked(const std::string& why);
+    void CloseLocked(const std::string& why) noexcept;
+    void ScheduleNotReadyLocked();
+    Answered* FindAnsweredLocked(const proto::ModelEntry& model);
+
+    bool Endpoints(const std::string& host, int port, std::vector<Endpoint>& out, std::string& reason, bool lookUpNow);
+    bool SettingsPending() const;
+    bool Detailed() const noexcept { return detailed_.load(); }
+    void Log(Level level, const std::string& line) const;
+    void Detail(const std::string& line) const;
+    void Wake();
+    void Loop();
+    void MaybeStartLocked();
+    void Recover(const Snapshot& snap);
+    void RehelloMain();
+    void PingMain();
+    void FirstProbe();
+    void StatusCheck();
+    void Summary(bool timed);
+    std::string StatusLine(const std::string& server, const std::string& device, const std::vector<Answered>& models) const;
     static std::vector<Listed> Newest(const std::vector<proto::ModelEntry>& models);
 
     TransportFactory factory_;
@@ -150,21 +269,56 @@ private:
         std::vector<Endpoint> endpoints;
         std::string error;
     } lookup_;
+    std::atomic<std::uint64_t> pendingGen_{0};
+    std::atomic<std::uint64_t> appliedGen_{0};
     std::atomic<int> timeoutMs_{1000};
+    std::atomic<bool> detailed_{false};
+    std::atomic<bool> lookupFailureLogged_{false};
 
-    // the connection
+    // the main connection
     mutable std::timed_mutex mutex_;
     Settings settings_;
     std::uint64_t appliedGeneration_ = 0;
     std::unique_ptr<Transport> transport_;
     std::vector<Listed> listed_;
-    bool helloCurrent_ = false;
-    bool lookupFailureLogged_ = false;
+    std::uint64_t modelsGeneration_ = 0;
+    std::vector<Answered> answered_;    // the connection's last HELLO_OK
+    bool helloCurrent_ = false;         // that HELLO listed exactly listed_
+    std::vector<std::uint32_t> owed_;   // requests that timed out on this connection, their answers still to come
+    int timeoutsInARow_ = 0;
+    Clock::time_point lastActivity_{};
     std::string lastStatusLine_;
-    Clock::time_point backoffUntil_{};
     std::uint32_t nextRequest_ = 1;
     int hellosSent_ = 0;
     int connects_ = 0;
+    int pings_ = 0;
+
+    std::atomic<bool> paused_{false};
+    std::atomic<int> runsWaiting_{0};
+    std::atomic<int> sideLoads_{0};
+    std::atomic<int> sideHellos_{0};
+
+    // the background thread and its timers: never held across the network or while taking mutex_
+    mutable std::mutex bgMutex_;
+    std::condition_variable wakeCv_;
+    bool wake_ = false;
+    bool stop_ = false;
+    bool allowThread_ = false;
+    bool active_ = false;
+    std::thread thread_;
+    int failedTries_ = 0;
+    Clock::time_point nextTry_{};
+    Clock::time_point pausedSince_{};
+    bool probeWanted_ = true;
+    Clock::time_point nextStatus_{};
+    Counters reported_;
+
+    // the counters
+    mutable std::mutex statsMutex_;
+    Counters totals_;
+    Period period_;
+    Clock::time_point lastSummary_{};
+    std::uint64_t pausedRuns_ = 0;
 };
 
 }  // namespace bfarb
