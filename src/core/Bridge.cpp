@@ -211,6 +211,16 @@ const OrtApiBase* ORT_API_CALL HookedGetApiBase() noexcept {
     g_realBase.store(real, std::memory_order_release);
     g_base.GetApi = &GetApi;
     g_base.GetVersionString = real->GetVersionString;
+    if (Bridge* b = Bridge::Current()) {
+        try {
+            const char* v = real->GetVersionString ? real->GetVersionString() : nullptr;
+            b->Connection().SetOrtVersion(v ? v : "");
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true))
+                b->LogLine(Level::Info, std::string("Better Facial Animations loaded ONNX Runtime ") + (v ? v : "?") + "; the bridge answers its OrtGetApiBase");
+        } catch (...) {
+        }
+    }
     return &g_base;
 }
 

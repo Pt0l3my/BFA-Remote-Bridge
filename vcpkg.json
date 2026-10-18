@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "bfa-remote-bridge",
+  "description": "The Windows build of BFARemoteBridge.dll: CommonLibSSE-NG's MIT line from its own registry, and spdlog. Linux builds don't use vcpkg.",
+  "supports": "windows & x64",
+  "dependencies": [
+    "commonlibsse-ng",
+    "spdlog"
+  ],
+  "overrides": [
+    {
+      "name": "fmt",
+      "version": "10.2.1"
+    }
+  ]
+}

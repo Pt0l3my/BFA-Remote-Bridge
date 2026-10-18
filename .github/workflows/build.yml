@@ -1,0 +1,162 @@
+name: Build
+
+# Linux: the core's tests against ONNX Runtime 1.24.4 and the reference server, and the reference server's own tests.
+# Windows: BFARemoteBridge.dll with MSVC, laid out as a Mod Organizer 2 mod and kept as an artifact. Run by hand with
+# "release" ticked, it also makes a draft release holding that zip.
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Make a draft release holding the zip
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Core and reference server tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ONNX Runtime 1.24.4, onnx and numpy
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet onnxruntime==1.24.4 onnx numpy
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DBFARB_PYTHON="$RUNNER_TEMP/venv/bin/python"
+          cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          cmake -S . -B build-asan -DBFARB_SANITIZE=ON -DBFARB_PYTHON="$RUNNER_TEMP/venv/bin/python"
+          cmake --build build-asan -j "$(nproc)"
+          ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure -R core_tests
+
+  windows:
+    name: BFARemoteBridge.dll (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # The vcpkg CommonLibSSE-NG's MIT line builds with: vcpkg-configuration.json's baseline.
+      VCPKG_COMMIT_ID: 19780d9cdf84d0944cf9a318666703b89ab6629c
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-binaries,readwrite
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Restore built vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-binaries
+          key: vcpkg-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Make the binary cache folder
+        shell: bash
+        run: mkdir -p vcpkg-binaries
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: true
+
+      - name: Configure
+        run: cmake --preset windows
+
+      - name: Build (keep going, so one run shows every error)
+        run: cmake --build --preset windows -- -k 0
+
+      - name: Check the DLL's SKSE exports, its imports and its runtime
+        shell: pwsh
+        run: |
+          $dll = "build/windows/BFARemoteBridge.dll"
+          $exports = dumpbin /nologo /exports $dll | Out-String
+          foreach ($name in "SKSEPlugin_Load", "SKSEPlugin_Version") {
+            if ($exports -notmatch $name) { throw "$dll doesn't export $name" }
+          }
+          $deps = dumpbin /nologo /dependents $dll | Out-String
+          if ($deps -match "(?i)(MSVCP|VCRUNTIME)\d+D\.dll|ucrtbased") { throw "$dll uses the debug runtime" }
+          if ($deps -match "(?i)onnxruntime|SkyrimNet") { throw "$dll links a DLL it should only look up" }
+          $exports -split "`n" | Select-String "SKSEPlugin"
+          $deps -split "`n" | Select-String "\.dll"
+
+      - name: Lay the mod out (a Mod Organizer 2 mod: its root is the game's Data folder)
+        shell: bash
+        run: |
+          version=$(sed -n 's/^project(BFARemoteBridge VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          echo "BFARB_VERSION=$version" >> "$GITHUB_ENV"
+          echo "BFARB_ARTIFACT=BFARemoteBridge-$version-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+          mod=mod
+          mkdir -p "$mod/SKSE/Plugins"
+          cp build/windows/BFARemoteBridge.dll build/windows/BFARemoteBridge.pdb "$mod/SKSE/Plugins/"
+          cp -r data/SKSE/Plugins/SkyrimNet "$mod/SKSE/Plugins/"
+          cp README.md "$mod/BFARemoteBridge README.md"
+          cp LICENSE "$mod/BFARemoteBridge LICENSE.txt"
+          cp THIRD-PARTY-NOTICES.md "$mod/BFARemoteBridge THIRD-PARTY-NOTICES.md"
+          find "$mod" -type f | sort
+
+      - name: Keep the mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BFARB_ARTIFACT }}
+          path: mod/
+          if-no-files-found: error
+
+      - name: Zip the mod for the release
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: pwsh
+        run: Compress-Archive -Path mod/* -DestinationPath "BFARemoteBridge-$env:BFARB_VERSION.zip"
+
+      - name: Keep the zip for the release
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zip
+          path: BFARemoteBridge-${{ env.BFARB_VERSION }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-zip
+
+      - name: Make the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^project(BFARemoteBridge VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          gh release create "v$version" "BFARemoteBridge-$version.zip" --draft --target "$GITHUB_SHA" \
+            --title "BFA Remote Bridge $version" \
+            --notes "BFA Remote Bridge $version. Install the zip with Mod Organizer 2 (Install a new mod from archive). See the README for the requirements and the settings."

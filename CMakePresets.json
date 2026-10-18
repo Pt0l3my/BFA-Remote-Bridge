@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows (MSVC, vcpkg): the core and BFARemoteBridge.dll",
+      "description": "Run from a Visual Studio developer prompt with VCPKG_ROOT set.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "BFARB_PLUGIN_DLL": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows", "configurePreset": "windows" }
+  ]
+}
