@@ -825,6 +825,21 @@ TEST(ClientStringAndItsEightyCharacters) {
     const std::string most = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX});
     CHECK(most.size() <= 80);
     CHECK(most.find("fallbacks") == std::string::npos || most.find("timeouts") == std::string::npos);
+    // exactly 80 keeps every key; 81 drops the last
+    const auto ofDigits = [](std::size_t n) {
+        std::uint64_t v = 1;
+        for (std::size_t i = 1; i < n; ++i) v *= 10;
+        return v;
+    };
+    const std::size_t room = 80 - fixed;  // the digits the three counts may have between them
+    const std::size_t a = std::min<std::size_t>(19, room - 2), f = room - a - 1;
+    const std::string exact = ClientString(Counters{ofDigits(a), ofDigits(f), 7});
+    CHECK_EQ(exact.size(), std::size_t{80});
+    CHECK(exact.find("timeouts 7)") != std::string::npos);
+    const std::string over = ClientString(Counters{ofDigits(a), ofDigits(f), 17});
+    CHECK(over.find("timeouts") == std::string::npos);
+    CHECK(over.find("fallbacks") != std::string::npos);
+    CHECK(over.size() <= 80);
     CHECK_EQ(ClientString(Counters{1, 2, 3}, 10), name.substr(0, 10));
     CHECK_EQ(ClientString(Counters{1, 2, 3}, name.size()), name);
 }

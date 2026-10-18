@@ -90,10 +90,16 @@ class Conn:
         return kind, self.recv_exact(length) if length else b""
 
     def closed(self):
+        """Whether the server closed the connection: an end of stream or a reset within 5 s; still open after that."""
+        self.s.settimeout(5)
         try:
             return self.s.recv(1) == b""
+        except socket.timeout:
+            return False
         except OSError:
             return True
+        finally:
+            self.s.settimeout(30)
 
     def close(self):
         self.s.close()
