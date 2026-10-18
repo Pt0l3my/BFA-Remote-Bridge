@@ -45,6 +45,7 @@
 #include "core/Log.h"
 #include "core/Protocol.h"
 #include "core/Settings.h"
+#include "core/Sha256.h"
 #include "core/Transport.h"
 #include "onnxruntime_c_api.h"
 
@@ -81,7 +82,7 @@ class Bridge {
 public:
     static constexpr std::uint64_t kSessionMagic = 0x4252444745425246ull;  // "FRBEGDRB": a bridge session
 
-    Bridge(TransportFactory factory, LogSink log, Client::Now now = &Clock::now);
+    Bridge(TransportFactory factory, Resolver resolver, LogSink log, Client::Now now = &Clock::now);
     ~Bridge();
     Bridge(const Bridge&) = delete;
     Bridge& operator=(const Bridge&) = delete;
@@ -96,7 +97,10 @@ public:
     enum class ApiState { NotAsked, Known, Unknown };
     static ApiState State() noexcept;
 
+    // The settings read from SkyrimNet. Until the first, a model load is refused when ExpectSettings(true) said
+    // SkyrimNet is loaded (its config may not be registered yet), and passes through otherwise (the bridge is idle).
     void Apply(const Settings& settings);
+    void ExpectSettings(bool expect);
     Settings CurrentSettings() const;
     Client& Connection() noexcept { return client_; }
     Stats Statistics() const;
@@ -134,6 +138,12 @@ private:
         OrtSession* local = nullptr;  // check mode's real session, or null
         int checks = 0;
         bool unsupportedLogged = false;
+        bool superseded = false;  // a newer session of the same model replaced it
+    };
+    struct HashEntry {
+        std::uint64_t size = 0;
+        std::filesystem::file_time_type written{};
+        Sha256::Digest digest{};
     };
     struct OptionsInfo {
         std::vector<proto::Override> overrides;
@@ -141,6 +151,9 @@ private:
     };
 
     OrtStatus* Refuse(const OrtApi* real, const std::string& model, const Admission& a);
+    OrtStatus* RefuseWith(const OrtApi* real, const std::string& model, const std::string& why, const Notice* notice);
+    // The model's size and SHA-256, hashed again only when its path, size or modification time changed.
+    bool HashCached(const std::filesystem::path& file, std::uint64_t& size, Sha256::Digest& digest, std::string& err);
     void PushModelsLocked();
     std::vector<proto::ModelEntry> LiveModelsLocked() const;
     void Log(Level level, const std::string& line) const;
@@ -154,6 +167,11 @@ private:
 
     mutable std::mutex settingsMutex_;
     Settings settings_;
+    std::atomic<bool> settingsRead_{false};
+    std::atomic<bool> expectSettings_{false};
+
+    std::mutex hashMutex_;
+    std::map<std::string, HashEntry> hashes_;
 
     mutable std::mutex sessionsMutex_;
     std::unordered_map<const OrtSessionOptions*, OptionsInfo> options_;

@@ -12,6 +12,7 @@ std::string Bfa(const std::string& version) { return "Better Facial Animations" 
 std::string LoadStatusText(const StatusFacts& f) {
     if (!f.enabled) return kPrefix + "off.";
     if (!f.bfaFound) return kPrefix + "Better Facial Animations wasn't found, so the bridge is idle.";
+    if (!f.knownBfa) return NoticeText(Notice{Notice::Kind::UnknownRuntime, {}, {}}, f.bfaVersion);
     if (!f.hooked) return kPrefix + Bfa(f.bfaVersion) + " found, but the bridge couldn't attach to it, so BFA runs as usual.";
     if (!f.addressSet)
         return kPrefix + (f.skyrimNet ? "no server address is set, so the bridge is idle and BFA runs as usual."

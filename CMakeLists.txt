@@ -61,6 +61,7 @@ add_library(bfarb_core STATIC
   src/core/Client.cpp
   src/core/PeImage.cpp
   src/core/Protocol.cpp
+  src/core/Scrub.cpp
   src/core/Settings.cpp
   src/core/Sha256.cpp
   src/core/Status.cpp)

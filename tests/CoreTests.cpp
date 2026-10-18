@@ -9,6 +9,7 @@
 
 #include "Test.h"
 #include "core/PeImage.h"
+#include "core/Scrub.h"
 #include "core/Settings.h"
 #include "core/Sha256.h"
 #include "core/Status.h"
@@ -210,6 +211,10 @@ TEST(StatusTexts) {
     f.bfaFound = true;
     f.bfaVersion = "4.3.2";
     CHECK(LoadStatusText(f).find("couldn't attach") != std::string::npos);
+    f.knownBfa = false;  // another BFA than 4.3.x: never attached to
+    CHECK_EQ(LoadStatusText(f),
+             std::string("BFA Remote Bridge: this Better Facial Animations uses an ONNX Runtime the bridge doesn't know, so BFA runs as usual."));
+    f.knownBfa = true;
     f.hooked = true;
     CHECK(LoadStatusText(f).find("no server address is set") != std::string::npos);
     f.skyrimNet = false;
@@ -347,4 +352,20 @@ TEST(PeReadsBetterFacialAnimationsDll) {
     CHECK_EQ(std::string(v.pluginName), std::string("BetterFacialAnimations"));
     std::printf("        BFA's DLL: GetProcAddress's IAT slot at RVA 0x%zx, SKSEPlugin_Version at RVA 0x%x, version %s\n", slot, rva,
                 pe::UnpackVersion(v.pluginVersion).c_str());
+}
+
+// ---- paths out of other programs' messages
+
+TEST(ScrubPathsKeepsBaseNamesOnly) {
+    const std::string win = "C:\\Games\\Skyrim Special Edition\\Data\\SKSE\\Plugins\\BetterFacialAnimations\\a2f3_fp16.onnx";
+    CHECK_EQ(ScrubPaths("Load model from " + win + " failed: no such file", win),
+             std::string("Load model from a2f3_fp16.onnx failed: no such file"));
+    // a path not given, with spaces: each word that reads as a path keeps its last part, so no folder survives whole
+    CHECK_EQ(ScrubPaths("Load model from " + win + " failed"), std::string("Load model from Skyrim Special a2f3_fp16.onnx failed"));
+    CHECK_EQ(ScrubPaths("Load model from /tmp/some folder/x/broken.onnx failed:Protobuf parsing failed.", "/tmp/some folder/x/broken.onnx"),
+             std::string("Load model from broken.onnx failed:Protobuf parsing failed."));
+    CHECK_EQ(ScrubPaths("open(/home/someone/m.onnx): denied"), std::string("open(m.onnx): denied"));
+    CHECK_EQ(ScrubPaths("in D:/mods/BFA/net.onnx."), std::string("in net.onnx."));
+    CHECK_EQ(ScrubPaths("Check tiny.onnx 1/2: y largest difference 0"), std::string("Check tiny.onnx 1/2: y largest difference 0"));
+    CHECK_EQ(ScrubPaths("ratio 3/4 and http-ish a/b"), std::string("ratio 3/4 and http-ish a/b"));
 }

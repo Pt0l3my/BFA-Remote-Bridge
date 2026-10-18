@@ -213,6 +213,11 @@ class ReferenceServerTests(unittest.TestCase):
             (frame(1, b"", version=2), 6),           # protocol version 2
             (hello("wrong", [self.entry]), 2),       # wrong key
             (hello("sesame", [("../tiny.onnx", 1, b"\0" * 32, [])]), 1),  # a name with a path
+            (hello("sesame", [("models\\tiny.onnx", 1, b"\0" * 32, [])]), 1),  # a backslash
+            (hello("sesame", [("C:tiny.onnx", 1, b"\0" * 32, [])]), 1),  # a drive letter's colon
+            (hello("sesame", [("tiny..onnx", 1, b"\0" * 32, [])]), 1),  # ".." anywhere
+            (hello("sesame", [("..", 1, b"\0" * 32, [])]), 1),
+            (hello("sesame", [("x" * 300 + ".onnx", 1, b"\0" * 32, [])]), 1),  # over-long
             (run(1, "tiny.onnx", [], []), 1),        # RUN before HELLO
             (frame(1, b"\x01"), 1),                  # truncated HELLO
         ]
@@ -234,18 +239,26 @@ class ReferenceServerTests(unittest.TestCase):
         c.send(run(6, "tiny.onnx", [("x", np.zeros((1, 2), np.float32))], ["y"]))  # inference fails
         kind, payload = c.answer()
         self.assertEqual((kind, error_code(payload)), (5, (6, 4)))
-        c.send(frame(3, b"", length=64 * 1024 * 1024 + 1)[:12])  # too large: refused before any payload is read
-        # the server reads and drops the announced payload; send it in full
-        remaining = 64 * 1024 * 1024 + 1
-        chunk = b"\0" * (1 << 20)
-        while remaining > 0:
-            n = min(remaining, len(chunk))
-            c.send(chunk[:n])
-            remaining -= n
-        kind, payload = c.answer()
-        self.assertEqual((kind, error_code(payload)[1]), (5, 5))
         c.send(frame(6, b""))
         self.assertEqual(c.answer()[0], 7)  # still open
+        # names in a RUN: a path, an over-long model name, an over-long tensor name
+        for model, inputs in [("..\\tiny.onnx", []), ("y" * 300, []), ("tiny.onnx", [("z" * 300, np.zeros(1, np.float32))])]:
+            c.send(run(9, model, inputs, ["y"]))
+            kind, payload = c.answer()
+            self.assertEqual((kind, error_code(payload)), (5, (9, 1)))
+            self.assertTrue(c.closed())
+            c = self.connect()
+            c.send(hello("sesame", [self.entry]))
+            self.assertEqual(c.answer()[0], 2)
+
+    def test_oversize_frame_is_refused_and_closed(self):
+        c = self.connect()
+        c.send(hello("sesame", [self.entry]))
+        self.assertEqual(c.answer()[0], 2)
+        c.send(frame(3, b"", length=64 * 1024 * 1024 + 1)[:12])  # the header alone: the payload is never read
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload)[1]), (5, 5))
+        self.assertTrue(c.closed())
 
 
 if __name__ == "__main__":

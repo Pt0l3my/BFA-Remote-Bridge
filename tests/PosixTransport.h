@@ -21,8 +21,7 @@ class PosixTransport final : public Transport {
 public:
     ~PosixTransport() override { Close(); }
 
-    bool Connect(const std::string& host, std::uint16_t port, int timeoutMs, std::string& err) override {
-        Close();
+    static bool Resolve(const std::string& host, std::uint16_t port, std::vector<Endpoint>& out, std::string& err) {
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -31,13 +30,24 @@ public:
             err = "the address doesn't resolve";
             return false;
         }
+        out.clear();
+        for (addrinfo* a = found; a; a = a->ai_next) {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(a->ai_addr);
+            out.push_back(Endpoint{a->ai_family, std::vector<std::uint8_t>(p, p + a->ai_addrlen)});
+        }
+        freeaddrinfo(found);
+        return true;
+    }
+
+    bool Connect(const std::vector<Endpoint>& endpoints, int timeoutMs, std::string& err) override {
+        Close();
         const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
         err = "no address answered";
-        for (addrinfo* a = found; a; a = a->ai_next) {
-            const int s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        for (const Endpoint& a : endpoints) {
+            const int s = ::socket(a.family, SOCK_STREAM, 0);
             if (s < 0) continue;
             ::fcntl(s, F_SETFL, ::fcntl(s, F_GETFL) | O_NONBLOCK);
-            int rc = ::connect(s, a->ai_addr, a->ai_addrlen);
+            int rc = ::connect(s, reinterpret_cast<const sockaddr*>(a.address.data()), static_cast<socklen_t>(a.address.size()));
             if (rc != 0 && errno == EINPROGRESS) {
                 pollfd p{s, POLLOUT, 0};
                 rc = Wait(p, deadline) ? 0 : -1;
@@ -56,50 +66,49 @@ public:
             }
             ::close(s);
         }
-        freeaddrinfo(found);
         return fd_ >= 0;
     }
 
-    bool SendAll(const std::uint8_t* data, std::size_t n, Clock::time_point deadline, std::string& err) override {
+    Result SendAll(const std::uint8_t* data, std::size_t n, Clock::time_point deadline, std::string& err) override {
         while (n > 0) {
             pollfd p{fd_, POLLOUT, 0};
             if (!Wait(p, deadline)) {
                 err = "timed out";
-                return false;
+                return Result::TimedOut;
             }
             const ssize_t k = ::send(fd_, data, n, MSG_NOSIGNAL);
             if (k < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (k <= 0) {
                 err = std::strerror(errno);
-                return false;
+                return errno == EPIPE || errno == ECONNRESET ? Result::Closed : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);
         }
-        return true;
+        return Result::Ok;
     }
 
-    bool ReceiveAll(std::uint8_t* data, std::size_t n, Clock::time_point deadline, std::string& err) override {
+    Result ReceiveAll(std::uint8_t* data, std::size_t n, Clock::time_point deadline, std::string& err) override {
         while (n > 0) {
             pollfd p{fd_, POLLIN, 0};
             if (!Wait(p, deadline)) {
                 err = "timed out";
-                return false;
+                return Result::TimedOut;
             }
             const ssize_t k = ::recv(fd_, data, n, 0);
             if (k < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (k == 0) {
                 err = "the connection closed";
-                return false;
+                return Result::Closed;
             }
             if (k < 0) {
                 err = std::strerror(errno);
-                return false;
+                return errno == ECONNRESET ? Result::Closed : Result::Failed;
             }
             data += k;
             n -= static_cast<std::size_t>(k);
         }
-        return true;
+        return Result::Ok;
     }
 
     void Close() noexcept override {

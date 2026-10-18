@@ -13,6 +13,7 @@ struct StatusFacts {
     bool skyrimNet = true;   // SkyrimNet's settings could be read
     bool bfaFound = false;
     std::string bfaVersion;  // "4.3.2"; empty when unknown
+    bool knownBfa = true;    // a version the bridge attaches to (4.3.x)
     bool hooked = false;     // the GetProcAddress patch is in place
     bool addressSet = false;
 };

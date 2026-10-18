@@ -67,9 +67,13 @@ BfaFacts FindAndHookBfa() {
         facts.version = pe::UnpackVersion(v.pluginVersion);
     }
     Log(Level::Info, "Better Facial Animations " + (facts.version.empty() ? std::string("(version unknown)") : facts.version) + " found");
-    if (facts.version.rfind("4.3.2", 0) != 0)
-        Log(Level::Warn, "The bridge was made for Better Facial Animations 4.3.2; it attaches anyway, and passes everything through if its ONNX "
-                         "Runtime isn't the one it knows");
+    // Only 4.3.x: another BFA may use the runtime in ways the bridge's sessions don't answer
+    facts.knownVersion = facts.version.rfind("4.3.", 0) == 0;
+    if (!facts.knownVersion) {
+        facts.problem = "the bridge attaches only to Better Facial Animations 4.3.x";
+        Log(Level::Warn, "The bridge attaches only to Better Facial Animations 4.3.x, so it passes everything through and BFA runs as usual");
+        return facts;
+    }
 
     // BFA's runtime already loaded: BFA has its OrtGetApiBase already, so the bridge stays out of the way
     std::wstring folder = ModulePath(bfa);

@@ -1,6 +1,8 @@
 // The connection logic against a scripted server: HELLO at a model load and its answers, RUN, the failures and the
 // 10-second backoff, HELLO again when the live models change, and the probe.
 
+#include <thread>
+
 #include "Scripted.h"
 #include "Test.h"
 #include "core/Client.h"
@@ -87,7 +89,7 @@ TEST(ClientAdmitsAndRuns) {
         return type == 1 ? HelloOkFor(p, 0) : RunOkFor(p);
     };
     std::vector<std::string> log;
-    Client c(ScriptedFactory(script), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
+    Client c(ScriptedFactory(script), ScriptedResolver(), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
     c.Configure(On());
     const auto m = Model("a.onnx");
     const Admission a = c.Admit({}, m);
@@ -112,7 +114,7 @@ TEST(ClientAdmitRefusals) {
     {
         auto script = std::make_shared<Script>();
         script->refuseConnect = true;
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         c.Configure(On());
         const Admission a = c.Admit({}, m);
         CHECK(!a.Ready());
@@ -121,7 +123,7 @@ TEST(ClientAdmitRefusals) {
     // no answer in time
     {
         auto script = std::make_shared<Script>();
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         c.Configure(On());
         CHECK(c.Admit({}, m).hello.kind == ProbeResult::Kind::NoAnswer);
     }
@@ -129,7 +131,7 @@ TEST(ClientAdmitRefusals) {
     {
         auto script = std::make_shared<Script>();
         script->answer = [](std::uint16_t, const std::vector<std::uint8_t>&) { return ErrorFrame(0, proto::ErrorCode::WrongKey); };
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         c.Configure(On());
         CHECK(c.Admit({}, m).hello.kind == ProbeResult::Kind::WrongKey);
     }
@@ -137,7 +139,7 @@ TEST(ClientAdmitRefusals) {
     for (std::uint8_t status : {1, 2, 3, 4}) {
         auto script = std::make_shared<Script>();
         script->answer = [status](std::uint16_t, const std::vector<std::uint8_t>& p) { return HelloOkFor(p, status, "why"); };
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         c.Configure(On());
         const Admission a = c.Admit({}, m);
         CHECK(!a.Ready());
@@ -149,14 +151,14 @@ TEST(ClientAdmitRefusals) {
     {
         auto script = std::make_shared<Script>();
         script->answer = [](std::uint16_t, const std::vector<std::uint8_t>&) { return Frame(proto::MsgType::HelloOk, {1, 2, 3}); };
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         c.Configure(On());
         CHECK(c.Admit({}, m).hello.kind == ProbeResult::Kind::Refused);
     }
     // no address
     {
         auto script = std::make_shared<Script>();
-        Client c(ScriptedFactory(script), nullptr, &FakeNow);
+        Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
         CHECK(c.Admit({}, m).hello.kind == ProbeResult::Kind::NoAddress);
         CHECK_EQ(script->connects, 0);
     }
@@ -175,7 +177,7 @@ TEST(ClientFailureStartsTheBackoff) {
         return RunOkFor(p);
     };
     std::vector<std::string> log;
-    Client c(ScriptedFactory(script), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
+    Client c(ScriptedFactory(script), ScriptedResolver(), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
     c.Configure(On());
     const auto m = Model("a.onnx");
     CHECK(c.Admit({}, m).Ready());
@@ -221,7 +223,7 @@ TEST(ClientHelloAgainWhenModelsChange) {
         }
         return RunOkFor(p);
     };
-    Client c(ScriptedFactory(script), nullptr, &FakeNow);
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
     c.Configure(On());
     const auto a = Model("a.onnx"), b = Model("b.onnx");
     CHECK(c.Admit({}, a).Ready());
@@ -236,9 +238,10 @@ TEST(ClientHelloAgainWhenModelsChange) {
     CHECK(c.Run(a, req, reply, reason) == Client::Outcome::Forwarded);
     CHECK(c.Run(a, req, reply, reason) == Client::Outcome::Forwarded);
     CHECK(listed == (std::vector<std::size_t>{1, 2, 1}));
-    // b is no longer listed: a run of it fails
+    // b is no longer listed: a run of it is skipped, without a backoff
     auto reqB = Request(b);
-    CHECK(c.Run(b, reqB, reply, reason) == Client::Outcome::Failed);
+    CHECK(c.Run(b, reqB, reply, reason) == Client::Outcome::Skipped);
+    CHECK(!c.BackingOff());
 }
 
 TEST(ClientModelNoLongerReady) {
@@ -248,7 +251,7 @@ TEST(ClientModelNoLongerReady) {
         if (type == 1) return HelloOkFor(p, ++hellos == 1 ? 0 : 3, "gone");
         return ErrorFrame(0, proto::ErrorCode::UnknownModel);
     };
-    Client c(ScriptedFactory(script), nullptr, &FakeNow);
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
     c.Configure(On());
     const auto m = Model("a.onnx");
     CHECK(c.Admit({}, m).Ready());
@@ -265,7 +268,7 @@ TEST(ClientModelNoLongerReady) {
 TEST(ClientProbe) {
     auto script = std::make_shared<Script>();
     script->answer = [](std::uint16_t, const std::vector<std::uint8_t>& p) { return HelloOkFor(p, 0); };
-    Client c(ScriptedFactory(script), nullptr, &FakeNow);
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
     CHECK(c.Probe().kind == ProbeResult::Kind::NoAddress);
     c.Configure(On());
     const ProbeResult r = c.Probe();
@@ -279,4 +282,150 @@ TEST(ClientProbe) {
     bad[4] = 2;  // version 2
     script->answer = [&](std::uint16_t, const std::vector<std::uint8_t>&) { return bad; };
     CHECK(c.Probe().kind == ProbeResult::Kind::Refused);
+}
+
+// Configure is called on the game's main thread: it never waits, even while a HELLO holds the connection.
+TEST(ClientConfigureNeverWaits) {
+    auto script = std::make_shared<Script>();
+    script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) { return type == 1 ? HelloOkFor(p, 0) : RunOkFor(p); };
+    script->answerDelayMs = 1500;  // a server loading the model
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
+    c.Configure(On());
+    const auto m = Model("a.onnx");
+    Admission a;
+    std::thread admit([&] { a = c.Admit({}, m); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // the HELLO is in flight
+    Settings changed = On();
+    changed.timeoutMs = 400;
+    const auto start = Clock::now();
+    c.Configure(changed);
+    c.SetOrtVersion("1.24.4");
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+    admit.join();
+    CHECK(took < 50);
+    CHECK(a.Ready());
+    // the next run applies the change: the connection is opened again
+    script->answerDelayMs = 0;
+    c.SetModels({m});
+    auto req = Request(m);
+    Client::Reply reply;
+    std::string reason;
+    CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Forwarded);
+    CHECK_EQ(c.Reconnects(), 2);
+}
+
+TEST(ClientHelloOkOutOfOrderIsRefused) {
+    auto script = std::make_shared<Script>();
+    script->answer = [](std::uint16_t, const std::vector<std::uint8_t>& p) {
+        proto::Hello h;
+        std::string err;
+        proto::DecodeHello(p.data(), p.size(), h, err);
+        proto::HelloOk ok;
+        ok.server = "scripted";
+        ok.device = "CPU";
+        for (auto it = h.models.rbegin(); it != h.models.rend(); ++it) ok.models.push_back({it->name, 0, ""});
+        std::vector<std::uint8_t> out;
+        proto::EncodeHelloOk(ok, out, err);
+        return Frame(proto::MsgType::HelloOk, out);
+    };
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
+    c.Configure(On());
+    const auto a = Model("a.onnx"), b = Model("b.onnx");
+    CHECK(c.Admit({}, a).Ready());  // one model: no order to get wrong
+    const Admission second = c.Admit({a}, b);
+    CHECK(!second.Ready());
+    CHECK(second.hello.kind == ProbeResult::Kind::Refused);
+    CHECK(second.detail.find("out of order") != std::string::npos);
+}
+
+// A connection the server closed while idle is opened again within the same call, without a backoff.
+TEST(ClientReconnectsAnIdleConnectionOnce) {
+    auto script = std::make_shared<Script>();
+    script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) { return type == 1 ? HelloOkFor(p, 0) : RunOkFor(p); };
+    std::vector<std::string> log;
+    Client c(ScriptedFactory(script), ScriptedResolver(), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
+    c.Configure(On());
+    const auto m = Model("a.onnx");
+    CHECK(c.Admit({}, m).Ready());
+    c.SetModels({m});
+    auto req = Request(m);
+    Client::Reply reply;
+    std::string reason;
+    CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Forwarded);
+    script->closeBeforeAnswer = true;
+    CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Forwarded);
+    CHECK(!c.BackingOff());
+    CHECK_EQ(c.Reconnects(), 2);
+    CHECK_EQ(Count(script->received, proto::MsgType::Hello), 2);
+    // a timeout on a reused connection isn't retried: it ends in the backoff
+    script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        return type == 1 ? HelloOkFor(p, 0) : std::vector<std::uint8_t>{};
+    };
+    CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Failed);
+    CHECK_EQ(c.Reconnects(), 2);
+}
+
+// The name is looked up once per settings change; a failed lookup is logged once and runs are skipped until the
+// settings change.
+TEST(ClientNameLookup) {
+    auto script = std::make_shared<Script>();
+    script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) { return type == 1 ? HelloOkFor(p, 0) : RunOkFor(p); };
+    auto calls = std::make_shared<int>(0);
+    std::vector<std::string> log;
+    Client c(ScriptedFactory(script), ScriptedResolver(calls), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
+    Settings s = On();
+    s.serverAddress = "server.invalid";
+    c.Configure(s);
+    CHECK(!c.Resolve());
+    const auto m = Model("a.onnx");
+    const Admission a = c.Admit({}, m);
+    CHECK(a.hello.kind == ProbeResult::Kind::NoAnswer);
+    CHECK(a.detail.find("couldn't be looked up") != std::string::npos);
+    c.SetModels({m});
+    auto req = Request(m);
+    Client::Reply reply;
+    std::string reason;
+    for (int i = 0; i < 3; ++i) CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Skipped);
+    int lines = 0;
+    for (const auto& l : log) lines += l.find("until the settings change") != std::string::npos;
+    CHECK_EQ(lines, 1);
+    CHECK_EQ(*calls, 1);  // runs never look the name up
+    CHECK_EQ(script->connects, 0);
+    s.serverAddress = "server.example";
+    c.Configure(s);
+    CHECK(c.Resolve());
+    CHECK(c.Admit({}, m).Ready());
+    CHECK_EQ(*calls, 2);
+    CHECK(c.Run(m, req, reply, reason) == Client::Outcome::Forwarded);
+}
+
+// BFA can drop a session without releasing it: the newest session of a model name is the one HELLO lists.
+TEST(ClientNewestSessionOfAModelWins) {
+    auto script = std::make_shared<Script>();
+    std::vector<std::size_t> listed;
+    script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1) {
+            proto::Hello h;
+            std::string err;
+            proto::DecodeHello(p.data(), p.size(), h, err);
+            listed.push_back(h.models.size());
+            return HelloOkFor(p, 0);
+        }
+        return RunOkFor(p);
+    };
+    Client c(ScriptedFactory(script), ScriptedResolver(), nullptr, &FakeNow);
+    c.Configure(On());
+    const auto old = Model("a.onnx");
+    auto fresh = Model("a.onnx");
+    fresh.overrides = {{"batch", 2}};
+    CHECK(c.Admit({}, old).Ready());
+    CHECK(c.Admit({old}, fresh).Ready());  // not refused: it replaces the old one
+    c.SetModels({old, fresh});
+    auto req = Request(fresh);
+    Client::Reply reply;
+    std::string reason;
+    CHECK(c.Run(fresh, req, reply, reason) == Client::Outcome::Forwarded);
+    CHECK(c.Run(old, req, reply, reason) == Client::Outcome::Skipped);
+    CHECK(!c.BackingOff());
+    CHECK(listed == (std::vector<std::size_t>{1, 1}));
 }

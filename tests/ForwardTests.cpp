@@ -20,10 +20,12 @@
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <thread>
 
 #include "PosixTransport.h"
 #include "Test.h"
 #include "core/Bridge.h"
+#include "core/Scrub.h"
 
 extern char** environ;
 
@@ -110,7 +112,9 @@ int DeadPort() {
     PosixTransport t;
     for (int port = 47000; port < 47100; ++port) {
         std::string err;
-        if (!t.Connect("127.0.0.1", static_cast<std::uint16_t>(port), 200, err)) return port;
+        std::vector<Endpoint> where;
+        PosixTransport::Resolve("127.0.0.1", static_cast<std::uint16_t>(port), where, err);
+        if (!t.Connect(where, 200, err)) return port;
         t.Close();
     }
     throw Failure("no free port");
@@ -130,15 +134,16 @@ struct Harness {
     OrtEnv* env = nullptr;
     OrtMemoryInfo* cpu = nullptr;
 
-    explicit Harness(Settings s)
-        : bridge([] { return std::make_unique<PosixTransport>(); },
+    explicit Harness(Settings s, bool apply = true, bool expectSettings = false)
+        : bridge([] { return std::make_unique<PosixTransport>(); }, &PosixTransport::Resolve,
                  [this](Level, const std::string& l) {
                      std::lock_guard lock(mutex);
                      log.push_back(l);
                  },
                  &FakeNow) {
         Bridge::SetCurrent(&bridge);
-        bridge.Apply(s);
+        bridge.ExpectSettings(expectSettings);
+        if (apply) bridge.Apply(s);
         bridge.OnNotice([this](const Notice& n) {
             std::lock_guard lock(mutex);
             notices.push_back(n);
@@ -716,4 +721,159 @@ TEST(ForwardUnsupportedInputAnswersNan) {
     }
     h.api->ReleaseValue(b);
     h.api->ReleaseSession(session);
+}
+
+// Every other runtime entry that takes a session answers a bridge session with an error, without the runtime; a real
+// session's call is the real one.
+TEST(ForwardOtherSessionEntriesRefuseBridgeSessions) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtSession* bridged = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &bridged));
+    const auto refused = [&](OrtStatus* st) {
+        const bool ok = st && std::string(h.api->GetErrorMessage(st)).rfind("BFA Remote Bridge: ", 0) == 0;
+        if (st) h.api->ReleaseStatus(st);
+        return ok;
+    };
+    std::size_t count = 99;
+    CHECK(refused(h.api->SessionGetInputCount(bridged, &count)));
+    CHECK_EQ(count, std::size_t{99});
+    OrtAllocator* allocator = nullptr;
+    Ok(h.api->GetAllocatorWithDefaultOptions(&allocator));
+    char* name = nullptr;
+    CHECK(refused(h.api->SessionGetOutputName(bridged, 0, allocator, &name)));
+    CHECK(name == nullptr);
+    OrtModelMetadata* metadata = nullptr;
+    CHECK(refused(h.api->SessionGetModelMetadata(bridged, &metadata)));
+    OrtIoBinding* binding = nullptr;
+    CHECK(refused(h.api->CreateIoBinding(bridged, &binding)));
+    if (const OrtModelEditorApi* editor = h.api->GetModelEditorApi()) {
+        int opset = 0;
+        CHECK(refused(editor->SessionGetOpsetForDomain(bridged, "", &opset)));
+    }
+    h.api->ReleaseSession(bridged);
+
+    Harness off(Settings{});  // a real session: the real answers
+    OrtSession* real = nullptr;
+    Ok(off.Create(Models() / "tiny.onnx", {{"batch", 2}}, &real));
+    Ok(off.api->SessionGetInputCount(real, &count));
+    CHECK_EQ(count, std::size_t{5});
+    Ok(off.api->SessionGetOutputName(real, 0, allocator, &name));
+    CHECK_EQ(std::string(name), std::string("y"));
+    allocator->Free(allocator, name);
+    Ok(off.api->CreateIoBinding(real, &binding));
+    off.api->ReleaseIoBinding(binding);
+    off.api->ReleaseSession(real);
+}
+
+// BFA can drop a session without releasing it: a newer session of the same model with other overrides is admitted,
+// and the old one answers NaN, without a backoff.
+TEST(ForwardNewestSessionReplacesALeakedOne) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtSession* leaked = nullptr;
+    OrtSession* fresh = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &leaked));
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}, {"unused_dimension", 1}}, &fresh));
+    TinyInputs in(h.api, h.cpu, 4);
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(leaked, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK(!h.bridge.Connection().BackingOff());
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(fresh, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK_EQ(h.CountLogged("for the next 10 seconds"), 0);
+    h.api->ReleaseSession(fresh);
+    h.api->ReleaseSession(leaked);
+}
+
+// Before the first settings read: refused while SkyrimNet is loaded (its config may not be registered yet), passed
+// through (and logged) when it isn't; pass-throughs are logged with their reason.
+TEST(ForwardBeforeTheSettingsAreRead) {
+    Need();
+    {
+        Harness h(Settings{}, false, true);
+        OrtSession* s = nullptr;
+        OrtStatus* st = h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s);
+        CHECK(st != nullptr);
+        CHECK_EQ(std::string(h.api->GetErrorMessage(st)),
+                 std::string("BFA Remote Bridge: tiny.onnx isn't loaded, since the bridge's settings weren't read yet; lines get the game's own lip sync"));
+        h.api->ReleaseStatus(st);
+        CHECK(s == nullptr);
+    }
+    {
+        Harness h(Settings{}, false, false);
+        OrtSession* s = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s));
+        CHECK(!h.bridge.IsBridgeSession(s));
+        CHECK(h.Logged("loads on this PC as usual: SkyrimNet isn't loaded"));
+        h.api->ReleaseSession(s);
+    }
+    for (bool enabled : {false, true}) {
+        Settings off;
+        off.enabled = enabled;
+        Harness h(off);
+        OrtSession* s = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s));
+        CHECK(h.Logged(enabled ? "loads on this PC as usual: no server address is set" : "loads on this PC as usual: the bridge is off"));
+        h.api->ReleaseSession(s);
+    }
+}
+
+// A connection the server closed while idle (here after a second) is opened again in the same call.
+TEST(ForwardReconnectsAfterTheServerClosesAnIdleConnection) {
+    Need();
+    Server server(Models(), {"--idle-seconds", "1"});
+    Harness h(On(server.Port()));
+    OrtSession* s = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s));
+    TinyInputs in(h.api, h.cpu, 2);
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(s, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(s, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK(h.Logged("had closed the connection; reconnecting"));
+    CHECK_EQ(h.CountLogged("for the next 10 seconds"), 0);
+    CHECK_EQ(h.bridge.Statistics().forwarded, 2u);
+    h.api->ReleaseSession(s);
+}
+
+// ONNX Runtime's own messages name the model's full path: what the bridge logs keeps the base name only.
+TEST(ForwardRuntimeMessagesLoseTheirPaths) {
+    Need();
+    const fs::path folder = TempFolder("secret folder name");
+    const fs::path missing = folder / "absent.onnx";
+    const OrtApi* real = RealApi();
+    OrtEnv* env = nullptr;
+    Ok(real->CreateEnv(ORT_LOGGING_LEVEL_FATAL, "bfarb-scrub", &env));
+    OrtSessionOptions* so = nullptr;
+    Ok(real->CreateSessionOptions(&so));
+    OrtSession* s = nullptr;
+    OrtStatus* st = real->CreateSession(env, missing.c_str(), so, &s);
+    CHECK(st != nullptr);
+    const std::string message = real->GetErrorMessage(st);
+    real->ReleaseStatus(st);
+    real->ReleaseSessionOptions(so);
+    real->ReleaseEnv(env);
+    CHECK(message.find("secret folder name") != std::string::npos);  // the runtime's own text has it
+    const std::string scrubbed = ScrubPaths(message, missing.string());
+    CHECK(scrubbed.find("secret folder name") == std::string::npos);
+    CHECK(scrubbed.find(fs::temp_directory_path().string()) == std::string::npos);
+    CHECK(scrubbed.find("absent.onnx") != std::string::npos);
+    std::printf("        %s\n", scrubbed.c_str());
+    fs::remove_all(folder);
 }

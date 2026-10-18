@@ -37,6 +37,7 @@ READY, NOT_FOUND, DIFFERENT_FILE, FAILED_TO_LOAD, NOT_ALLOWED = 0, 1, 2, 3, 4
 
 E_MALFORMED, E_WRONG_KEY, E_UNKNOWN_MODEL, E_INFERENCE, E_TOO_LARGE, E_VERSION, E_BUSY = 1, 2, 3, 4, 5, 6, 7
 CLOSING_ERRORS = {E_MALFORMED, E_WRONG_KEY, E_VERSION}
+MAX_NAME = 255  # bytes of a model or tensor name; longer is malformed
 
 DTYPES = {1: np.dtype("<f4"), 6: np.dtype("<i4"), 7: np.dtype("<i8"), 10: np.dtype("<f2"), 11: np.dtype("<f8")}
 CODES = {v: k for k, v in DTYPES.items()}
@@ -69,7 +70,7 @@ class Refusal(Exception):
 
 
 def valid_name(name):
-    if not name or name in (".", "..") or ".." in name:
+    if not name or name in (".", "..") or ".." in name or len(name.encode("utf-8")) > MAX_NAME:
         return False
     return not any(c in "/\\:" or ord(c) < 0x20 or ord(c) == 0x7F for c in name)
 
@@ -130,6 +131,8 @@ def error_payload(request_id, code, message):
 
 def read_tensor(r):
     name = r.str()
+    if not name or len(name.encode("utf-8")) > MAX_NAME:
+        raise Refusal(E_MALFORMED, "a tensor name is empty or longer than %d bytes" % MAX_NAME)
     code = r.u8()
     rank = r.u8()
     dims = [r.i64() for _ in range(rank)]
@@ -286,12 +289,9 @@ class Handler(socketserver.StreamRequestHandler):
                     if version != VERSION:
                         raise Refusal(E_VERSION, "protocol version %d not supported" % version)
                     if length > MAX_PAYLOAD:
-                        remaining = length
-                        while remaining > 0:
-                            if self.read_exact(min(remaining, 1 << 20)) is None:
-                                return
-                            remaining -= min(remaining, 1 << 20)
-                        raise Refusal(E_TOO_LARGE, "payload above 64 MiB")
+                        # answered and closed: the oversize payload is never read
+                        self.send(ERROR, error_payload(0, E_TOO_LARGE, "payload above 64 MiB"))
+                        return
                     payload = self.read_exact(length) if length else b""
                     if payload is None:
                         return
@@ -355,6 +355,8 @@ class Handler(socketserver.StreamRequestHandler):
                 feeds[name] = array
             outputs = [r.str() for _ in range(r.u16())]
             r.done()
+            if any(not n or len(n.encode("utf-8")) > MAX_NAME for n in outputs):
+                raise Refusal(E_MALFORMED, "an output name is empty or longer than %d bytes" % MAX_NAME)
         except Refusal as e:
             e.request_id = request_id
             raise

@@ -25,7 +25,8 @@ BFA's files are never changed: the bridge attaches to BFA in memory when the gam
     or restart the game.
   - If the server doesn't answer a call in time, that one line gets the game's own lip sync, and the bridge waits 10
     seconds before asking again (lines in those 10 seconds get the game's own lip sync at once, without waiting).
-    BFA keeps its model and the next line tries again.
+    BFA keeps its facial model and the next line tries again. Its sentiment model is the exception: BFA drops it after
+    a missed answer and loads it again 30 seconds later (60 in GPU mode).
 - Turning the bridge on or off takes effect the next time BFA loads its model: restart the game, or switch the model
   in BFA's menu. A model BFA loaded while the bridge was off runs on this PC as usual.
 
@@ -36,8 +37,8 @@ BFA's files are never changed: the bridge attaches to BFA in memory when the gam
   [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444).
 - SkyrimNet Beta26 or later: the bridge's settings are on its
   Settings > Plugins page.
-- Better Facial Animations 4.3.2 (it ships ONNX Runtime 1.24.4, the version the bridge knows; with any other runtime
-  the bridge passes everything through and BFA runs as usual).
+- Better Facial Animations 4.3.2 (it ships ONNX Runtime 1.24.4, the version the bridge knows). The bridge attaches
+  only to BFA 4.3.x; with any other version, or another runtime, it passes everything through and BFA runs as usual.
 - An A2F server on another PC of your local network, holding the same model files as your BFA folder, such as
   PandorumLLM's A2F server.
 
@@ -48,8 +49,12 @@ BFA's files are never changed: the bridge attaches to BFA in memory when the gam
    `SKSE/Plugins/SkyrimNet/external/pt0l3my.bfaremotebridge/`.
 2. Enable it, below Better Facial Animations or anywhere: the order doesn't matter.
 3. On the server's PC, set up the A2F server with a copy of your `BetterFacialAnimations` folder's `.onnx` files.
-4. In the game, open SkyrimNet's **Settings > Plugins** page, find **BFA Remote Bridge**, enter the server's address
-   (and the access key if you set one), save, and restart the game.
+4. In PandorumLLM's panel, set **Remote IP** to the gaming PC's address on your network. Until it is set, the A2F
+   server listens on its own PC only (127.0.0.1) and refuses the gaming PC; once set, it listens on the network and
+   admits only that address, its own PC and 127.0.0.1.
+5. In the game, open SkyrimNet's **Settings > Plugins** page, find **BFA Remote Bridge**, enter the server's address,
+   save, and restart the game. PandorumLLM's A2F server doesn't use an access key yet, so leave that empty (any key is
+   accepted).
 
 By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 
@@ -61,6 +66,9 @@ By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 - In BFA's GPU mode, the bridge still sends every run to the server, and no lip-sync inference runs on the gaming
   card; but BFA still opens a Direct3D 12 device of its own on that card before it loads a model. Force CPU avoids
   even that. The bridge notes in its log when BFA is set to GPU.
+- In GPU mode BFA also reacts to a refused model load or a failed warm-up as to a failing card: with its independent
+  device it turns its GPU route off until you press "Try GPU again" in its menu, and with the shared device it may
+  turn DirectML's metacommands off for the session. Another reason for Force CPU.
 
 ## Settings
 
@@ -73,11 +81,13 @@ On SkyrimNet's Settings > Plugins page, under **BFA Remote Bridge**:
 | Port | 7871 | The A2F server's port, as set in PandorumLLM. |
 | Access key | (empty) | The key set in PandorumLLM, if any. |
 | Timeout (ms) | 1000 | How long each lip-sync call waits for the server (200 to 5000). A line it doesn't answer in time gets the game's own lip sync. |
-| Check results | 0 | A diagnostic: also loads BFA's model on this PC and runs this many of each model's first calls on both PCs, logging how far apart the results are. While it is above 0 the model runs on this PC too, so keep it at 0 for play. |
+| Check results | 0 | A diagnostic: also loads BFA's model on this PC and runs this many of each model's first calls on both PCs, logging how far apart the results are. While it is above 0 the model runs on this PC too, so keep it at 0 for play. Small differences are expected when the server runs on another device (DirectML against the processor), uses another thread count, or runs another model in a role's place (the log's HELLO line says so); identical results need the same file, the same device and the same thread count. |
 | Status on load | on | Shows the bridge's state on screen when a save loads and when BFA loads its model. |
 | Log detail | Normal | Detailed logs every call's round trip. |
 
-The bridge reads the settings when the game starts, at each save load, and whenever you save the page.
+The bridge reads the settings when the game starts, when the main menu opens, before each save loads, and whenever
+you save the page. Until SkyrimNet has registered them, BFA's model loads are refused (BFA tries again 30 seconds
+later), so that the model never runs on this PC by mistake.
 
 ## The log
 
@@ -85,9 +95,11 @@ The bridge reads the settings when the game starts, at each save load, and whene
 
 - whether BFA was found, its version, and whether the bridge attached to it;
 - the settings (the server address and the access key only as set or not);
-- the server's first answer at start-up (its name and device);
+- the server's first answer at start-up (its name and device, such as "PandorumLLM ... A2F" on "DirectML 0: ..." or
+  "CPU: ...");
 - each model BFA loads: its size, SHA-256 and overrides, and whether the server serves it ("is served by ...;
-  nothing of it runs on this PC") or why not;
+  nothing of it runs on this PC") or why not, with the server's note when it runs another model in that role's place;
+- each model BFA loads on this PC instead, and why (the bridge is off, no address, SkyrimNet isn't loaded);
 - each failure, once, with "lines get the game's own lip sync for the next 10 seconds";
 - every 250 answered runs, the average round trip and the server's own time. With Log detail set to Detailed, one
   line per run.

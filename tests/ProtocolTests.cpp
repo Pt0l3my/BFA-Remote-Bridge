@@ -254,3 +254,30 @@ TEST(ProtocolPayloadRefusals) {
     CHECK(!ErrorClosesConnection(3) && !ErrorClosesConnection(4) && !ErrorClosesConnection(5) && !ErrorClosesConnection(7));
     (void)Bytes;
 }
+
+// RUN_OK's byte length must equal its shape's size, above or below: Bridge.cpp copies exactly that many bytes.
+TEST(ProtocolRunOkByteLengthMustMatchTheShape) {
+    const float y[4] = {1, 2, 3, 4};
+    RunOk m;
+    m.requestId = 1;
+    m.outputs = {{"y", 1, {2, 2}, y, sizeof y}};
+    std::vector<std::uint8_t> p;
+    std::string err;
+    CHECK(EncodeRunOk(m, p, err));
+    // request id, micros, count, name (2 + 1), dtype, rank, two dims: then the u32 byte length
+    const std::size_t at = 4 + 4 + 2 + 3 + 1 + 1 + 16;
+    CHECK_EQ(int(p[at]), 16);
+    DecodedRunOk back;
+    CHECK(DecodeRunOk(p.data(), p.size(), back, err));
+    for (std::uint8_t wrong : {12, 20}) {  // below and above the shape's 16 bytes
+        auto bad = p;
+        bad[at] = wrong;
+        if (wrong > 16) bad.insert(bad.end(), wrong - 16, 0);  // the bytes are there too
+        CHECK(!DecodeRunOk(bad.data(), bad.size(), back, err));
+        CHECK(err.find("byte length") != std::string::npos);
+    }
+    // more data than the length says is trailing bytes
+    auto longer = p;
+    longer.push_back(0);
+    CHECK(!DecodeRunOk(longer.data(), longer.size(), back, err));
+}

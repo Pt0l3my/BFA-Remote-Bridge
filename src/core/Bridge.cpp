@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "core/Half.h"
+#include "core/Scrub.h"
 #include "core/Sha256.h"
 #include "core/Version.h"
 
@@ -53,6 +54,11 @@ bool Ok(const OrtApi* real, OrtStatus* status) noexcept {
 
 std::string Utf8Name(const std::filesystem::path& path) {
     const std::u8string s = path.filename().u8string();
+    return std::string(reinterpret_cast<const char*>(s.data()), s.size());
+}
+
+std::string PathText(const std::filesystem::path& path) {
+    const std::u8string s = path.u8string();
     return std::string(reinterpret_cast<const char*>(s.data()), s.size());
 }
 
@@ -165,6 +171,97 @@ OrtStatus* ORT_API_CALL WrapRun(OrtSession* session, const OrtRunOptions* runOpt
     return real->Run(session, runOptions, inputNames, inputs, inputCount, outputNames, outputCount, outputs);
 }
 
+// ---- every other entry that takes a session: a bridge session has nothing behind it in the runtime, so these answer it
+// with an error status (BFA calls none of them); a real session's call is the real one
+
+bool IsBridge(const OrtSession* session) noexcept {
+    Bridge* b = Bridge::Current();
+    try {
+        return b && session && b->IsBridgeSession(session);
+    } catch (...) {
+        return false;
+    }
+}
+inline bool IsBridge(OrtSession* session) noexcept { return IsBridge(static_cast<const OrtSession*>(session)); }
+template <typename T>
+bool IsBridge(const T&) noexcept {
+    return false;
+}
+
+OrtStatus* NotOnBridgeSession(const OrtApi* real) noexcept {
+    return real->CreateStatus(ORT_FAIL, "BFA Remote Bridge: this call isn't available on a session the server runs");
+}
+
+// The entries' types carry the header's warn_unused_result on GCC and Clang, which a template argument drops; harmless.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+#endif
+template <typename Table, typename F, F Table::*Member>
+struct Guard;
+template <typename Table, typename... A, OrtStatus*(ORT_API_CALL* Table::*Member)(A...) noexcept>
+struct Guard<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
+    static inline const Table* real = nullptr;
+    static OrtStatus* ORT_API_CALL Call(A... a) noexcept {
+        if ((IsBridge(a) || ...)) return NotOnBridgeSession(Real());
+        return (real->*Member)(a...);
+    }
+};
+
+#define BFARB_GUARD(TABLE, COPY, REAL, NAME)                                                           \
+    do {                                                                                               \
+        using G = Guard<TABLE, decltype(TABLE::NAME), &TABLE::NAME>;                                   \
+        G::real = (REAL);                                                                              \
+        (COPY).NAME = &G::Call;                                                                        \
+    } while (false)
+
+// The 22 OrtApi entries of ONNX Runtime 1.24.4 that take an OrtSession* besides Run (wrapped on its own); with
+// CreateSession and ReleaseSession, and the model editor's three, every entry that meets a session.
+void GuardSessionEntries(OrtApi& table, const OrtApi* real) {
+    BFARB_GUARD(OrtApi, table, real, SessionGetInputCount);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOutputCount);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOverridableInitializerCount);
+    BFARB_GUARD(OrtApi, table, real, SessionGetInputTypeInfo);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOutputTypeInfo);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOverridableInitializerTypeInfo);
+    BFARB_GUARD(OrtApi, table, real, SessionGetInputName);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOutputName);
+    BFARB_GUARD(OrtApi, table, real, SessionGetOverridableInitializerName);
+    BFARB_GUARD(OrtApi, table, real, SessionEndProfiling);
+    BFARB_GUARD(OrtApi, table, real, SessionGetModelMetadata);
+    BFARB_GUARD(OrtApi, table, real, CreateAllocator);
+    BFARB_GUARD(OrtApi, table, real, RunWithBinding);
+    BFARB_GUARD(OrtApi, table, real, CreateIoBinding);
+    BFARB_GUARD(OrtApi, table, real, SessionGetProfilingStartTimeNs);
+    BFARB_GUARD(OrtApi, table, real, RunAsync);
+    BFARB_GUARD(OrtApi, table, real, SetEpDynamicOptions);
+    BFARB_GUARD(OrtApi, table, real, SessionGetMemoryInfoForInputs);
+    BFARB_GUARD(OrtApi, table, real, SessionGetMemoryInfoForOutputs);
+    BFARB_GUARD(OrtApi, table, real, SessionGetEpDeviceForInputs);
+    BFARB_GUARD(OrtApi, table, real, SessionGetEpDeviceForOutputs);
+    BFARB_GUARD(OrtApi, table, real, Session_GetEpGraphAssignmentInfo);
+}
+
+std::atomic<const OrtModelEditorApi*> g_realEditor{nullptr};
+OrtModelEditorApi g_editor;
+
+const OrtModelEditorApi* ORT_API_CALL WrapGetModelEditorApi() noexcept {
+    const OrtModelEditorApi* real = Real()->GetModelEditorApi();
+    if (!real) return nullptr;
+    std::lock_guard lock(g_tableMutex);
+    if (g_realEditor.load() != real) {
+        std::memcpy(&g_editor, real, sizeof(OrtModelEditorApi));
+        BFARB_GUARD(OrtModelEditorApi, g_editor, real, SessionGetOpsetForDomain);
+        BFARB_GUARD(OrtModelEditorApi, g_editor, real, ApplyModelToModelEditorSession);
+        BFARB_GUARD(OrtModelEditorApi, g_editor, real, FinalizeModelEditorSession);
+        g_realEditor.store(real);
+    }
+    return &g_editor;
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
     const OrtApiBase* base = g_realBase.load(std::memory_order_acquire);
     if (!base) return nullptr;
@@ -196,6 +293,8 @@ const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
         g_table.Run = &WrapRun;
         g_table.GetExecutionProviderApi = &WrapGetProviderApi;
         g_table.SessionOptionsAppendExecutionProvider = &WrapAppendProvider;
+        g_table.GetModelEditorApi = &WrapGetModelEditorApi;
+        GuardSessionEntries(g_table, real);
         g_realApi.store(real, std::memory_order_release);
     }
     g_state.store(static_cast<int>(Bridge::ApiState::Known));
@@ -315,7 +414,8 @@ double LargestDifference(std::uint8_t dtype, const std::uint8_t* a, const std::u
 
 }  // namespace
 
-Bridge::Bridge(TransportFactory factory, LogSink log, Client::Now now) : log_(log), client_(std::move(factory), std::move(log), now) {}
+Bridge::Bridge(TransportFactory factory, Resolver resolver, LogSink log, Client::Now now)
+    : log_(log), client_(std::move(factory), std::move(resolver), std::move(log), now) {}
 
 Bridge::~Bridge() {
     Bridge* self = this;
@@ -360,6 +460,7 @@ void Bridge::Apply(const Settings& settings) {
         std::lock_guard lock(settingsMutex_);
         settings_ = settings;
     }
+    settingsRead_.store(true);
     client_.Configure(settings);
 }
 
@@ -439,21 +540,59 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
                   ? "the server's copy: " + std::string(proto::ModelStatusName(a.status)) + (a.detail.empty() ? "" : " (" + a.detail + ")")
                   : a.detail;
     }
-    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + why + "; lines get the game's own lip sync";
+    return RefuseWith(real, model, why, &n);
+}
+
+OrtStatus* Bridge::RefuseWith(const OrtApi* real, const std::string& model, const std::string& why, const Notice* notice) {
+    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + ScrubPaths(why) + "; lines get the game's own lip sync";
     Log(Level::Warn, message.substr(std::strlen("BFA Remote Bridge: ")));
-    Tell(n);
+    if (notice) Tell(*notice);
     return real->CreateStatus(ORT_FAIL, message.c_str());
+}
+
+void Bridge::ExpectSettings(bool expect) { expectSettings_.store(expect); }
+
+bool Bridge::HashCached(const std::filesystem::path& file, std::uint64_t& size, Sha256::Digest& digest, std::string& err) {
+    std::error_code ec;
+    const auto fileSize = std::filesystem::file_size(file, ec);
+    const auto written = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(file, ec);
+    const std::string key = PathText(file);
+    if (!ec) {
+        std::lock_guard lock(hashMutex_);
+        const auto it = hashes_.find(key);
+        if (it != hashes_.end() && it->second.size == fileSize && it->second.written == written) {
+            size = it->second.size;
+            digest = it->second.digest;
+            return true;
+        }
+    }
+    if (!HashFile(file, size, digest, err)) return false;
+    if (!ec) {
+        std::lock_guard lock(hashMutex_);
+        hashes_[key] = HashEntry{size, written, digest};
+    }
+    return true;
 }
 
 OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const ORTCHAR_T* path, const OrtSessionOptions* options,
                                  OrtSession** out) noexcept {
     try {
         const Settings s = CurrentSettings();
-        if (!s.enabled || s.serverAddress.empty() || !path || !out) return real->CreateSession(env, path, options, out);
+        const bool read = settingsRead_.load();
+        if (!path || !out) return real->CreateSession(env, path, options, out);
+        const std::filesystem::path file(path);
+        const std::string modelName = Utf8Name(file);
+        if (!read && expectSettings_.load())
+            return RefuseWith(real, modelName, "the bridge's settings weren't read yet", nullptr);
+        if (!read || !s.enabled || s.serverAddress.empty()) {
+            Log(Level::Info, "Model " + modelName + " loads on this PC as usual: " +
+                                 (!read ? "SkyrimNet isn't loaded, so the bridge is idle"
+                                        : !s.enabled ? "the bridge is off" : "no server address is set"));
+            return real->CreateSession(env, path, options, out);
+        }
 
         auto session = std::make_unique<Session>();
-        const std::filesystem::path file(path);
-        session->entry.name = Utf8Name(file);
+        session->entry.name = modelName;
         {
             std::lock_guard lock(sessionsMutex_);
             bool gpu = false;
@@ -476,7 +615,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             return Refuse(real, name, a);
         }
         std::string err;
-        if (!HashFile(file, session->entry.size, session->entry.sha256, err)) {
+        if (!HashCached(file, session->entry.size, session->entry.sha256, err)) {
             Admission a;
             a.hello.kind = ProbeResult::Kind::Refused;
             a.detail = "the bridge couldn't read it to hash it (" + err + ")";
@@ -499,8 +638,8 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             OrtSession* local = nullptr;
             OrtStatus* status = real->CreateSession(env, path, options, &local);
             if (status) {
-                Log(Level::Warn, std::string("Check mode: the real session of ") + name + " couldn't be made here (" + real->GetErrorMessage(status) +
-                                     "), so its runs aren't checked");
+                Log(Level::Warn, "Check mode: the real session of " + name + " couldn't be made here (" +
+                                     ScrubPaths(real->GetErrorMessage(status), PathText(file)) + "), so its runs aren't checked");
                 real->ReleaseStatus(status);
             } else {
                 session->local = local;
@@ -511,11 +650,15 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         {
             std::lock_guard lock(sessionsMutex_);
             session->order = nextOrder_++;
+            // the newest session of a model replaces older ones (BFA can drop a session without releasing it)
+            for (auto& [_, other] : sessions_)
+                if (other->entry.name == name) other->superseded = true;
             sessions_[handle] = std::move(session);
             PushModelsLocked();
         }
         *out = handle;
-        Log(Level::Info, "Model " + name + " is served by " + a.hello.server + " on " + a.hello.device + "; nothing of it runs on this PC");
+        Log(Level::Info, "Model " + name + " is served by " + a.hello.server + " on " + a.hello.device +
+                             (a.detail.empty() ? std::string() : " (" + a.detail + ")") + "; nothing of it runs on this PC");
         Tell(Notice{Notice::Kind::Served, name, a.hello.device});
         return nullptr;
     } catch (...) {
@@ -579,18 +722,24 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                          OrtValue** outputs) noexcept {
     proto::ModelEntry entry;
     OrtSession* local = nullptr;
+    bool superseded = false;
     try {
         std::lock_guard lock(sessionsMutex_);
         const auto it = sessions_.find(session);
         if (it == sessions_.end()) return real->Run(session, runOptions, inputNames, inputs, inputCount, outputNames, outputCount, outputs);
         entry = it->second->entry;
         local = it->second->local;
+        superseded = it->second->superseded;
     } catch (...) {
         NanAnswer(real, outputCount, outputs);
         return nullptr;
     }
 
     // a bridge session: from here on every path returns success, with the server's outputs or NaN ones
+    if (superseded) {  // a newer session of its model replaced it: no backoff, nothing logged
+        NanAnswer(real, outputCount, outputs);
+        return nullptr;
+    }
     std::vector<OrtValue*> created;
     Settings s;
     Client::Reply reply;
@@ -648,6 +797,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
         }
 
         // the answer must fit the call exactly before anything is written
+        reason.clear();
         const auto& got = reply.ok.outputs;
         if (got.size() != outputCount) reason = "the server returned " + std::to_string(got.size()) + " outputs, not " + std::to_string(outputCount);
         for (std::size_t i = 0; reason.empty() && i < outputCount; ++i) {
@@ -754,7 +904,7 @@ void Bridge::Check(const OrtApi* real, OrtSession* local, const char* const* inp
     std::string line = "Check " + model + " " + std::to_string(index) + "/" + std::to_string(of) + ":";
     OrtStatus* status = real->Run(local, nullptr, inputNames, inputs, inputCount, outputNames, outputCount, mine.data());
     if (status) {
-        line += std::string(" the run on this PC failed (") + real->GetErrorMessage(status) + ")";
+        line += " the run on this PC failed (" + ScrubPaths(real->GetErrorMessage(status)) + ")";
         real->ReleaseStatus(status);
     } else {
         for (std::size_t i = 0; i < outputCount; ++i) {

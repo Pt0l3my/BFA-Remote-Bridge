@@ -19,8 +19,10 @@ From BFA 4.3.2's public source (GPL-3.0; read, never copied):
   the client lists.
 - Right after creating a session it runs it once on all-zero inputs (its warm-up), and drops the model when that run
   fails.
-- It checks every output before use: the element count, the type (float) and that every value is finite. A failed
-  check fails that line only ("the session and device stay"); an error status from `Run` marks the session failed.
+- It checks every output before use: the element count, the type (float) and that every value is finite. For the
+  facial models a failed check fails that line only ("the session and device stay"); an error status from `Run` marks
+  the session failed. The sentiment model (`emotion_fp16.onnx`) is the exception: BFA drops its session after any
+  failed answer, checked or not, and loads it again 30 seconds later on the processor, 60 on the graphics card.
 - Each model is **stateless between calls**: V3's recurrent state travels in its inputs and outputs (`input_latents`
   in, `output_latents` out), so the server keeps nothing per conversation.
 
@@ -130,7 +132,8 @@ u16  output_count    in the order requested
 
 **Error codes**: 1 malformed frame or payload; 2 wrong access key; 3 unknown or unready model; 4 inference failed
 (the runtime's message in `message`); 5 too large; 6 protocol version not supported; 7 busy or shutting down. After
-codes 1, 2 and 6 the server closes the connection; after the others it stays open.
+codes 1, 2 and 6 the server closes the connection, and after code 5 for a frame header announcing more than 64 MiB
+(whose payload it never reads); after the others it stays open.
 
 **Rules**
 
@@ -141,8 +144,18 @@ codes 1, 2 and 6 the server closes the connection; after the others it stays ope
 - The server answers PING with PONG at any time after HELLO. It may close a connection idle for more than 10
   minutes; the bridge reconnects as needed.
 - The server answers BFA's warm-up run (all-zero inputs, right after the session is made) like any other RUN.
-- A HELLO that lists a model the server hasn't loaded yet makes it load and warm the model up before answering: the
-  bridge waits up to 60 seconds for that answer.
+- A ready model's `detail` may say something too, for instance that another model runs in its place ("runs
+  Audio2Face-3D v2.3 Mark (NVIDIA FP32 v2.3) in its place"); the bridge logs every non-empty detail.
+- The client never sends PING before HELLO (the bridge sends none at all); a server may refuse one with code 1.
+
+**The server's duties at loading**
+
+- A HELLO that lists a model the server hasn't loaded yet makes it load and warm the model up before answering (one
+  to a few seconds for a DirectML session). The bridge waits up to 60 seconds for that answer, at a model load only.
+- The server **finishes a model load even if the client disconnects** meanwhile, and **keeps loaded sessions across
+  reconnections**: a later HELLO for the same model and overrides, on any connection, is answered at once. The bridge
+  relies on it: the HELLO it says before a run (after a reconnection, or when the live models changed) waits only for
+  that run's timeout.
 
 ## 3 What the bridge does
 
@@ -154,7 +167,7 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   7871), **Access key**, **Timeout** (ms per call, default 1000, 200 to 5000), **Check results**, **Status on load**,
   **Log detail**. The bridge is on when Bridge is ticked and a server address is set.
 - **Attaching.** At SKSE's post-load message it finds `BetterFacialAnimations.dll`, reads its version from its
-  `SKSEPlugin_Version` data, and patches the entry for KERNEL32's `GetProcAddress` in BFA's import address table. Its
+  `SKSEPlugin_Version` data (4.3.x only: any other BFA runs as if the bridge weren't installed), and patches the entry for KERNEL32's `GetProcAddress` in BFA's import address table. Its
   replacement changes one answer only: BFA's lookup of `OrtGetApiBase` in `onnxruntime.dll` gets the bridge's. That
   one's `GetApi(24)` is a copy of the real `OrtApi` table with a few entries replaced; any other API version gets the
   real table, untouched, and BFA runs as if the bridge weren't installed.
@@ -162,7 +175,8 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   model file (base name, size, SHA-256), takes the overrides BFA set on the options, connects and sends HELLO listing
   every live model and the new one.
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
-    PC.
+    PC. A newer session of a model replaces older ones in HELLO (BFA can drop a session without releasing it); a run
+    on a replaced session gets the NaN answer below, without a backoff.
   - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed): BFA gets an error status
     made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the reason. BFA then has no model, and
     lip sync is the game's own until BFA loads its model again (a restart, or a model switch in BFA's menu).
@@ -176,6 +190,19 @@ so there is no local fallback: a line the server doesn't answer in time gets the
     model. A 10-second backoff follows, during which runs answer so at once, without touching the network; the first
     run after it reconnects and says HELLO again. One log line per backoff.
   - HELLO is sent again before a run whenever the set of live models changed since the last one, or after a failure.
+- **Before the settings are read**: SkyrimNet registers the bridge's settings during its own start-up, so the bridge
+  reads them at the data-loaded message, when the main menu opens, before each game loads and when its page is
+  saved, and counts them read once SkyrimNet names the config. A model load before that is refused ("the bridge's
+  settings weren't read yet"; BFA tries a failed load again 30 seconds later) while SkyrimNet is loaded, and loads on
+  the gaming PC as usual when SkyrimNet isn't. Every model load that passes through is logged with its reason.
+- **The server's name** is looked up once per change of the address or port, off the game's threads, and connections
+  use the addresses found. A failed lookup is logged once, and runs get the NaN answer until the settings change.
+- **A reused connection the server has closed** (it may close one idle for 10 minutes) is opened again within the same
+  call: when sending fails or the connection closes before any byte of the answer, the bridge reconnects, says HELLO
+  and sends again, once, within that call's deadline.
+- **Every other entry that takes a session** (the 22 of `OrtApi` besides `Run`, such as `SessionGetInputCount`,
+  `SessionGetOutputName`, `CreateIoBinding`, `RunWithBinding` and `RunAsync`, and the model editor's three) answers a
+  bridge session with an error status made by `CreateStatus`, without the runtime. BFA calls none of them.
 - **Releasing** a bridge session frees it in the bridge; it never reaches the runtime. Sessions made while the bridge
   was off are the runtime's own, and every call on them is the real one: the on/off setting takes effect at BFA's
   next model load.

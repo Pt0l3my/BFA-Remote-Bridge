@@ -1,15 +1,17 @@
 // BFARemoteBridge.dll's SKSE entry.
 //
-//   load          the log (BFARemoteBridge.log in SKSE's log folder), VR refused, the messaging listener
-//   post-load     every plugin is loaded: find Better Facial Animations, read its version, attach to its lookup of
-//                 ONNX Runtime (Hook.cpp)
-//   data loaded   the settings from SkyrimNet's Settings > Plugins page, the listener for that page's saves, and a
-//                 one-shot thread that says HELLO to the server (no models) and logs what it answers
-//   game loaded   the settings again; at the first load, the status notification (setting showStatus), and the model
-//                 loads' notices held until then
+//   load            the log (BFARemoteBridge.log in SKSE's log folder), VR refused, the messaging listener
+//   post-load       every plugin is loaded: find Better Facial Animations, read its version, attach to its lookup of
+//                   ONNX Runtime (Hook.cpp); note whether SkyrimNet is loaded, so a model load waits for its settings
+//   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
+//   main menu,      registered them; also whenever that page is saved. After the first read, and after each change of
+//   pre-load game   the address or port, a short-lived thread looks the server's name up (and, the first time, says
+//                   HELLO with no models and logs the answer)
+//   game loaded     the settings again; at the first load, the status notification (setting showStatus), and the
+//                   model loads' notices held until then
 //
 // A model load's outcome comes later, on BFA's worker thread; its notice goes to the game's main thread through SKSE's
-// task interface.
+// task interface. Nothing here waits for the network: the client's Configure never does.
 
 #include "plugin/Plugin.h"
 
@@ -22,6 +24,8 @@ namespace {
 Bridge* g_bridge = nullptr;  // lives until the game exits: BFA's worker may call it at any time
 BfaFacts g_bfa;
 std::atomic<bool> g_skyrimNet{false};
+bool g_settingsRead = false;  // main thread only
+Settings g_lastRead;
 
 std::mutex g_noticeMutex;
 bool g_gameLoaded = false;
@@ -60,15 +64,48 @@ void Notify(const std::string& text) {
     if (const auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([text] { RE::DebugNotification(text.c_str()); });
 }
 
+// Off the game's threads: the name lookup, and the first time a HELLO with no models.
+void LookUp(bool probe) {
+    std::thread([probe] {
+        try {
+            Client& c = g_bridge->Connection();
+            if (!g_bridge->CurrentSettings().serverAddress.empty() && !c.Resolve())
+                Log(Level::Warn, "The server's address couldn't be looked up: lines get the game's own lip sync until the settings change");
+            if (!probe) return;
+            const ProbeResult r = c.Probe();
+            switch (r.kind) {
+                case ProbeResult::Kind::NoAddress: Log(Level::Info, "No server address is set: the bridge is idle"); break;
+                case ProbeResult::Kind::Answered: Log(Level::Info, "The server answered: " + r.server + " on " + r.device); break;
+                case ProbeResult::Kind::NoAnswer: Log(Level::Warn, "The server didn't answer: " + r.detail); break;
+                case ProbeResult::Kind::WrongKey: Log(Level::Warn, "The server refused the access key"); break;
+                default: Log(Level::Warn, "The server refused the bridge: " + r.detail); break;
+            }
+        } catch (...) {
+        }
+    }).detach();
+}
+
+// On the main thread. Never waits: the client applies the settings at its next model load or run.
 void ApplySettings(const char* when) {
     Settings s;
     std::vector<std::string> warnings;
-    const bool found = ReadSkyrimNetSettings(s, warnings);
-    g_skyrimNet = found;
+    const SettingsRead read = ReadSkyrimNetSettings(s, warnings);
+    if (read == SettingsRead::NoSkyrimNet) {
+        if (!g_settingsRead) Log(Level::Warn, std::string("SkyrimNet isn't loaded (") + when + "): the bridge is idle and BFA runs as usual");
+        return;
+    }
+    if (read == SettingsRead::NotRegistered) {
+        Log(Level::Info, std::string("SkyrimNet hasn't registered the bridge's settings yet (") + when + ")");
+        return;
+    }
+    const bool first = !g_settingsRead;
+    const bool moved = first || s.serverAddress != g_lastRead.serverAddress || s.serverPort != g_lastRead.serverPort;
+    g_settingsRead = true;
+    g_lastRead = s;
     g_bridge->Apply(s);
-    if (!found) Log(Level::Warn, std::string("SkyrimNet's settings can't be read (") + when + "): the defaults are used, so no server is set");
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
+    if (moved && g_bfa.hooked) LookUp(first);
 }
 
 class ConfigSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent> {
@@ -85,21 +122,17 @@ public:
     }
 };
 
-void Probe() {
-    std::thread([] {
+// The main menu's opening: before a new game starts BFA's worker.
+class MenuSink final : public RE::BSTEventSink<RE::MenuOpenCloseEvent> {
+public:
+    RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override {
         try {
-            const ProbeResult r = g_bridge->Connection().Probe();
-            switch (r.kind) {
-                case ProbeResult::Kind::NoAddress: Log(Level::Info, "No server address is set: the bridge is idle"); break;
-                case ProbeResult::Kind::Answered: Log(Level::Info, "The server answered: " + r.server + " on " + r.device); break;
-                case ProbeResult::Kind::NoAnswer: Log(Level::Warn, "The server didn't answer: " + r.detail); break;
-                case ProbeResult::Kind::WrongKey: Log(Level::Warn, "The server refused the access key"); break;
-                default: Log(Level::Warn, "The server refused the bridge: " + r.detail); break;
-            }
+            if (event && event->opening && event->menuName == RE::MainMenu::MENU_NAME) ApplySettings("main menu");
         } catch (...) {
         }
-    }).detach();
-}
+        return RE::BSEventNotifyControl::kContinue;
+    }
+};
 
 void OnGameLoaded() {
     ApplySettings("game loaded");
@@ -117,6 +150,7 @@ void OnGameLoaded() {
     f.skyrimNet = g_skyrimNet;
     f.bfaFound = g_bfa.found;
     f.bfaVersion = g_bfa.version;
+    f.knownBfa = g_bfa.knownVersion;
     f.hooked = g_bfa.hooked;
     f.addressSet = !s.serverAddress.empty();
     const std::string status = LoadStatusText(f);
@@ -132,17 +166,23 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
         switch (message->type) {
             case SKSE::MessagingInterface::kPostLoad:
                 g_bfa = FindAndHookBfa();
+                g_skyrimNet = SkyrimNetLoaded();
+                g_bridge->ExpectSettings(g_skyrimNet);
                 break;
             case SKSE::MessagingInterface::kDataLoaded: {
-                ApplySettings("data loaded");
-                static ConfigSink sink;
+                static ConfigSink configs;
                 if (auto* source = SKSE::GetModCallbackEventSource())
-                    source->AddEventSink(&sink);
+                    source->AddEventSink(&configs);
                 else
                     Log(Level::Warn, "SKSE's mod event source isn't there: a save on SkyrimNet's page applies at the next game load");
-                if (g_bfa.hooked) Probe();
+                static MenuSink menus;
+                if (auto* ui = RE::UI::GetSingleton()) ui->AddEventSink<RE::MenuOpenCloseEvent>(&menus);
+                ApplySettings("data loaded");
                 break;
             }
+            case SKSE::MessagingInterface::kPreLoadGame:
+                ApplySettings("before a game loads");
+                break;
             case SKSE::MessagingInterface::kPostLoadGame:
             case SKSE::MessagingInterface::kNewGame:
                 OnGameLoaded();
@@ -181,7 +221,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
         Log(Level::Warn, "Skyrim VR isn't supported: the bridge stays off");
         return false;
     }
-    g_bridge = new Bridge(WinsockFactory(), [](Level level, const std::string& line) { Log(level, line); });
+    g_bridge = new Bridge(WinsockFactory(), &WinsockResolve, [](Level level, const std::string& line) { Log(level, line); });
     Bridge::SetCurrent(g_bridge);
     g_bridge->OnNotice([](const Notice& n) {
         if (ShowStatus()) Notify(NoticeText(n, g_bfa.version));
