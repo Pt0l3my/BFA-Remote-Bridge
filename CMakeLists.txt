@@ -45,6 +45,11 @@ else()
   if(BFARB_SANITIZE)
     target_compile_options(bfarb_options INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g)
     target_link_options(bfarb_options INTERFACE -fsanitize=address,undefined)
+    # GCC 13 under AddressSanitizer reports false out-of-bounds reads inside the standard library's own code (a
+    # vector's copy of a one-item initialiser list), which -Werror would turn into failed builds.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      target_compile_options(bfarb_options INTERFACE -Wno-array-bounds -Wno-stringop-overread -Wno-maybe-uninitialized)
+    endif()
   endif()
 endif()
 

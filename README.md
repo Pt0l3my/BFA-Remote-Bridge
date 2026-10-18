@@ -1,2 +1,123 @@
-# BFA-Remote-Bridge
-A bridge for Better Facial Animations to allow facial animation model to run on remote server instead of shared with game hardware.
+# BFA Remote Bridge
+
+An SKSE plugin for Skyrim Special Edition and Anniversary Edition that runs
+Better Facial Animations (BFA)'s lip-sync model on another PC
+of your local network instead of the one playing the game.
+
+BFA runs NVIDIA's Audio2Face models through ONNX Runtime on the gaming PC's graphics card every time an NPC speaks.
+When that card is already busy drawing the game, each burst of inference pushes frames back and the game stutters.
+The bridge sends BFA's model runs to an **A2F server** on another PC (PandorumLLM's, or any server that speaks
+[the bridge's protocol](docs/PROTOCOL.md)) and hands the results back to BFA, so the arithmetic happens there.
+
+BFA's files are never changed: the bridge attaches to BFA in memory when the game starts.
+
+## How it works
+
+- At start-up the bridge finds `BetterFacialAnimations.dll` and redirects its one lookup of ONNX Runtime's entry
+  point, so BFA's calls to the runtime pass through the bridge.
+- **While the bridge is on, no BFA model runs on the gaming PC**, neither on its graphics card nor on its
+  processor. When BFA loads a model, the bridge asks the server to load the same file (matched by name, size and
+  SHA-256); every run then goes to the server, BFA's warm-up run included.
+- **There is no local fallback.** A late lip sync looks worse than none, and running the model on the processor
+  stutters too:
+  - If the server can't load the model (it isn't running, the key is wrong, it lacks the file or has another copy),
+    BFA's model isn't loaded, and lip sync is the game's own. Start the server, then reload the model in BFA's menu
+    or restart the game.
+  - If the server doesn't answer a call in time, that one line gets the game's own lip sync, and the bridge waits 10
+    seconds before asking again (lines in those 10 seconds get the game's own lip sync at once, without waiting).
+    BFA keeps its model and the next line tries again.
+- Turning the bridge on or off takes effect the next time BFA loads its model: restart the game, or switch the model
+  in BFA's menu. A model BFA loaded while the bridge was off runs on this PC as usual.
+
+## Requirements
+
+- Skyrim Special Edition 1.5.97 or Anniversary Edition 1.6.x (1.6.1170 and later included). Not VR.
+- [SKSE](https://skse.silverlock.org/) for your game version and
+  [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444).
+- SkyrimNet Beta26 or later: the bridge's settings are on its
+  Settings > Plugins page.
+- Better Facial Animations 4.3.2 (it ships ONNX Runtime 1.24.4, the version the bridge knows; with any other runtime
+  the bridge passes everything through and BFA runs as usual).
+- An A2F server on another PC of your local network, holding the same model files as your BFA folder, such as
+  PandorumLLM's A2F server.
+
+## Install (Mod Organizer 2)
+
+1. Download `BFARemoteBridge-<version>.zip` and install it with **Install a new mod from archive**. It holds
+   `SKSE/Plugins/BFARemoteBridge.dll` and SkyrimNet's settings page for it,
+   `SKSE/Plugins/SkyrimNet/external/pt0l3my.bfaremotebridge/`.
+2. Enable it, below Better Facial Animations or anywhere: the order doesn't matter.
+3. On the server's PC, set up the A2F server with a copy of your `BetterFacialAnimations` folder's `.onnx` files.
+4. In the game, open SkyrimNet's **Settings > Plugins** page, find **BFA Remote Bridge**, enter the server's address
+   (and the access key if you set one), save, and restart the game.
+
+By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
+
+## Set BFA to Force CPU
+
+**Tick Force CPU in BFA's menu when you use the bridge.**
+
+- With Force CPU, the gaming PC's graphics card does no BFA work at all.
+- In BFA's GPU mode, the bridge still sends every run to the server, and no lip-sync inference runs on the gaming
+  card; but BFA still opens a Direct3D 12 device of its own on that card before it loads a model. Force CPU avoids
+  even that. The bridge notes in its log when BFA is set to GPU.
+
+## Settings
+
+On SkyrimNet's Settings > Plugins page, under **BFA Remote Bridge**:
+
+| Setting | Default | What it does |
+|---|---|---|
+| Bridge | on | Runs BFA's lip-sync model on the server, and never on this PC. Takes effect at BFA's next model load. Off, BFA runs as if the bridge weren't installed. |
+| Server address | (empty) | The address of the PC running the A2F server, on your local network. Empty keeps the bridge idle, and BFA runs as usual. |
+| Port | 7871 | The A2F server's port, as set in PandorumLLM. |
+| Access key | (empty) | The key set in PandorumLLM, if any. |
+| Timeout (ms) | 1000 | How long each lip-sync call waits for the server (200 to 5000). A line it doesn't answer in time gets the game's own lip sync. |
+| Check results | 0 | A diagnostic: also loads BFA's model on this PC and runs this many of each model's first calls on both PCs, logging how far apart the results are. While it is above 0 the model runs on this PC too, so keep it at 0 for play. |
+| Status on load | on | Shows the bridge's state on screen when a save loads and when BFA loads its model. |
+| Log detail | Normal | Detailed logs every call's round trip. |
+
+The bridge reads the settings when the game starts, at each save load, and whenever you save the page.
+
+## The log
+
+`Documents/My Games/Skyrim Special Edition/SKSE/BFARemoteBridge.log` (times in UTC). It says:
+
+- whether BFA was found, its version, and whether the bridge attached to it;
+- the settings (the server address and the access key only as set or not);
+- the server's first answer at start-up (its name and device);
+- each model BFA loads: its size, SHA-256 and overrides, and whether the server serves it ("is served by ...;
+  nothing of it runs on this PC") or why not;
+- each failure, once, with "lines get the game's own lip sync for the next 10 seconds";
+- every 250 answered runs, the average round trip and the server's own time. With Log detail set to Detailed, one
+  line per run.
+
+## Troubleshooting
+
+| You see | What to do |
+|---|---|
+| "Better Facial Animations wasn't found, so the bridge is idle." | Install and enable BFA. |
+| "no server address is set" | Enter the server's address on SkyrimNet's page, save, and restart. |
+| "SkyrimNet wasn't found" | Install SkyrimNet Beta26 or later: the settings are read from it. |
+| "the server didn't answer" | Start the A2F server, check the address and port, and allow the port through the server PC's firewall (private networks only). Then reload the model in BFA's menu, or restart. |
+| "the server refused the access key" | Enter the same key as the server's. |
+| "the server lacks ... or has a different copy" | Copy the model files from your `BetterFacialAnimations` folder to the server's model folder again: they must be identical. |
+| "couldn't attach to it" | Another mod loaded BFA's ONNX Runtime first, or this BFA differs from 4.3.2: the log says which. BFA runs as usual. |
+| Lips still on the game's own animation now and then | The log's "for the next 10 seconds" lines say why; raise the timeout if the server is slow. |
+
+## Building
+
+- **Linux** (the core and its tests): `cmake -S . -B build -DBFARB_PYTHON=<python with onnxruntime==1.24.4, onnx and
+  numpy>`, `cmake --build build`, `ctest --test-dir build --output-on-failure`. The tests run the real runtime against
+  `tools/reference_server.py`.
+- **Windows** (the DLL): from a Visual Studio developer prompt with `VCPKG_ROOT` set, `cmake --preset windows` and
+  `cmake --build --preset windows`.
+- `sh tools/wincheck/fetch.sh` then `sh tools/wincheck/wincheck.sh` parse the Windows files on Linux with clang.
+
+## Licences
+
+- BFA Remote Bridge: MIT (`LICENSE`), copyright Pt0l3my.
+- The vendored ONNX Runtime C API headers (`third_party/onnxruntime/`): MIT, Microsoft Corporation.
+- CommonLibSSE-NG, spdlog and fmt, linked into the DLL: MIT. See `THIRD-PARTY-NOTICES.md`.
+- No file of Better Facial Animations (GPL-3.0), of NVIDIA (the Audio2Face and Audio2Emotion models), of ONNX
+  Runtime's DLLs or of DirectML is included.
