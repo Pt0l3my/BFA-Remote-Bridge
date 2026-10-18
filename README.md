@@ -146,6 +146,11 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 - **Windows** (the DLL): from a Visual Studio developer prompt with `VCPKG_ROOT` set, `cmake --preset windows` and
   `cmake --build --preset windows`.
 - `sh tools/wincheck/fetch.sh` then `sh tools/wincheck/wincheck.sh` parse the Windows files on Linux with clang.
+- **Sanitiser builds** (Linux, for development), each in a build folder of its own: `-DBFARB_SANITIZE=ON` (such as
+  `build-asan`) adds AddressSanitizer and UndefinedBehaviorSanitizer, and `-DBFARB_TSAN=ON` (such as `build-tsan`)
+  ThreadSanitizer. Run them with `ctest` as above. With GCC, the ThreadSanitizer build adds `tests/TsanClocklock.cpp`
+  to the test program: GCC 13's ThreadSanitizer doesn't see `std::timed_mutex`'s timed locks and would report their
+  unlocks falsely, and that file routes them through a lock it sees. A clean run prints no "WARNING: ThreadSanitizer".
 
 ## Licences
 

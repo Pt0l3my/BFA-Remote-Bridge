@@ -24,6 +24,10 @@ endif()
 option(BFARB_WERROR "Treat compiler warnings as errors" ON)
 option(BFARB_PLUGIN_DLL "Build BFARemoteBridge.dll (Windows, MSVC, CommonLibSSE-NG through vcpkg)" OFF)
 option(BFARB_SANITIZE "Build the core and tests with AddressSanitizer and UndefinedBehaviorSanitizer (GCC, Clang)" OFF)
+option(BFARB_TSAN "Build the core and tests with ThreadSanitizer (GCC, Clang; Linux only)" OFF)
+if(BFARB_TSAN AND BFARB_SANITIZE)
+  message(FATAL_ERROR "BFARB_TSAN and BFARB_SANITIZE can't be on in the same build: use a build folder for each.")
+endif()
 
 # ---------------------------------------------------------------------------- warnings
 add_library(bfarb_options INTERFACE)
@@ -50,6 +54,10 @@ else()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       target_compile_options(bfarb_options INTERFACE -Wno-array-bounds -Wno-stringop-overread -Wno-maybe-uninitialized)
     endif()
+  endif()
+  if(BFARB_TSAN)
+    target_compile_options(bfarb_options INTERFACE -fsanitize=thread -fno-omit-frame-pointer -g)
+    target_link_options(bfarb_options INTERFACE -fsanitize=thread)
   endif()
 endif()
 
@@ -83,6 +91,11 @@ if(NOT WIN32)
     tests/ProtocolTests.cpp
     tests/TestMain.cpp)
   target_compile_definitions(bfarb_tests PRIVATE BFARB_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(BFARB_TSAN AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC's ThreadSanitizer doesn't see std::timed_mutex's timed locks: the test program routes them through a lock it
+    # sees (tests/TsanClocklock.cpp).
+    target_sources(bfarb_tests PRIVATE tests/TsanClocklock.cpp)
+  endif()
   target_link_libraries(bfarb_tests PRIVATE bfarb_core bfarb_options ${CMAKE_DL_LIBS})
 
   set(BFARB_TEST_ENV "BFARB_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}")
