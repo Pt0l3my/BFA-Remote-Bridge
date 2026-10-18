@@ -70,7 +70,7 @@ TCP, one request in flight per connection, strictly request then response. All i
 bridge then sends its current list again).
 
 ```
-str  client          e.g. "BFARemoteBridge 1.0.0"
+str  client          e.g. "BFARemoteBridge 1.1.0 (answered 1250, fallbacks 0, timeouts 0)"
 str  key             the access key, empty if none
 str  ort_version     the gaming PC's runtime, e.g. "1.24.4" (informational)
 u16  model_count
@@ -81,6 +81,15 @@ u16  model_count
   u16  override_count
     per override: str dim_name, i64 value
 ```
+
+The bridge's **client string** is its name and version, then its counters in parentheses: `BFARemoteBridge 1.1.0
+(answered N, fallbacks N, timeouts N)`. The counters are cumulative from Skyrim's start: `answered` counts the runs
+the server answered, `fallbacks` every run it didn't (the line got the game's own lip sync), and `timeouts` the part of
+those that timed out. The keys keep this order; new keys are only ever added at the end. A server may show the string
+as given or parse it. The string stays within **80 characters** (PandorumLLM's patch3 cuts its log lines there): when
+the counters would make it longer, the trailing keys are dropped, last first, until it fits, and the name and version
+alone are sent when no key fits. (The example is 62 characters; a key is dropped only once the three counts have more
+than 24 digits between them.)
 
 **HELLO_OK**
 
@@ -132,8 +141,8 @@ u16  output_count    in the order requested
 
 **Error codes**: 1 malformed frame or payload; 2 wrong access key; 3 unknown or unready model; 4 inference failed
 (the runtime's message in `message`); 5 too large; 6 protocol version not supported; 7 busy or shutting down. After
-codes 1, 2 and 6 the server closes the connection, and after code 5 for a frame header announcing more than 64 MiB
-(whose payload it never reads); after the others it stays open.
+codes 1, 2, 5 and 6 the server closes the connection; code 7 says it is stopping, and the bridge treats it as the
+connection's end too. After codes 3 and 4 the connection stays open.
 
 **Rules**
 
@@ -141,21 +150,35 @@ codes 1, 2 and 6 the server closes the connection, and after code 5 for a frame 
   `..` or a drive letter is refused (code 1). The client never sends a path, and the server's messages name no path
   of its own.
 - The access key, when set, is compared in constant time; an empty server key accepts any client.
-- The server answers PING with PONG at any time after HELLO. It may close a connection idle for more than 10
-  minutes; the bridge reconnects as needed.
+- The server answers each connection's requests **in order**, one at a time, late answers too: after a request the
+  client stopped waiting for, that request's RUN_OK or ERROR still comes, before the next answer.
+- The server answers PING with PONG at any time after HELLO. A PING before HELLO is ERROR 1, and the connection
+  closes. A server may close an idle connection (PandorumLLM's patch3 no longer does, and uses TCP keepalive); the
+  bridge PINGs a connection idle for 60 seconds and reconnects as needed.
 - The server answers BFA's warm-up run (all-zero inputs, right after the session is made) like any other RUN.
 - A ready model's `detail` may say something too, for instance that another model runs in its place ("runs
   Audio2Face-3D v2.3 Mark (NVIDIA FP32 v2.3) in its place"); the bridge logs every non-empty detail.
-- The client never sends PING before HELLO (the bridge sends none at all); a server may refuse one with code 1.
+- The client never sends PING before HELLO: the bridge sends one only on a connection whose HELLO was answered and
+  listed models, never on a status check's connection or a model load's.
 
 **The server's duties at loading**
 
 - A HELLO that lists a model the server hasn't loaded yet makes it load and warm the model up before answering (one
-  to a few seconds for a DirectML session). The bridge waits up to 60 seconds for that answer, at a model load only.
+  to a few seconds for a DirectML session; 2.5 s for the sentiment model the first time, in the owner's logs). The
+  bridge sends that HELLO on a **side connection** of its own and waits up to 60 seconds for the answer there, so the
+  main connection is never held by a load.
 - The server **finishes a model load even if the client disconnects** meanwhile, and **keeps loaded sessions across
   reconnections**: a later HELLO for the same model and overrides, on any connection, is answered at once. The bridge
-  relies on it: the HELLO it says before a run (after a reconnection, or when the live models changed) waits only for
-  that run's timeout.
+  relies on it: after the side connection's HELLO_OK, the main connection's HELLO with every live model is answered
+  at once. A second HELLO on a connection only replaces that connection's ready set; the server never unloads.
+- One model loads at a time, across all connections, and a RUN on another connection runs meanwhile (the server
+  takes only that session's lock). In PandorumLLM's patch3 a **HELLO**, on any connection, waits while a load is in
+  progress, even one naming only loaded models; its next patch answers a HELLO of loaded models at once. Until then
+  the bridge's background thread holds its own HELLOs while the bridge's side load is in flight. A status check names
+  no model and never waits.
+- **Not measured yet: DirectML during a first load.** On the server's graphics card a load's work (the weights read
+  and uploaded, the warm-up) shares the card with the runs of the models already loaded. Nothing on the server makes
+  those runs wait, but the card may slow them: lines during the first load of a model may fall back.
 
 ## 3 What the bridge does
 
@@ -172,24 +195,53 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   one's `GetApi(24)` is a copy of the real `OrtApi` table with a few entries replaced; any other API version gets the
   real table, untouched, and BFA runs as if the bridge weren't installed.
 - **A model load** (`CreateSession`, while the bridge is on) never reaches the real runtime. The bridge hashes the
-  model file (base name, size, SHA-256), takes the overrides BFA set on the options, connects and sends HELLO listing
-  every live model and the new one.
+  model file (base name, size, SHA-256), takes the overrides BFA set on the options, and sends HELLO with that model
+  alone on a **side connection** of its own (3000 ms to connect, 60 seconds for the answer), closed after the answer.
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
-    PC. A newer session of a model replaces older ones in HELLO (BFA can drop a session without releasing it); a run
-    on a replaced session gets the NaN answer below, without a backoff.
+    PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
+    if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
+    session without releasing it); a run on a replaced session gets the NaN answer below.
   - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed): BFA gets an error status
     made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the reason. BFA then has no model, and
-    lip sync is the game's own until BFA loads its model again (a restart, or a model switch in BFA's menu).
-- **A run** on a bridge session, BFA's warm-up run included, always goes to the server: RUN, then RUN_OK checked
-  against the call (the count, the names and order, and the types and shapes of any outputs the caller passed), then
-  the outputs handed to BFA as the runtime would (new values made by the real `CreateTensorAsOrtValue`, or the
-  caller's filled).
-  - When the server doesn't answer in full (a timeout, a lost connection, an ERROR, a malformed or mismatched
-    answer), the call still succeeds, with each requested output a one-element float tensor holding NaN. BFA's output
-    check rejects it and that one line plays with the game's own lip sync; an error status would make BFA drop its
-    model. A 10-second backoff follows, during which runs answer so at once, without touching the network; the first
-    run after it reconnects and says HELLO again. One log line per backoff.
-  - HELLO is sent again before a run whenever the set of live models changed since the last one, or after a failure.
+    lip sync is the game's own until BFA loads its model again (a restart, a model switch in BFA's menu, or BFA's own
+    retry).
+- **A run** on a bridge session, BFA's warm-up run included, always goes to the server, on the **main connection**:
+  RUN, then RUN_OK checked against the call (the count, the names and order, and the types and shapes of any outputs
+  the caller passed), then the outputs handed to BFA as the runtime would (new values made by the real
+  `CreateTensorAsOrtValue`, or the caller's filled). HELLO goes first only when the connection has no answer for that
+  model yet (a new connection).
+  - When the server doesn't answer in full (a timeout, a lost connection, an ERROR, a malformed or mismatched answer,
+    a model not ready), the call still succeeds, with each requested output a one-element float tensor holding NaN.
+    BFA's output check rejects it and that one line plays with the game's own lip sync; an error status would make
+    BFA drop its model. Nothing runs on the gaming PC for it.
+- **A connection the server closed or reset, or a send that failed** (a reused connection) is opened again within the
+  same call: the bridge reconnects, says HELLO and sends the same RUN, once, within that call's deadline. The log says
+  which of the three it was.
+- **A RUN timeout** with no byte of its answer arrived keeps the connection. The server answers in order, so that
+  request's late RUN_OK or ERROR comes before the next answer: the next exchange on the connection (a RUN, a HELLO or
+  a PING) reads and discards whole frames answering a request that timed out, then reads its own. A discarded ERROR
+  1, 2, 5 or 6 (after which the server closes the connection) or 7 (the server stopping) ends the connection. A timeout
+  in the middle of a frame, or of the send, closes the connection, since the stream can't be resynchronised.
+- **The pause.** A connection failure (no connection, a lost or closed connection, a malformed answer, an ERROR that
+  ends the connection, an unanswered PING) or a second RUN timeout in a row closes the connection and starts the
+  pause: every run is then answered at once with NaN, without touching the network, until the background thread's
+  HELLO is answered. One log line starts it and one ends it, with how long it lasted and how many runs it answered so.
+- **The background thread**, one of the bridge's own, asleep on a condition variable between its timers. It starts
+  once the bridge is on with a server address, never runs on the game's threads, and lives until the game exits.
+  - **Reconnecting:** after a failure it connects (3000 ms) and says HELLO with every live model (60 seconds) on a
+    new connection, outside the main connection's lock, and swaps it in. It tries after 1, 2, 5, 10 and 30 seconds,
+    then every 30 seconds; its answered HELLO ends the pause. It also makes the main connection when there is none
+    and a model is live, and asks again, on the same schedule, about a model the server's last answer didn't have
+    ready (whose runs meanwhile get the NaN answer at once).
+  - **HELLO after a change:** when the live models changed, HELLO with the full list on the open main connection.
+  - **PING** on a main connection idle for 60 seconds whose HELLO was answered and listed models. PONG must come
+    within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
+  - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
+    counters in its client string) on a connection of its own, then closed. Also once when the bridge comes on.
+  - **Never in a run's way:** it never holds the main connection's lock while a run waits for it. Its HELLO and PING
+    on the main connection take the lock only when it is free and no run waits, and are answered at once.
+  - While the bridge's own side load is in flight it holds its HELLOs (see the server's duties at loading); status
+    checks aren't held.
 - **Before the settings are read**: SkyrimNet registers the bridge's settings during its own start-up, so the bridge
   reads them at the data-loaded message, when the main menu opens, before each game loads and when its page is
   saved, and counts them read once SkyrimNet names the config. A model load before that is refused ("the bridge's
@@ -197,9 +249,6 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   the gaming PC as usual when SkyrimNet isn't. Every model load that passes through is logged with its reason.
 - **The server's name** is looked up once per change of the address or port, off the game's threads, and connections
   use the addresses found. A failed lookup is logged once, and runs get the NaN answer until the settings change.
-- **A reused connection the server has closed** (it may close one idle for 10 minutes) is opened again within the same
-  call: when sending fails or the connection closes before any byte of the answer, the bridge reconnects, says HELLO
-  and sends again, once, within that call's deadline.
 - **Every other entry that takes a session** (the 22 of `OrtApi` besides `Run`, such as `SessionGetInputCount`,
   `SessionGetOutputName`, `CreateIoBinding`, `RunWithBinding` and `RunAsync`, and the model editor's three) answers a
   bridge session with an error status made by `CreateStatus`, without the runtime. BFA calls none of them.
@@ -208,11 +257,20 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   next model load.
 - **Everything else** BFA calls (options, providers, tensors, memory information, statuses) is the real runtime's. In
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code), but no inference runs
-  on it; the bridge logs that BFA is set to GPU, and Force CPU avoids even that device.
+  on it; the bridge logs that BFA is set to GPU and, once per session while the bridge is on with an address and its
+  Status on load setting allows notices, shows "BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it
+  off this PC's graphics card." Force CPU avoids even that device.
 - **Check mode** (Check results above 0) is a diagnostic that does run the model on the gaming PC: only while it is
   on, a model load also makes the real session, and each session's first N runs run both ways, the largest difference
   per output logged.
-- **The log**, `BFARemoteBridge.log` in SKSE's log folder: BFA found or not, its version, the attachment, the settings
-  (the address and the key only as set or not), each model's size, SHA-256 and overrides, the server's answer to each
-  HELLO, each failure and its backoff, and every 250 answered runs the round trip and server times. Log detail
-  "Detailed" adds a line per run.
+- **The log**, `BFARemoteBridge.log` in SKSE's log folder, times in UTC: BFA found or not, its version, the attachment,
+  the settings (the address and the key only as set or not), each model's size, SHA-256 and overrides, the server's
+  answer to each model load and to the main connection's HELLO when it changes, the pause's start and end, and **each
+  run the server didn't answer**: its model, its reason (no connection, connect timed out, RUN timed out, ERROR with
+  its code and text, not ready, connection lost, other) and the time it took. Runs answered at once without the
+  network (during a pause, a model not ready, an address not looked up, a replaced session, an input the protocol
+  can't carry) are counted by reason; only the first of a series is logged. **The summary line** counts every run,
+  answered or not, by reason, at each 250 runs and every 10 minutes when anything happened: "250 runs since the last
+  summary: 249 answered, 1 not (1 timed out, 0 refused, 0 not ready, 0 no connection, 0 paused, 0 other); round trip
+  8.1 ms, server 6.2 ms, slowest 21.0 ms". Log detail "Detailed" adds a line per run, each connect and close with its
+  reason, each HELLO's answer, each unanswered PING, each discarded late answer and each background attempt.

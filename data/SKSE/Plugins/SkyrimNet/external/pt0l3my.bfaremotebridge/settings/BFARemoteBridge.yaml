@@ -7,7 +7,7 @@
 
 plugin:
   name: "BFARemoteBridge"
-  version: "1.0.0"
+  version: "1.1.0"
   description: "Runs Better Facial Animations' lip-sync model on another PC on your network (PandorumLLM's A2F server) instead of this one."
 
 schema:
@@ -42,7 +42,7 @@ schema:
     - name: "Timeout (ms)"
       path: "timeoutMs"
       type: "int"
-      description: "How long each lip-sync call waits for the server. A line it doesn't answer in time gets the game's own lip sync, and the bridge waits 10 seconds before asking again."
+      description: "How long each lip-sync call waits for the server. A line it doesn't answer in time gets the game's own lip sync. If the connection fails, lines get the game's own lip sync until the bridge has reconnected in the background."
       defaultValue: 1000
       min: 200
       max: 5000
@@ -66,7 +66,7 @@ schema:
     - name: "Log detail"
       path: "logDetail"
       type: "select"
-      description: "Detailed logs every call's round trip in BFARemoteBridge.log."
+      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt in BFARemoteBridge.log."
       defaultValue: "Normal"
       options:
         - Normal

@@ -744,7 +744,7 @@ TEST(ClientHelloOkOutOfOrderIsRefused) {
 TEST(ClientNameLookup) {
     auto script = std::make_shared<Script>();
     script->answer = &Serve;
-    auto calls = std::make_shared<int>(0);
+    auto calls = std::make_shared<std::atomic<int>>(0);
     std::vector<std::string> log;
     Client c(ScriptedFactory(script), ScriptedResolver(calls), [&](Level, const std::string& l) { log.push_back(l); }, &FakeNow);
     Settings s = On();
@@ -768,13 +768,13 @@ TEST(ClientNameLookup) {
     int lines = 0;
     for (const auto& l : log) lines += l.find("until the settings change") != std::string::npos;
     CHECK_EQ(lines, 1);
-    CHECK_EQ(*calls, 1);  // runs and the background never look a failed name up again
+    CHECK_EQ(calls->load(), 1);  // runs and the background never look a failed name up again
     CHECK_EQ(script->connects.load(), 0);
     s.serverAddress = "server.example";
     c.Configure(s);
     CHECK(c.Resolve());
     CHECK(c.Admit(m).Ready());
-    CHECK_EQ(*calls, 2);
+    CHECK_EQ(calls->load(), 2);
     CHECK(c.Run(m, req, reply, fb) == Client::Outcome::Forwarded);
 }
 
@@ -806,7 +806,7 @@ TEST(ClientStringAndItsEightyCharacters) {
     const std::string name = std::string("BFARemoteBridge ") + kVersionText;
     CHECK_EQ(ClientName(), name);
     CHECK_EQ(ClientString(Counters{1250, 0, 0}), name + " (answered 1250, fallbacks 0, timeouts 0)");
-    if (std::string(kVersionText) == "1.1.0") CHECK_EQ(ClientString(Counters{1250, 0, 0}).size(), std::size_t{63});
+    if (std::string(kVersionText) == "1.1.0") CHECK_EQ(ClientString(Counters{1250, 0, 0}).size(), std::size_t{62});
     // the longest that fits whole, then one digit more: the trailing key goes first, then the next
     const std::size_t fixed = (name + " (answered , fallbacks , timeouts )").size();
     std::uint64_t big = 1;
@@ -908,14 +908,14 @@ TEST(ClientBackgroundThreadEndsThePause) {
     CHECK(r.Run(m) == Client::Outcome::Forwarded);
     r.script->closeBeforeAnswer = true;
     r.script->refuseConnect = true;
+    const auto start = Clock::now();
     CHECK(r.Run(m) == Client::Outcome::Failed);
     CHECK(r.c.Paused());
     r.script->refuseConnect = false;
-    const auto start = Clock::now();
     while (r.c.Paused() && Clock::now() - start < std::chrono::seconds(5)) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
     CHECK(!r.c.Paused());
-    CHECK(took >= 900 && took < 2500);  // the first try after 1 s
+    CHECK(took >= 1000 && took < 3000);  // the first try after 1 s
     CHECK(r.Run(m) == Client::Outcome::Forwarded);
     r.c.StopBackground();
 }

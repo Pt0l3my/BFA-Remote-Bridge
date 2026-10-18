@@ -23,10 +23,15 @@ BFA's files are never changed: the bridge attaches to BFA in memory when the gam
   - If the server can't load the model (it isn't running, the key is wrong, it lacks the file or has another copy),
     BFA's model isn't loaded, and lip sync is the game's own. Start the server, then reload the model in BFA's menu
     or restart the game.
-  - If the server doesn't answer a call in time, that one line gets the game's own lip sync, and the bridge waits 10
-    seconds before asking again (lines in those 10 seconds get the game's own lip sync at once, without waiting).
-    BFA keeps its facial model and the next line tries again. Its sentiment model is the exception: BFA drops it after
-    a missed answer and loads it again 30 seconds later (60 in GPU mode).
+  - If the server doesn't answer a call in time, that one line gets the game's own lip sync, BFA keeps its facial
+    model, and the next line goes to the server again on the same connection. Its sentiment model is the exception:
+    BFA drops it after a missed answer and loads it again 30 seconds later (60 in GPU mode).
+  - If the connection fails (the server stops, the network drops, or two calls in a row time out), the bridge pauses:
+    lines get the game's own lip sync at once, without waiting, while the bridge reconnects in the background (after
+    1, 2, 5, 10 and 30 seconds, then every 30 seconds). Speech goes back to the server the moment it answers again.
+- The bridge keeps one connection for speech. When BFA loads a model, the server loads it on a short-lived connection
+  of its own, so the lines of a model already loaded keep flowing meanwhile. After a minute without speech the bridge
+  checks the connection (PING), so it is ready before the next line needs it.
 - Turning the bridge on or off takes effect the next time BFA loads its model: restart the game, or switch the model
   in BFA's menu. A model BFA loaded while the bridge was off runs on this PC as usual.
 
@@ -65,7 +70,8 @@ By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 - With Force CPU, the gaming PC's graphics card does no BFA work at all.
 - In BFA's GPU mode, the bridge still sends every run to the server, and no lip-sync inference runs on the gaming
   card; but BFA still opens a Direct3D 12 device of its own on that card before it loads a model. Force CPU avoids
-  even that. The bridge notes in its log when BFA is set to GPU.
+  even that. The bridge notes in its log when BFA is set to GPU, and says so once on screen: "BFA Remote Bridge: BFA
+  is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."
 - In GPU mode BFA also reacts to a refused model load or a failed warm-up as to a failing card: with its independent
   device it turns its GPU route off until you press "Try GPU again" in its menu, and with the shared device it may
   turn DirectML's metacommands off for the session. Another reason for Force CPU.
@@ -80,10 +86,10 @@ On SkyrimNet's Settings > Plugins page, under **BFA Remote Bridge**:
 | Server address | (empty) | The address of the PC running the A2F server, on your local network. Empty keeps the bridge idle, and BFA runs as usual. |
 | Port | 7871 | The A2F server's port, as set in PandorumLLM. |
 | Access key | (empty) | The key set in PandorumLLM, if any. |
-| Timeout (ms) | 1000 | How long each lip-sync call waits for the server (200 to 5000). A line it doesn't answer in time gets the game's own lip sync. |
+| Timeout (ms) | 1000 | How long each lip-sync call waits for the server (200 to 5000). A line it doesn't answer in time gets the game's own lip sync. If the connection fails, lines get the game's own lip sync until the bridge has reconnected in the background. |
 | Check results | 0 | A diagnostic: also loads BFA's model on this PC and runs this many of each model's first calls on both PCs, logging how far apart the results are. While it is above 0 the model runs on this PC too, so keep it at 0 for play. Small differences are expected when the server runs on another device (DirectML against the processor), uses another thread count, or runs another model in a role's place (the log's HELLO line says so); identical results need the same file, the same device and the same thread count. |
-| Status on load | on | Shows the bridge's state on screen when a save loads and when BFA loads its model. |
-| Log detail | Normal | Detailed logs every call's round trip. |
+| Status on load | on | Shows the bridge's state on screen when a save loads and when BFA loads its model, and once per session if BFA is set to GPU. |
+| Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt. |
 
 The bridge reads the settings when the game starts, when the main menu opens, before each save loads, and whenever
 you save the page. Until SkyrimNet has registered them, BFA's model loads are refused (BFA tries again 30 seconds
@@ -100,9 +106,23 @@ later), so that the model never runs on this PC by mistake.
 - each model BFA loads: its size, SHA-256 and overrides, and whether the server serves it ("is served by ...;
   nothing of it runs on this PC") or why not, with the server's note when it runs another model in that role's place;
 - each model BFA loads on this PC instead, and why (the bridge is off, no address, SkyrimNet isn't loaded);
-- each failure, once, with "lines get the game's own lip sync for the next 10 seconds";
-- every 250 answered runs, the average round trip and the server's own time. With Log detail set to Detailed, one
-  line per run.
+- each line the server didn't answer: the model, the reason (no connection, connect timed out, RUN timed out, ERROR
+  with its code and text, not ready, connection lost) and the time it took, as "a2f3_fp16.onnx: not answered (RUN
+  timed out: no answer within 1000 ms) after 1001.2 ms; its line gets the game's own lip sync". Lines answered at
+  once during a pause are counted, not logged one by one;
+- each pause, when it starts ("...; lines get the game's own lip sync until the server answers again") and when it
+  ends, with how long it lasted;
+- every 250 runs, and every 10 minutes when anything happened, a summary of every run by reason, with the average
+  round trip, the server's own time and the slowest call:
+  "250 runs since the last summary: 249 answered, 1 not (1 timed out, 0 refused, 0 not ready, 0 no connection, 0
+  paused, 0 other); round trip 8.1 ms, server 6.2 ms, slowest 21.0 ms".
+
+With Log detail set to Detailed it also logs one line per run, each connection opened or closed and why, each answer
+to HELLO, each unanswered PING, each late answer discarded and each background reconnection attempt.
+
+The bridge also tells the server how it is doing: its HELLO carries its counters since the game started, as
+"BFARemoteBridge 1.1.0 (answered 1250, fallbacks 0, timeouts 0)", and every 5 minutes, when they changed, it sends
+them on a short connection of its own, so PandorumLLM's panel shows them.
 
 ## Troubleshooting
 
@@ -115,7 +135,8 @@ later), so that the model never runs on this PC by mistake.
 | "the server refused the access key" | Enter the same key as the server's. |
 | "the server lacks ... or has a different copy" | Copy the model files from your `BetterFacialAnimations` folder to the server's model folder again: they must be identical. |
 | "couldn't attach to it" | Another mod loaded BFA's ONNX Runtime first, or this BFA differs from 4.3.2: the log says which. BFA runs as usual. |
-| Lips still on the game's own animation now and then | The log's "for the next 10 seconds" lines say why; raise the timeout if the server is slow. |
+| Lips still on the game's own animation now and then | The log's "not answered" lines and summaries say why; raise the timeout if the server is slow. |
+| "BFA is set to GPU" | Tick Force CPU in BFA's menu (see above). |
 
 ## Building
 

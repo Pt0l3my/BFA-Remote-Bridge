@@ -114,6 +114,7 @@ jobs:
           cp build/windows/BFARemoteBridge.dll build/windows/BFARemoteBridge.pdb "$mod/SKSE/Plugins/"
           cp -r data/SKSE/Plugins/SkyrimNet "$mod/SKSE/Plugins/"
           cp README.md "$mod/BFARemoteBridge README.md"
+          cp CHANGELOG.md "$mod/BFARemoteBridge CHANGELOG.md"
           cp LICENSE "$mod/BFARemoteBridge LICENSE.txt"
           cp THIRD-PARTY-NOTICES.md "$mod/BFARemoteBridge THIRD-PARTY-NOTICES.md"
           find "$mod" -type f | sort

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Tests of the reference server (tools/reference_server.py), from a client written here in Python: every message
-type, the refusals and their codes, which ones close the connection, and results equal to a local run.
+type, the refusals and their codes, which ones close the connection, results equal to a local run, PONG only after
+HELLO, and answers in order, late ones too.
 
     python3 tools/test_reference_server.py <folder holding tiny.onnx and other/tiny.onnx (tests/make_test_model.py)>
 """
 
 import hashlib
 import os
+import time
 import socket
 import struct
 import subprocess
@@ -134,14 +136,18 @@ def parse_run_ok(payload):
     return request_id, micros, out
 
 
+def start_server(*extra):
+    proc = subprocess.Popen([sys.executable, "-I", SERVER, "--models", MODELS, "--port", "0", "--quiet", "--key", "sesame", *extra],
+                            stdout=subprocess.PIPE, text=True)
+    line = proc.stdout.readline()
+    assert line.startswith("LISTENING "), line
+    return proc, int(line.split()[1])
+
+
 class ReferenceServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.proc = subprocess.Popen([sys.executable, "-I", SERVER, "--models", MODELS, "--port", "0", "--quiet", "--key", "sesame"],
-                                    stdout=subprocess.PIPE, text=True)
-        line = cls.proc.stdout.readline()
-        assert line.startswith("LISTENING "), line
-        cls.port = int(line.split()[1])
+        cls.proc, cls.port = start_server()
         cls.tiny = os.path.join(MODELS, "tiny.onnx")
         size, sha = digest(cls.tiny)
         cls.entry = ("tiny.onnx", size, sha, [("batch", 2)])
@@ -151,10 +157,20 @@ class ReferenceServerTests(unittest.TestCase):
         cls.proc.terminate()
         cls.proc.wait()
 
-    def connect(self):
-        c = Conn(self.port)
+    def connect(self, port=None):
+        c = Conn(port or self.port)
         self.addCleanup(c.close)
         return c
+
+    def other_server(self, *extra):
+        proc, port = start_server(*extra)
+
+        def stop():
+            proc.terminate()
+            proc.wait()
+
+        self.addCleanup(stop)
+        return port
 
     def test_hello_statuses(self):
         c = self.connect()
@@ -219,6 +235,7 @@ class ReferenceServerTests(unittest.TestCase):
             (hello("sesame", [("..", 1, b"\0" * 32, [])]), 1),
             (hello("sesame", [("x" * 300 + ".onnx", 1, b"\0" * 32, [])]), 1),  # over-long
             (run(1, "tiny.onnx", [], []), 1),        # RUN before HELLO
+            (frame(6, b""), 1),                      # PING before HELLO: no PONG
             (frame(1, b"\x01"), 1),                  # truncated HELLO
         ]
         for data, code in cases:
@@ -250,6 +267,53 @@ class ReferenceServerTests(unittest.TestCase):
             c = self.connect()
             c.send(hello("sesame", [self.entry]))
             self.assertEqual(c.answer()[0], 2)
+
+    def test_answers_in_order(self):
+        # requests sent back to back are answered in the order sent, PONG among them
+        c = self.connect()
+        c.send(hello("sesame", [self.entry]) + run(11, "tiny.onnx", tiny_inputs(1), ["y"]) + frame(6, b"") +
+               run(12, "tiny.onnx", tiny_inputs(2), ["y"]) + run(13, "missing.onnx", [], ["y"]))
+        self.assertEqual(c.answer()[0], 2)
+        kind, payload = c.answer()
+        self.assertEqual((kind, parse_run_ok(payload)[0]), (4, 11))
+        self.assertEqual(c.answer(), (7, b""))
+        kind, payload = c.answer()
+        self.assertEqual((kind, parse_run_ok(payload)[0]), (4, 12))
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload)), (5, (13, 3)))
+
+    def test_a_late_answer_comes_before_the_next(self):
+        # the first RUN is slow: its answer, late for a client that gave up, still comes first
+        port = self.other_server("--delay-ms", "400", "--fault-count", "1")
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry]))
+        self.assertEqual(c.answer()[0], 2)
+        start = time.monotonic()
+        c.send(run(21, "tiny.onnx", tiny_inputs(1), ["y"]))
+        c.send(run(22, "tiny.onnx", tiny_inputs(2), ["y"]))
+        ids = [parse_run_ok(c.answer()[1])[0] for _ in range(2)]
+        self.assertEqual(ids, [21, 22])
+        self.assertGreaterEqual(time.monotonic() - start, 0.39)
+        c.send(run(23, "tiny.onnx", tiny_inputs(3), ["y"]))  # past --fault-count: at once
+        start = time.monotonic()
+        self.assertEqual(parse_run_ok(c.answer()[1])[0], 23)
+        self.assertLess(time.monotonic() - start, 0.35)
+
+    def test_error_codes_that_close(self):
+        # after ERROR 1, 2, 5, 6 or 7 the connection is closed; after 3 or 4 it stays open
+        for code in (1, 2, 3, 4, 5, 6, 7):
+            port = self.other_server("--run-error", str(code))
+            c = self.connect(port)
+            c.send(hello("sesame", [self.entry]))
+            self.assertEqual(c.answer()[0], 2)
+            c.send(run(31, "tiny.onnx", tiny_inputs(1), ["y"]))
+            kind, payload = c.answer()
+            self.assertEqual((kind, error_code(payload)), (5, (31, code)), code)
+            if code in (1, 2, 5, 6, 7):
+                self.assertTrue(c.closed(), code)
+            else:
+                c.send(frame(6, b""))
+                self.assertEqual(c.answer(), (7, b""), code)
 
     def test_oversize_frame_is_refused_and_closed(self):
         c = self.connect()

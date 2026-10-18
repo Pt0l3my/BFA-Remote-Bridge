@@ -132,7 +132,7 @@ inline TransportFactory ScriptedFactory(std::shared_ptr<Script> script) {
 }
 
 // A lookup that finds one made-up address for any name but those ending in ".invalid", and counts its calls.
-inline Resolver ScriptedResolver(std::shared_ptr<int> calls = std::make_shared<int>(0)) {
+inline Resolver ScriptedResolver(std::shared_ptr<std::atomic<int>> calls = std::make_shared<std::atomic<int>>(0)) {
     return [calls](const std::string& host, std::uint16_t, std::vector<Endpoint>& out, std::string& err) {
         ++*calls;
         if (host.size() >= 8 && host.compare(host.size() - 8, 8, ".invalid") == 0) {

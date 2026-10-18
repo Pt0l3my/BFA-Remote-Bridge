@@ -231,6 +231,8 @@ TEST(StatusTexts) {
     n.kind = Notice::Kind::Missing;
     CHECK_EQ(NoticeText(n, "4.3.2"),
              std::string("BFA Remote Bridge: the server lacks a2f3_fp16.onnx or has a different copy; lip sync is the game's own."));
+    n.kind = Notice::Kind::GpuMode;  // the owner's approved text, word for word
+    CHECK_EQ(NoticeText(n, "4.3.2"), std::string("BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."));
     for (auto k : {Notice::Kind::WrongKey, Notice::Kind::CouldNotLoad, Notice::Kind::UnknownRuntime}) {
         n.kind = k;
         CHECK(NoticeText(n, "4.3.2").rfind("BFA Remote Bridge: ", 0) == 0);
