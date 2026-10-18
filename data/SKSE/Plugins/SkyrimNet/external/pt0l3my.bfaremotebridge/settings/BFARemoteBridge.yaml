@@ -60,7 +60,7 @@ schema:
     - name: "Status on load"
       path: "showStatus"
       type: "bool"
-      description: "Shows the bridge's state on screen when a save loads and when BFA loads its model."
+      description: "Shows the bridge's state on screen when a save loads and when BFA loads its model, and once per session if BFA is set to GPU."
       defaultValue: true
       category: "Diagnostics"
     - name: "Log detail"

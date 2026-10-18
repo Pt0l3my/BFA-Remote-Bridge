@@ -29,7 +29,7 @@ Protocol version 1 is unchanged. The scope was agreed with PandorumLLM's side: [
   each connect and close with its reason, each HELLO's answer, each unanswered PING and each background attempt.
 - **A notice on screen when BFA is set to GPU,** once per session while the bridge is on and Status on load allows
   notices: "BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."
-- The settings page's Timeout and Log detail texts describe the new behaviour.
+- The settings page's Timeout, Status on load and Log detail texts describe the new behaviour.
 - The reference server answers PONG only after HELLO, closes the connection after ERROR 1, 2, 5, 6 or 7, keeps idle
   connections open by default, and has test options for late and failing answers.
 
