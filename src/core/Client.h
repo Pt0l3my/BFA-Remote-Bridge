@@ -12,10 +12,12 @@
 // - Admit: at BFA's CreateSession, the new model alone in a HELLO on a side connection of its own (kConnectTimeout to
 //   connect, kHelloTimeout for the server to load and warm it up), closed after the answer. The main connection is
 //   never held by a load. While a side load is in flight the background thread holds its own HELLOs (the server makes
-//   any HELLO wait for a load in progress); status checks name no model and aren't held. SetModels then lists every
-//   live model, and the background thread (or the next run) says HELLO with that list on the main connection.
-// - Run: RUN and its answer within the timeout, on the main connection. HELLO is sent first only when the connection
-//   has no answer for the run's model yet. A connection the server closed or reset, or a send that failed, is opened
+//   any HELLO wait for a load in progress); status checks name no model and aren't held. A small gate keeps the two
+//   apart: Admit waits for a main-connection HELLO already in flight before its side HELLO goes. SetModels then lists
+//   every live model, and the background thread (or the next run) says HELLO with that list on the main connection.
+// - Run: RUN and its answer on the main connection, all within the call's timeout counted from its start: waiting for
+//   the connection's lock, a connect and a HELLO included. HELLO is sent first only when the connection has no answer
+//   for the run's model yet. A connection the server closed or reset, or a send that failed, is opened
 //   again within the same call, once. A RUN timeout with no byte of its answer arrived keeps the connection: the next
 //   exchange reads and discards the late answer (the server answers in order), and a late ERROR 1, 2, 5, 6 or 7 ends
 //   the connection. A second timeout in a row, a timeout in the middle of a frame, or any connection failure closes
@@ -25,8 +27,9 @@
 //   10 and 30 s (then every 30 s), its HELLO's answer ending the pause; a HELLO on the main connection when the live
 //   models changed; a PING after 60 s idle on a connection whose HELLO listed models; a status check on a connection
 //   of its own every 5 minutes when the counters changed; the summary line every 10 minutes when anything happened.
-//   It never holds the connection's lock while a run waits: connecting and HELLO go on a new connection outside the
-//   lock, swapped in under it, and its HELLO and PING on the main connection use a try-lock and give way to runs.
+//   It never makes a run wait past the run's own timeout: connecting and HELLO go on a new connection outside the
+//   lock, swapped in under it, and its HELLO and PING on the main connection use a try-lock, give way to runs, and
+//   last no longer than the run timeout.
 //   Tick is one round of its work, which the tests call directly instead of starting the thread.
 
 #include <array>
@@ -218,10 +221,10 @@ private:
         proto::ModelEntry entry;
         std::uint8_t status = 0xFF;
         std::string detail;
-        bool told = false;  // a fallback for it not being ready was logged
     };
     struct Snapshot;
     class SideLoad;
+    class MainHello;
 
     // Under mutex_.
     void ApplyPendingLocked();
@@ -233,6 +236,8 @@ private:
     void CloseLocked(const std::string& why) noexcept;
     void ScheduleNotReadyLocked();
     Answered* FindAnsweredLocked(const proto::ModelEntry& model);
+    bool ToldNotReadyLocked(const Answered& a);
+    void AnsweredLocked(std::vector<Answered> fresh);
 
     bool Endpoints(const std::string& host, int port, std::vector<Endpoint>& out, std::string& reason, bool lookUpNow);
     bool SettingsPending() const;
@@ -242,8 +247,8 @@ private:
     void Wake();
     void Loop();
     void MaybeStartLocked();
-    void Recover(const Snapshot& snap);
-    void RehelloMain();
+    bool Recover(const Snapshot& snap);
+    bool RehelloMain();
     void PingMain();
     void FirstProbe();
     void StatusCheck();
@@ -286,6 +291,7 @@ private:
     bool helloCurrent_ = false;         // that HELLO listed exactly listed_
     std::vector<std::uint32_t> owed_;   // requests that timed out on this connection, their answers still to come
     int timeoutsInARow_ = 0;
+    std::uint64_t pauses_ = 0;          // pauses begun: an attempt begun before a pause doesn't end it
     Clock::time_point lastActivity_{};
     std::string lastStatusLine_;
     std::uint32_t nextRequest_ = 1;
@@ -293,10 +299,19 @@ private:
     int connects_ = 0;
     int pings_ = 0;
 
+    std::string toldNoConnection_;        // a series of runs with nowhere to connect to: its reason, logged once
+    std::vector<Answered> toldNotReady_;  // the not-ready fallbacks logged, by model and state, across connections
+
     std::atomic<bool> paused_{false};
     std::atomic<int> runsWaiting_{0};
-    std::atomic<int> sideLoads_{0};
     std::atomic<int> sideHellos_{0};
+
+    // H's gate: side loads in flight and main-connection HELLOs in flight, never both at once from the background
+    // thread's side. Never held across the network, and taken after mutex_ when both are.
+    mutable std::mutex gateMutex_;
+    std::condition_variable gateCv_;
+    std::atomic<int> sideLoads_{0};
+    int mainHellos_ = 0;
 
     // the background thread and its timers: never held across the network or while taking mutex_
     mutable std::mutex bgMutex_;

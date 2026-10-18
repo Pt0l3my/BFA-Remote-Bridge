@@ -210,6 +210,10 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   the caller passed), then the outputs handed to BFA as the runtime would (new values made by the real
   `CreateTensorAsOrtValue`, or the caller's filled). HELLO goes first only when the connection has no answer for that
   model yet (a new connection).
+  - **Its timeout** counts from the moment BFA makes the call, and bounds all of it: the wait for the main connection
+    (another run, or the background thread's PING or HELLO, may hold it), a connect (only as long as the call has
+    left, never the 3000 ms off the speech path), HELLO and RUN share that one deadline. A call that gets the
+    connection with no time left sends nothing.
   - When the server doesn't answer in full (a timeout, a lost connection, an ERROR, a malformed or mismatched answer,
     a model not ready), the call still succeeds, with each requested output a one-element float tensor holding NaN.
     BFA's output check rejects it and that one line plays with the game's own lip sync; an error status would make
@@ -223,8 +227,8 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   1, 2, 5 or 6 (after which the server closes the connection) or 7 (the server stopping) ends the connection. A timeout
   in the middle of a frame, or of the send, closes the connection, since the stream can't be resynchronised.
 - **The pause.** A connection failure (no connection, a lost or closed connection, a malformed answer, an ERROR that
-  ends the connection, an unanswered PING) or a second RUN timeout in a row closes the connection and starts the
-  pause: every run is then answered at once with NaN, without touching the network, until the background thread's
+  ends the connection, an unanswered PING, a HELLO on the main connection unanswered in time or refused, whether in a
+  run or from the background thread) or a second RUN timeout in a row closes the connection and starts the pause: every run is then answered at once with NaN, without touching the network, until the background thread's
   HELLO is answered. One log line starts it and one ends it, with how long it lasted and how many runs it answered so.
 - **The background thread**, one of the bridge's own, asleep on a condition variable between its timers. It starts
   once the bridge is on with a server address, never runs on the game's threads, and lives until the game exits.
@@ -238,10 +242,13 @@ so there is no local fallback: a line the server doesn't answer in time gets the
     within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
   - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
     counters in its client string) on a connection of its own, then closed. Also once when the bridge comes on.
-  - **Never in a run's way:** it never holds the main connection's lock while a run waits for it. Its HELLO and PING
-    on the main connection take the lock only when it is free and no run waits, and are answered at once.
+  - **Never past a run's timeout:** its connect and the 60-second HELLO of a reconnect go on a new connection, outside
+    the main connection's lock. Its HELLO and PING on the main connection take the lock only when it is free and no
+    run waits, and last at most the run timeout. A run that arrives meanwhile waits for the lock within its own
+    timeout, which counts from its call (above): it is answered by the server, or gets the NaN answer, by then.
   - While the bridge's own side load is in flight it holds its HELLOs (see the server's duties at loading); status
-    checks aren't held.
+    checks aren't held. A small gate keeps the two apart: a model load waits for a HELLO already in flight on the main
+    connection before its side HELLO goes, so no HELLO of the main connection is caught waiting for the load.
 - **Before the settings are read**: SkyrimNet registers the bridge's settings during its own start-up, so the bridge
   reads them at the data-loaded message, when the main menu opens, before each game loads and when its page is
   saved, and counts them read once SkyrimNet names the config. A model load before that is refused ("the bridge's
@@ -268,9 +275,11 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   answer to each model load and to the main connection's HELLO when it changes, the pause's start and end, and **each
   run the server didn't answer**: its model, its reason (no connection, connect timed out, RUN timed out, ERROR with
   its code and text, not ready, connection lost, other) and the time it took. Runs answered at once without the
-  network (during a pause, a model not ready, an address not looked up, a replaced session, an input the protocol
-  can't carry) are counted by reason; only the first of a series is logged. **The summary line** counts every run,
-  answered or not, by reason, at each 250 runs and every 10 minutes when anything happened: "250 runs since the last
-  summary: 249 answered, 1 not (1 timed out, 0 refused, 0 not ready, 0 no connection, 0 paused, 0 other); round trip
-  8.1 ms, server 6.2 ms, slowest 21.0 ms". Log detail "Detailed" adds a line per run, each connect and close with its
-  reason, each HELLO's answer, each unanswered PING, each discarded late answer and each background attempt.
+  network (during a pause, a model not ready, no address or an address not looked up, a replaced session, an input
+  the protocol can't carry) are counted by reason; only the first of a series is logged. A model the server keeps not
+  ready is logged again only when its state changes, however often the background thread asks. **The summary line**
+  counts every run, answered or not, by reason, at each 250 runs and every 10 minutes when anything happened: "250
+  runs since the last summary: 249 answered, 1 not (1 timed out, 0 refused, 0 not ready, 0 no connection, 0 paused, 0
+  other); round trip 8.1 ms, server 6.2 ms, slowest 21.0 ms". Log detail "Detailed" adds a line per run, each connect
+  and close with its reason (a background reconnect's connect is logged at the normal level only when it ends a
+  pause), each HELLO's answer, each unanswered PING, each discarded late answer and each background attempt.

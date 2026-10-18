@@ -233,6 +233,7 @@ std::string SummaryLine(const Period& p) {
 // ---- the client
 
 struct Client::Snapshot {
+    std::uint64_t pauses = 0;
     bool paused = false;
     bool connected = false;
     bool helloCurrent = false;
@@ -244,12 +245,20 @@ struct Client::Snapshot {
     Settings settings;
 };
 
-// A side load in flight, for H: the background thread holds its HELLOs meanwhile, and looks again when it ends.
+// A side load in flight, for H: the background thread holds its HELLOs meanwhile, and looks again when it ends. It
+// begins once no HELLO is in flight on the main connection, so that HELLO is never caught waiting for this load.
 class Client::SideLoad {
 public:
-    explicit SideLoad(Client& c) : c_(c) { ++c_.sideLoads_; }
+    explicit SideLoad(Client& c) : c_(c) {
+        std::unique_lock lock(c_.gateMutex_);
+        c_.gateCv_.wait(lock, [this] { return c_.mainHellos_ == 0; });
+        ++c_.sideLoads_;
+    }
     ~SideLoad() {
-        --c_.sideLoads_;
+        {
+            std::lock_guard lock(c_.gateMutex_);
+            --c_.sideLoads_;
+        }
         c_.Wake();
     }
     SideLoad(const SideLoad&) = delete;
@@ -257,6 +266,35 @@ public:
 
 private:
     Client& c_;
+};
+
+// A HELLO on the main connection in flight, for H: a side load waits for it to end before its own HELLO goes. The
+// background thread's is held while a side load is in flight (Held: nothing may be sent); a run's never is.
+class Client::MainHello {
+public:
+    MainHello(Client& c, bool holdForLoads) : c_(c) {
+        std::lock_guard lock(c_.gateMutex_);
+        if (holdForLoads && c_.sideLoads_.load() > 0) {
+            held_ = true;
+            return;
+        }
+        ++c_.mainHellos_;
+    }
+    ~MainHello() {
+        if (held_) return;
+        {
+            std::lock_guard lock(c_.gateMutex_);
+            --c_.mainHellos_;
+        }
+        c_.gateCv_.notify_all();
+    }
+    bool Held() const noexcept { return held_; }
+    MainHello(const MainHello&) = delete;
+    MainHello& operator=(const MainHello&) = delete;
+
+private:
+    Client& c_;
+    bool held_ = false;
 };
 
 Client::Client(TransportFactory factory, Resolver resolver, LogSink log, Now now)
@@ -349,6 +387,8 @@ void Client::ApplyPendingLocked() {
         if (paused_.load()) EndPauseLocked("the settings changed");
         timeoutsInARow_ = 0;
         lastStatusLine_.clear();
+        toldNoConnection_.clear();
+        toldNotReady_.clear();
         std::lock_guard lock(bgMutex_);
         failedTries_ = 0;
         nextTry_ = {};
@@ -356,6 +396,10 @@ void Client::ApplyPendingLocked() {
 }
 
 bool Client::Endpoints(const std::string& host, int port, std::vector<Endpoint>& out, std::string& reason, bool lookUpNow) {
+    if (host.empty()) {
+        reason = "no server address is set";
+        return false;
+    }
     const auto matches = [&] { return lookup_.done && lookup_.host == host && lookup_.port == port; };
     bool found = false;
     {
@@ -447,6 +491,7 @@ void Client::CloseLocked(const std::string& why) noexcept {
 void Client::StartPauseLocked(const std::string& reason) {
     CloseLocked(reason);
     timeoutsInARow_ = 0;
+    ++pauses_;
     const bool already = paused_.exchange(true);
     {
         std::lock_guard lock(bgMutex_);
@@ -485,6 +530,24 @@ Client::Answered* Client::FindAnsweredLocked(const proto::ModelEntry& model) {
     for (auto& a : answered_)
         if (a.entry == model) return &a;
     return nullptr;
+}
+
+// Whether a run's fallback for a model in this state (not ready, and why) was logged already; true from the second on.
+bool Client::ToldNotReadyLocked(const Answered& a) {
+    for (const auto& t : toldNotReady_)
+        if (t.entry == a.entry && t.status == a.status && t.detail == a.detail) return true;
+    toldNotReady_.push_back(a);
+    return false;
+}
+
+// A HELLO_OK on the main connection: its models' states. A model whose state changed is logged again at its next
+// fallback; one the server answers the same way on each reconnect isn't.
+void Client::AnsweredLocked(std::vector<Answered> fresh) {
+    answered_ = std::move(fresh);
+    std::erase_if(toldNotReady_, [this](const Answered& t) {
+        const Answered* a = FindAnsweredLocked(t.entry);
+        return !a || a->status != t.status || a->detail != t.detail;
+    });
 }
 
 // After a HELLO_OK on the main connection: a model it says isn't ready is asked about again, on the backoff schedule.
@@ -550,8 +613,9 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
         Detail("HELLO on the main connection: " + reason);
         return false;
     }
-    answered_.clear();
-    for (std::size_t i = 0; i < hello.models.size(); ++i) answered_.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    std::vector<Answered> fresh;
+    for (std::size_t i = 0; i < hello.models.size(); ++i) fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    AnsweredLocked(std::move(fresh));
     helloCurrent_ = true;
     const std::string line = StatusLine(ans.result.server, ans.result.device, answered_);
     if (line != lastStatusLine_)
@@ -628,14 +692,19 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         fallback = Fallback{why, std::move(text), quiet};
         return o;
     };
+    // the call's whole time, counted from here: waiting for the connection, a connect, a HELLO and RUN
+    const Clock::time_point entry = Clock::now();
+    const int timeoutMs = timeoutMs_.load();
+    const Clock::time_point deadline = entry + std::chrono::milliseconds(timeoutMs);
     // during a pause: at once, without the connection's lock
     if (paused_.load() && !SettingsPending()) return answer(Outcome::Skipped, Why::Paused, "the bridge is paused", true);
     std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
     ++runsWaiting_;
-    const bool got = lock.try_lock_for(std::chrono::milliseconds(timeoutMs_.load()));
+    const bool got = lock.try_lock_until(deadline);
     --runsWaiting_;
-    // another run holding the connection past this call's timeout: this line goes without
-    if (!got) return answer(Outcome::Skipped, Why::Other, "another call held the connection past the timeout");
+    // another run, or the background thread's PING or HELLO, holding the connection past this call's timeout: this line
+    // goes without
+    if (!got) return answer(Outcome::Skipped, Why::Other, "the connection was busy past the timeout");
     ApplyPendingLocked();
     if (paused_.load()) return answer(Outcome::Skipped, Why::Paused, "the bridge is paused", true);
     const auto listed = std::find_if(listed_.begin(), listed_.end(), [&](const Listed& l) { return l.entry.name == model.name; });
@@ -645,17 +714,19 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     if (!transport_) {
         std::vector<Endpoint> unused;
         if (!EndpointsLocked(unused, reason, false)) {
-            bool quiet = false;
+            // no address, or none looked up: only the first of a series is logged
+            bool quiet = reason == toldNoConnection_;
+            toldNoConnection_ = reason;
             if (reason.find("couldn't be looked up") != std::string::npos) {
                 quiet = true;
                 if (!lookupFailureLogged_.exchange(true)) Log(Level::Warn, reason + "; lines get the game's own lip sync until the settings change");
             }
             return answer(Outcome::Skipped, Why::NoConnection, reason, quiet);
         }
+        toldNoConnection_.clear();
     }
     if (Answered* a = FindAnsweredLocked(model); a && a->status != static_cast<std::uint8_t>(proto::ModelStatus::Ready)) {
-        const bool quiet = a->told;
-        a->told = true;
+        const bool quiet = ToldNotReadyLocked(*a);
         return answer(Outcome::Skipped, Why::NotReady,
                       std::string("the server doesn't have it ready (") + proto::ModelStatusName(a->status) +
                           (a->detail.empty() ? "" : ": " + a->detail) + ")",
@@ -669,7 +740,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     if (!proto::EncodeRun(request, payload, err)) return answer(Outcome::Skipped, Why::Other, "couldn't encode RUN (" + err + ")");
 
     const Clock::time_point start = Clock::now();
-    const Clock::time_point deadline = start + std::chrono::milliseconds(settings_.timeoutMs);
+    if (start >= deadline) return answer(Outcome::Skipped, Why::Other, "the connection was busy past the timeout");
     const Note note = [this](const std::string& l) { Detail(l); };
     proto::Header header;
     bool reused = transport_ != nullptr;
@@ -686,11 +757,14 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         bool inHello = false;
         if (!FindAnsweredLocked(model)) {
             inHello = true;
-            ok = HelloMainLocked(deadline, f, reason);
+            {
+                const MainHello inFlight(*this, false);  // a run's own HELLO is never held; a side load waits for it
+                ok = HelloMainLocked(deadline, f, reason);
+            }
             if (ok) {
                 Answered* a = FindAnsweredLocked(model);
                 if (!a || a->status != static_cast<std::uint8_t>(proto::ModelStatus::Ready)) {
-                    if (a) a->told = true;
+                    if (a) ToldNotReadyLocked(*a);
                     return answer(Outcome::Failed, Why::NotReady,
                                   std::string("the server no longer has it ready (") +
                                       (a ? std::string(proto::ModelStatusName(a->status)) + (a->detail.empty() ? "" : ": " + a->detail)
@@ -726,7 +800,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         }
         if (f == Failure::NoByte) {
             // no byte of the answer arrived: the stream is still whole, and its late answer comes first
-            const std::string text = "no answer within " + std::to_string(settings_.timeoutMs) + " ms";
+            const std::string text = "no answer within " + std::to_string(timeoutMs) + " ms";
             owed_.push_back(request.requestId);
             if (++timeoutsInARow_ >= 2) {
                 StartPauseLocked("A second RUN in a row timed out");
@@ -804,9 +878,13 @@ void Client::RecordFallback(const std::string& model, const Fallback& fb, std::c
             lastSummary_ = now_();
         }
     }
-    if (!fb.quiet)
-        Log(Level::Warn, model + ": not answered (" + WhyName(fb.why) + (fb.text.empty() ? "" : ": " + fb.text) + ") after " +
-                             Ms(static_cast<std::uint64_t>(took.count())) + " ms; its line gets the game's own lip sync");
+    if (!fb.quiet) {
+        // a text that begins with the reason's name ("ERROR 4, ...") stands for both
+        const std::string why = WhyName(fb.why);
+        const std::string what = fb.text.empty() ? why : fb.text.rfind(why + " ", 0) == 0 ? fb.text : why + ": " + fb.text;
+        Log(Level::Warn, model + ": not answered (" + what + ") after " + Ms(static_cast<std::uint64_t>(took.count())) +
+                             " ms; its line gets the game's own lip sync");
+    }
     if (!line.empty()) Log(Level::Info, line);
 }
 
@@ -946,6 +1024,7 @@ Clock::time_point Client::Tick() {
         if (lock.owns_lock() && runsWaiting_.load() == 0) {
             got = true;
             ApplyPendingLocked();
+            snap.pauses = pauses_;
             snap.paused = paused_.load();
             snap.connected = transport_ != nullptr;
             snap.helloCurrent = helloCurrent_;
@@ -971,22 +1050,16 @@ Clock::time_point Client::Tick() {
             std::lock_guard lock(bgMutex_);
             due = nextTry_;
         }
-        const bool held = sideLoads_.load() > 0;  // H: no HELLO of ours while our own side load is in flight
+        // H: no HELLO of ours while our own side load is in flight; its end wakes the thread
         if (snap.paused || !snap.connected || snap.anyNotReady) {
-            if (held) {
-                Detail("The background HELLO waits for the model load in progress");
-            } else if (now >= due) {
-                Recover(snap);
+            if (now < due) {
+                soon(due);
+            } else if (Recover(snap)) {
                 std::lock_guard lock(bgMutex_);
                 soon(nextTry_);
-            } else {
-                soon(due);
             }
         } else if (!snap.helloCurrent) {
-            if (!held) {
-                RehelloMain();
-                soon(now + kBusyRetry);
-            }
+            if (RehelloMain()) soon(now + kBusyRetry);
         } else if (snap.pingable) {
             if (now >= snap.lastActivity + kIdlePing) {
                 PingMain();
@@ -1010,8 +1083,14 @@ Clock::time_point Client::Tick() {
     return std::max(next, now);
 }
 
-// A new connection and HELLO with every live model, outside the connection's lock; swapped in under it.
-void Client::Recover(const Snapshot& snap) {
+// A new connection and HELLO with every live model, outside the connection's lock; swapped in under it. False when
+// held, untried, for a side load in flight (H): its end wakes the thread.
+bool Client::Recover(const Snapshot& snap) {
+    const MainHello inFlight(*this, true);
+    if (inFlight.Held()) {
+        Detail("The background HELLO waits for the model load in progress");
+        return false;
+    }
     int attempt = 0;
     {
         std::lock_guard lock(bgMutex_);
@@ -1024,6 +1103,7 @@ void Client::Recover(const Snapshot& snap) {
         std::lock_guard lock(bgMutex_);
         ++failedTries_;
         nextTry_ = now_() + BackoffDelay(failedTries_);
+        return true;
     };
     std::vector<Endpoint> endpoints;
     if (!Endpoints(snap.settings.serverAddress, snap.settings.serverPort, endpoints, reason, false)) return failed(reason);
@@ -1052,15 +1132,27 @@ void Client::Recover(const Snapshot& snap) {
         Detail("Background attempt " + std::to_string(attempt) + ": the settings changed meanwhile");
         std::lock_guard bg(bgMutex_);
         nextTry_ = {};
-        return;
+        return true;
+    }
+    if (pauses_ != snap.pauses) {
+        // a failure after this attempt began: an answer to a HELLO sent before it doesn't end its pause
+        t->Close();
+        Detail("Background attempt " + std::to_string(attempt) + ": a failure came meanwhile; trying again on the schedule");
+        return true;
     }
     CloseLocked("the background thread's new connection replaces it");
     transport_ = std::move(t);
     ++connects_;
     ++hellosSent_;
-    Log(Level::Info, "Connected to the server on port " + std::to_string(settings_.serverPort));
-    answered_.clear();
-    for (std::size_t i = 0; i < hello.models.size(); ++i) answered_.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    // at the normal level only when it ends a pause: a model the server keeps not ready reconnects every 30 s
+    const std::string connected = "Connected to the server on port " + std::to_string(settings_.serverPort);
+    if (paused_.load())
+        Log(Level::Info, connected);
+    else
+        Detail(connected);
+    std::vector<Answered> fresh;
+    for (std::size_t i = 0; i < hello.models.size(); ++i) fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    AnsweredLocked(std::move(fresh));
     helloCurrent_ = modelsGeneration_ == snap.modelsGeneration;
     lastActivity_ = now_();
     timeoutsInARow_ = 0;
@@ -1072,18 +1164,26 @@ void Client::Recover(const Snapshot& snap) {
     lastStatusLine_ = line;
     EndPauseLocked("the server answered the background HELLO");
     ScheduleNotReadyLocked();
+    return true;
 }
 
-// HELLO with the live models on the open main connection, answered at once: a try-lock, giving way to runs.
-void Client::RehelloMain() {
+// HELLO with the live models on the open main connection, answered at once: a try-lock, giving way to runs. False when
+// held for a side load in flight (H): its end wakes the thread.
+bool Client::RehelloMain() {
     TryLock lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock() || runsWaiting_.load() > 0) return;
+    if (!lock.owns_lock() || runsWaiting_.load() > 0) return true;
     ApplyPendingLocked();
-    if (!transport_ || helloCurrent_ || listed_.empty() || paused_.load()) return;
+    if (!transport_ || helloCurrent_ || listed_.empty() || paused_.load()) return true;
+    const MainHello inFlight(*this, true);
+    if (inFlight.Held()) {
+        Detail("The background HELLO waits for the model load in progress");
+        return false;
+    }
     Failure f = Failure::None;
     std::string reason;
     if (!HelloMainLocked(Clock::now() + std::chrono::milliseconds(settings_.timeoutMs), f, reason))
         StartPauseLocked("The server didn't answer HELLO on the main connection (" + reason + ")");
+    return true;
 }
 
 // PING on a connection idle for kIdlePing whose HELLO listed models; PONG within the RUN timeout.

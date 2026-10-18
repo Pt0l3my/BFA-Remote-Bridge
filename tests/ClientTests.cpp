@@ -3,6 +3,7 @@
 // HELLO, the status checks), the counters and the summary line, and the probe.
 
 #include <climits>
+#include <functional>
 #include <thread>
 
 #include "Scripted.h"
@@ -143,6 +144,38 @@ struct Rig {
         c.Tick();
     }
 };
+
+// The frames of one type a connection got.
+std::vector<Sent> Frames(const Connection& c, proto::MsgType t) {
+    std::vector<Sent> out;
+    for (const auto& s : c.sent)
+        if (s.type == static_cast<std::uint16_t>(t)) out.push_back(s);
+    return out;
+}
+
+// A script whose first RUN from now on is answered late: its RUN_OK comes just before the answer to the next frame,
+// whatever that frame is.
+struct LateOnce {
+    std::vector<std::uint8_t> late;
+    bool done = false;
+    std::vector<std::uint8_t> operator()(std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 3 && !done) {
+            done = true;
+            late = RunOkFor(p);
+            return {};
+        }
+        auto back = std::move(late);
+        late.clear();
+        const auto mine = Serve(type, p);
+        back.insert(back.end(), mine.begin(), mine.end());
+        return back;
+    }
+};
+
+void WaitFor(const std::function<bool()>& ready) {
+    const auto give = Clock::now() + std::chrono::seconds(10);
+    while (!ready() && Clock::now() < give) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 
 // A thread joined however the test ends; `release` first lets a scripted server waiting on it go.
 struct Joined {
@@ -314,6 +347,38 @@ TEST(ClientBackgroundRetriesOnTheScheduleAndEndsThePause) {
     const int hellos = r.script->Count(proto::MsgType::Hello);
     CHECK(r.Run(m) == Client::Outcome::Forwarded);
     CHECK_EQ(r.script->Count(proto::MsgType::Hello), hellos);  // the background's connection is the main one now
+}
+
+// A background attempt whose HELLO went before a later failure doesn't end that failure's pause: the next attempt, on
+// the schedule, does.
+TEST(ClientAnAttemptBeforeAFailureDoesntEndItsPause) {
+    Rig r;
+    const auto m = Model("a.onnx");
+    std::atomic<bool> release{false}, holding{false};
+    std::atomic<int> withModels{0};
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1 && !DecodedHello(p).models.empty() && ++withModels == 2) {  // the background's HELLO
+            holding = true;
+            while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return Serve(type, p);
+    };
+    CHECK(r.c.Admit(m).Ready());
+    r.c.SetModels({m});
+    Joined attempt{&release, std::thread([&] { r.c.Tick(); })};  // the start-up status check, then the main connection
+    WaitFor([&] { return holding.load(); });
+    r.script->closeBeforeAnswer = true;  // a run's own connection fails meanwhile
+    Fallback fb;
+    CHECK(r.Run(m, fb) == Client::Outcome::Failed);
+    CHECK(r.c.Paused());
+    release = true;
+    attempt.t.join();
+    CHECK(r.c.Paused());
+    CHECK_EQ(r.Logged("a failure came meanwhile"), 1);
+    g_now += std::chrono::seconds(1);
+    r.c.Tick();
+    CHECK(!r.c.Paused());
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
 }
 
 // ---- PING
@@ -800,6 +865,278 @@ TEST(ClientNewestSessionOfAModelWins) {
     CHECK(listed == (std::vector<std::size_t>{1, 1, 1}));
 }
 
+// ---- the timeouts: 3000 ms for a connect off the speech path, 60 s for a HELLO that may load a model, and the run's
+// own timeout for everything in a run and for the background thread's exchanges on the main connection
+
+TEST(ClientTimeoutsOfEachConnectAndExchange) {
+    Rig r;  // a 300 ms run timeout
+    const auto a = Model("a.onnx");
+    // the side load: 3000 ms to connect, 60 s for HELLO
+    CHECK(r.c.Admit(a).Ready());
+    auto conns = r.script->Connections();
+    CHECK_EQ(conns.size(), std::size_t{1});
+    CHECK_EQ(conns[0].connectTimeoutMs, 3000);
+    const auto side = Frames(conns[0], proto::MsgType::Hello);
+    CHECK_EQ(side.size(), std::size_t{1});
+    CHECK(side[0].BudgetMs() > 59000 && side[0].BudgetMs() <= 60000);
+
+    // a run makes the main connection: its connect, HELLO and RUN within the run's 300 ms, one deadline for the three
+    r.c.SetModels({a});
+    CHECK(r.Run(a) == Client::Outcome::Forwarded);
+    conns = r.script->Connections();
+    CHECK_EQ(conns.size(), std::size_t{2});
+    CHECK(conns[1].connectTimeoutMs > 0 && conns[1].connectTimeoutMs <= 300);
+    auto hello = Frames(conns[1], proto::MsgType::Hello);
+    auto run = Frames(conns[1], proto::MsgType::Run);
+    CHECK(hello.size() == 1 && run.size() == 1);
+    CHECK(hello[0].BudgetMs() > 200 && hello[0].BudgetMs() <= 300);
+    CHECK(run[0].deadline == hello[0].deadline);
+    CHECK(r.Run(a) == Client::Outcome::Forwarded);
+    run = Frames(r.script->Connections()[1], proto::MsgType::Run);
+    CHECK(run.size() == 2 && run[1].BudgetMs() > 200 && run[1].BudgetMs() <= 300);
+
+    // the start-up status check: 3000 ms to connect, and 3000 ms for its answer
+    r.c.Tick();
+    conns = r.script->Connections();
+    CHECK_EQ(conns.size(), std::size_t{3});
+    CHECK_EQ(conns[2].connectTimeoutMs, 3000);
+    const auto status = Frames(conns[2], proto::MsgType::Hello);
+    CHECK(status.size() == 1 && status[0].BudgetMs() > 2000 && status[0].BudgetMs() <= 3000);
+
+    // PING after 60 s idle, not before; its PONG within the run timeout
+    g_now += std::chrono::seconds(59);
+    r.c.Tick();
+    CHECK(Frames(r.script->Connections()[1], proto::MsgType::Ping).empty());
+    g_now += std::chrono::seconds(1);
+    r.c.Tick();
+    const auto ping = Frames(r.script->Connections()[1], proto::MsgType::Ping);
+    CHECK(ping.size() == 1 && ping[0].BudgetMs() > 200 && ping[0].BudgetMs() <= 300);
+
+    // a connect inside a run (the reconnect after a closed connection) stays within the run's deadline
+    r.script->closeBeforeAnswer = true;
+    r.script->refuseConnect = true;
+    CHECK(r.Run(a) == Client::Outcome::Failed);
+    CHECK(r.c.Paused());
+    const auto tried = r.script->ConnectTimeouts();
+    CHECK(tried.back() > 0 && tried.back() <= 300);
+
+    // the background reconnect: 3000 ms to connect, 60 s for HELLO
+    r.script->refuseConnect = false;
+    g_now += std::chrono::seconds(1);
+    r.c.Tick();
+    CHECK(!r.c.Paused());
+    conns = r.script->Connections();
+    CHECK_EQ(conns.size(), std::size_t{4});
+    CHECK_EQ(conns[3].connectTimeoutMs, 3000);
+    hello = Frames(conns[3], proto::MsgType::Hello);
+    CHECK(hello.size() == 1 && hello[0].BudgetMs() > 59000 && hello[0].BudgetMs() <= 60000);
+}
+
+// The background thread's PING on the main connection never makes a run wait past the run's own timeout: the run's
+// clock starts when it is called, its wait for the connection included. A slow PONG, then a lost one, with a run
+// arriving while the PING is out; the server takes 280 ms over each answer.
+TEST(ClientRunNeverWaitsPastItsTimeoutForThePing) {
+    for (const bool lost : {false, true}) {
+        Rig r;  // 300 ms
+        const auto m = Model("a.onnx");
+        r.Serving(m);
+        if (lost)
+            r.script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+                return type == 6 ? std::vector<std::uint8_t>{} : Serve(type, p);
+            };
+        r.script->answerDelayMs = 280;
+        r.script->timed = true;
+        g_now += std::chrono::seconds(60);
+        Joined ping{nullptr, std::thread([&] { r.c.Tick(); })};
+        WaitFor([&] { return r.script->Count(proto::MsgType::Ping) == 1; });
+        const auto start = Clock::now();
+        Fallback fb;
+        const Client::Outcome outcome = r.Run(m, fb);
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+        ping.t.join();
+        CHECK(took <= 300 + 100);
+        CHECK(outcome != Client::Outcome::Forwarded);
+        if (lost) {
+            CHECK(outcome == Client::Outcome::Skipped);
+            CHECK(r.c.Paused());
+        } else {
+            CHECK(fb.why == Why::RunTimedOut || fb.why == Why::Other);
+            CHECK(!r.c.Paused());
+        }
+    }
+}
+
+// No address (cleared mid-game), or one not looked up yet: runs fall back at once, and only the first of a series is
+// logged.
+TEST(ClientNoAddressIsLoggedOnce) {
+    Rig r;
+    const auto m = Model("a.onnx");
+    r.Serving(m);
+    Settings s = On();
+    s.serverAddress.clear();
+    const auto series = [&](const std::string& text) {
+        for (int i = 0; i < 20; ++i) {
+            Fallback fb;
+            CHECK(r.Run(m, fb) == Client::Outcome::Skipped);
+            CHECK(fb.why == Why::NoConnection);
+            CHECK_EQ(fb.text, text);
+            CHECK_EQ(fb.quiet, i > 0);
+            r.c.RecordFallback(m.name, fb, {});
+        }
+        CHECK_EQ(r.Logged("a.onnx: not answered (no connection: " + text + ")"), 1);
+    };
+    r.c.Configure(s);
+    series("no server address is set");
+    s.serverAddress = "server.example";  // a new address, not looked up yet: a new series
+    r.c.Configure(s);
+    series("the server's address hasn't been looked up yet");
+    CHECK(r.c.Resolve());
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    CHECK(!r.c.Paused());
+}
+
+// H with the main connection open: the HELLO a change of the live models calls for waits while the bridge's own side
+// load is in flight, and goes when it ends.
+TEST(ClientHoldsTheReHelloDuringASideLoad) {
+    Rig r;
+    const auto a = Model("a.onnx"), b = Model("b.onnx"), c = Model("c.onnx");
+    std::atomic<bool> release{false};
+    std::atomic<int> hellos{0};  // every HELLO with models but b's side HELLO
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1) {
+            const proto::Hello h = DecodedHello(p);
+            if (h.models.size() == 1 && h.models[0].name == "b.onnx") {
+                while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(5));  // the server loads b
+            } else if (!h.models.empty()) {
+                ++hellos;
+            }
+        }
+        return Serve(type, p);
+    };
+    r.Serving(a);
+    r.c.SetModels({a, c});
+    r.c.Tick();  // HELLO with a and c on the open connection
+    const int before = hellos, reconnects = r.c.Reconnects();
+    Admission admitted;
+    Joined load{&release, std::thread([&] { admitted = r.c.Admit(b); })};
+    WaitFor([&] { return r.c.SideLoadsInFlight() > 0; });
+    r.c.SetModels({a});  // c released: the connection's HELLO is out of date
+    r.c.Tick();
+    CHECK_EQ(hellos.load(), before);  // held
+    CHECK(r.Logged("waits for the model load in progress") >= 1);
+    CHECK(!r.c.Paused());
+    release = true;
+    load.t.join();
+    CHECK(admitted.Ready());
+    r.c.Tick();
+    CHECK_EQ(hellos.load(), before + 1);
+    CHECK_EQ(r.c.Reconnects(), reconnects);  // on the open connection
+    CHECK(r.Run(a) == Client::Outcome::Forwarded);
+}
+
+// H's gate: a side load waits for a HELLO already in flight on the main connection before its own HELLO goes, so that
+// HELLO is never caught waiting for the load.
+TEST(ClientSideLoadWaitsForAMainHelloInFlight) {
+    Rig r;
+    const auto a = Model("a.onnx"), b = Model("b.onnx"), c = Model("c.onnx");
+    r.Serving(a);
+    std::atomic<bool> release{false};
+    std::mutex eventsMutex;
+    std::vector<std::string> events;
+    const auto note = [&](const char* e) {
+        std::lock_guard lock(eventsMutex);
+        events.push_back(e);
+    };
+    const auto seen = [&] {
+        std::lock_guard lock(eventsMutex);
+        return events;
+    };
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1) {
+            const proto::Hello h = DecodedHello(p);
+            if (h.models.size() == 2) {
+                note("main");
+                while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                note("main answered");
+            } else if (h.models.size() == 1 && h.models[0].name == "b.onnx") {
+                note("side");
+            }
+        }
+        return Serve(type, p);
+    };
+    r.c.SetModels({a, c});
+    Joined hello{&release, std::thread([&] { r.c.Tick(); })};  // HELLO with a and c on the main connection
+    WaitFor([&] { return !seen().empty(); });
+    Admission admitted;
+    Joined load{&release, std::thread([&] { admitted = r.c.Admit(b); })};
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(seen() == (std::vector<std::string>{"main"}));
+    CHECK_EQ(r.c.SideLoadsInFlight(), 0);
+    release = true;
+    hello.t.join();
+    load.t.join();
+    CHECK(seen() == (std::vector<std::string>{"main", "main answered", "side"}));
+    CHECK(admitted.Ready());
+    CHECK(!r.c.Paused());
+}
+
+// A late answer pending when the background thread's HELLO, or its PING, goes out on the main connection: it is read
+// and discarded first, and the connection stays.
+TEST(ClientDiscardsALateAnswerBeforeAReHelloOrAPing) {
+    for (const bool ping : {false, true}) {
+        Rig r;
+        const auto a = Model("a.onnx");
+        r.Serving(a);
+        r.script->answer = LateOnce{};
+        Fallback fb;
+        CHECK(r.Run(a, fb) == Client::Outcome::Failed);
+        CHECK(fb.why == Why::RunTimedOut);
+        CHECK(!r.c.Paused());
+        const int reconnects = r.c.Reconnects(), hellos = r.c.HellosSent();
+        if (ping) {
+            g_now += std::chrono::seconds(60);
+            r.c.Tick();
+            CHECK_EQ(r.c.Pings(), 1);
+        } else {
+            r.c.SetModels({a, Model("c.onnx")});
+            r.c.Tick();
+            CHECK_EQ(r.c.HellosSent(), hellos + 1);
+        }
+        CHECK(!r.c.Paused());
+        CHECK_EQ(r.c.Reconnects(), reconnects);
+        CHECK_EQ(r.Logged("Discarded the late answer to request"), 1);
+        CHECK(r.Run(a) == Client::Outcome::Forwarded);
+    }
+}
+
+// A model the server keeps not ready: the background asks again on a new connection every 30 s, and the log stays
+// quiet: that connect is logged at Detailed only (it ends no pause), and the status line and the fallback once.
+TEST(ClientModelKeptNotReadyStaysQuiet) {
+    Settings s = On();
+    s.logDetail = LogDetail::Normal;
+    Rig r(s);
+    r.script->answer = [](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1 && !DecodedHello(p).models.empty()) return HelloOkFor(p, 3, "not loaded");
+        return Serve(type, p);
+    };
+    const auto m = Model("a.onnx");
+    r.c.SetModels({m});
+    r.c.Tick();  // the start-up status check, and the main connection
+    for (int i = 0; i < 10; ++i) {
+        Fallback fb;
+        CHECK(r.Run(m, fb) == Client::Outcome::Skipped);
+        CHECK(fb.why == Why::NotReady);
+        r.c.RecordFallback(m.name, fb, {});
+        g_now += std::chrono::seconds(30);
+        r.c.Tick();
+    }
+    CHECK(r.c.Reconnects() >= 10);
+    CHECK(!r.c.Paused());
+    CHECK_EQ(r.Logged("Connected to the server"), 0);
+    CHECK_EQ(r.Logged("a.onnx: not answered (not ready"), 1);
+    CHECK_EQ(r.Logged("Server scripted on CPU: a.onnx"), 1);
+}
+
 // ---- the counters, the client string and the summary line
 
 TEST(ClientStringAndItsEightyCharacters) {
@@ -906,10 +1243,13 @@ TEST(ClientEachFallbackIsLogged) {
     r.c.RecordFallback("a2f3_fp16.onnx", Fallback{Why::RunTimedOut, "no answer within 1000 ms", false}, std::chrono::microseconds(1001200));
     CHECK_EQ(r.Logged("a2f3_fp16.onnx: not answered (RUN timed out: no answer within 1000 ms) after 1001.2 ms; its line gets the game's own lip sync"), 1);
     r.c.RecordFallback("a2f3_fp16.onnx", Fallback{Why::ServerError, "ERROR 4, inference failed: scripted", false}, std::chrono::microseconds(3000));
-    CHECK_EQ(r.Logged("a2f3_fp16.onnx: not answered (ERROR: ERROR 4, inference failed: scripted) after 3.0 ms"), 1);
+    CHECK_EQ(r.Logged("a2f3_fp16.onnx: not answered (ERROR 4, inference failed: scripted) after 3.0 ms"), 1);
+    CHECK_EQ(r.Logged("ERROR: ERROR"), 0);
+    r.c.RecordFallback("a2f3_fp16.onnx", Fallback{Why::ServerError, "HELLO: the server refused HELLO: ERROR 2, wrong key", false}, {});
+    CHECK_EQ(r.Logged("not answered (ERROR: HELLO: the server refused HELLO: ERROR 2, wrong key) after 0.0 ms"), 1);
     r.c.RecordFallback("a2f3_fp16.onnx", Fallback{Why::Paused, "the bridge is paused", true}, {});
     CHECK_EQ(r.Logged("not answered (paused"), 0);
-    CHECK(r.c.Totals() == (Counters{0, 3, 1}));
+    CHECK(r.c.Totals() == (Counters{0, 4, 1}));
 }
 
 // ---- the thread itself, on the real clock

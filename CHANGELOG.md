@@ -16,14 +16,17 @@ Protocol version 1 is unchanged. The scope was agreed with PandorumLLM's side: [
   it.
 - **A connect timeout of its own:** 3000 ms for connects off the speech path (model loads, status checks, the
   background thread). A connect within a call stays within that call's timeout.
+- **A call's timeout counts from the moment BFA makes it,** its wait for the connection included: the background
+  thread's PING or HELLO never makes a line wait longer than the timeout.
 - **PING** after 60 seconds idle, on a connection whose HELLO listed models; a missing PONG starts the reconnect.
 - **The counters in the client string,** "BFARemoteBridge 1.1.0 (answered N, fallbacks N, timeouts N)", within 80
   characters, in every HELLO; a status check on a connection of its own every 5 minutes when they changed.
 - **Logging.** Each line the server didn't answer is logged with its model, reason and time (lines answered at once
   during a pause are counted, not logged one by one). The summary line counts every run by reason, at each 250 runs
   and every 10 minutes when anything happened. A reconnect within a call says whether the connection was closed,
-  reset or the send failed. Log detail "Detailed" adds each connect and close with its reason, each HELLO's answer,
-  each unanswered PING and each background attempt.
+  reset or the send failed. With no server address, or one not looked up yet, only the first line of a series is
+  logged, and a model the server keeps not ready is logged once until its state changes. Log detail "Detailed" adds
+  each connect and close with its reason, each HELLO's answer, each unanswered PING and each background attempt.
 - **A notice on screen when BFA is set to GPU,** once per session while the bridge is on and Status on load allows
   notices: "BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."
 - The settings page's Timeout and Log detail texts describe the new behaviour.
