@@ -1,0 +1,31 @@
+# Publishes a draft release, run by hand once its zip has been checked: the build's "release" option makes the draft
+# (build.yml), the zip is swept for anything personal or secret, and only then does this make it public.
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The draft release's tag, for example v1.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish the draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish it, if it is a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.draft and .tag_name == env.TAG)] | if length == 1 then .[0].id else empty end')
+          if [ -z "$id" ]; then echo "No single draft release tagged $TAG."; exit 1; fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -f make_latest=true \
+            --jq '"Published " + .tag_name + ": " + .html_url'
