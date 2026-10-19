@@ -1262,17 +1262,17 @@ TEST(ClientEachFallbackIsLogged) {
 
 TEST(ClientBackgroundThreadEndsThePause) {
     Rig r(On(), &Clock::now);
-    r.c.StartBackground();
     const auto m = Model("a.onnx");
-    CHECK(r.c.Admit(m).Ready());
-    r.c.SetModels({m});
-    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    r.Serving(m);  // side, main and the start-up status check, before the thread runs
     r.script->closeBeforeAnswer = true;
     r.script->refuseConnect = true;
     const auto start = Clock::now();
     CHECK(r.Run(m) == Client::Outcome::Failed);
     CHECK(r.c.Paused());
     r.script->refuseConnect = false;
+    // Started only now: closeBeforeAnswer is for the next frame on any connection, so a HELLO of the thread's own,
+    // sent while it was armed, took it in place of the run (a race seen once in CI).
+    r.c.StartBackground();
     while (r.c.Paused() && Clock::now() - start < std::chrono::seconds(5)) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
     CHECK(!r.c.Paused());
