@@ -4,6 +4,10 @@
 
 Protocol version 1 is unchanged. The scope was agreed with PandorumLLM's side: [docs/AGREEMENT-1.1.md](docs/AGREEMENT-1.1.md).
 
+- **The author is Pt0l3my,** so the SkyrimNet plugin id and folder are `pt0l3my.bfaremotebridge`. Remove the old
+  version before installing this one: two folders would show the page twice. The settings keep their values, which
+  SkyrimNet saves under the config name, not the folder.
+
 - **Model loads on a side connection.** When BFA loads a model, the bridge asks the server for it on a short-lived
   connection of its own (3000 ms to connect, 60 seconds for the server to load it), then lists every live model on
   the main connection, where the answer comes at once. Lines of a model already loaded keep flowing during a load.
