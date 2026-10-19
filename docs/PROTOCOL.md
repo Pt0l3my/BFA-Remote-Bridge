@@ -70,7 +70,7 @@ TCP, one request in flight per connection, strictly request then response. All i
 bridge then sends its current list again).
 
 ```
-str  client          e.g. "BFARemoteBridge 1.1.0 (answered 1250, fallbacks 0, timeouts 0)"
+str  client          e.g. "BFARemoteBridge 1.1.1 (answered 1250, fallbacks 0, timeouts 0)"
 str  key             the access key, empty if none
 str  ort_version     the gaming PC's runtime, e.g. "1.24.4" (informational)
 u16  model_count
@@ -82,14 +82,14 @@ u16  model_count
     per override: str dim_name, i64 value
 ```
 
-The bridge's **client string** is its name and version, then its counters in parentheses: `BFARemoteBridge 1.1.0
+The bridge's **client string** is its name and version, then its counters in parentheses: `BFARemoteBridge 1.1.1
 (answered N, fallbacks N, timeouts N)`. The counters are cumulative from Skyrim's start: `answered` counts the runs
 the server answered, `fallbacks` every run it didn't (the line got the game's own lip sync), and `timeouts` the part of
 those that timed out. The keys keep this order; new keys are only ever added at the end. A server may show the string
-as given or parse it. The string stays within **80 characters** (PandorumLLM's patch3 cuts its log lines there): when
-the counters would make it longer, the trailing keys are dropped, last first, until it fits, and the name and version
-alone are sent when no key fits. (The example is 62 characters; a key is dropped only once the three counts have more
-than 24 digits between them.)
+as given or parse it. The string stays within **120 characters**, which PandorumLLM's log lines keep since its patch4
+(80 before). The three counts have at most 60 digits between them, so today's keys always fit whole, at 116
+characters at most; the example is 62. Should keys added later make it longer, the trailing keys are dropped, last
+first, until it fits, and the name and version alone are sent when no key fits.
 
 **HELLO_OK**
 
@@ -153,8 +153,8 @@ connection's end too. After codes 3 and 4 the connection stays open.
 - The server answers each connection's requests **in order**, one at a time, late answers too: after a request the
   client stopped waiting for, that request's RUN_OK or ERROR still comes, before the next answer.
 - The server answers PING with PONG at any time after HELLO. A PING before HELLO is ERROR 1, and the connection
-  closes. A server may close an idle connection (PandorumLLM's patch3 no longer does, and uses TCP keepalive); the
-  bridge PINGs a connection idle for 60 seconds and reconnects as needed.
+  closes. A server may close an idle connection (PandorumLLM no longer does since its patch3, and uses TCP
+  keepalive); the bridge PINGs a connection idle for 60 seconds and reconnects as needed.
 - The server answers BFA's warm-up run (all-zero inputs, right after the session is made) like any other RUN.
 - A ready model's `detail` may say something too, for instance that another model runs in its place ("runs
   Audio2Face-3D v2.3 Mark (NVIDIA FP32 v2.3) in its place"); the bridge logs every non-empty detail.
@@ -172,10 +172,11 @@ connection's end too. After codes 3 and 4 the connection stays open.
   relies on it: after the side connection's HELLO_OK, the main connection's HELLO with every live model is answered
   at once. A second HELLO on a connection only replaces that connection's ready set; the server never unloads.
 - One model loads at a time, across all connections, and a RUN on another connection runs meanwhile (the server
-  takes only that session's lock). In PandorumLLM's patch3 a **HELLO**, on any connection, waits while a load is in
-  progress, even one naming only loaded models; its next patch answers a HELLO of loaded models at once. Until then
-  the bridge's background thread holds its own HELLOs while the bridge's side load is in flight. A status check names
-  no model and never waits.
+  takes only that session's lock). Since PandorumLLM's patch4 a **HELLO** of models already loaded is answered at
+  once, even while another connection loads; a HELLO that has to load waits for a load in progress. In patch3 every
+  HELLO waited, even one naming only loaded models, so the bridge's background thread holds its own HELLOs while the
+  bridge's side load is in flight: with patch4 that costs nothing, and it keeps the bridge right with patch3. A status
+  check names no model and never waits.
 - **Not measured yet: DirectML during a first load.** On the server's graphics card a load's work (the weights read
   and uploaded, the warm-up) shares the card with the runs of the models already loaded. Nothing on the server makes
   those runs wait, but the card may slow them: lines during the first load of a model may fall back.

@@ -121,7 +121,7 @@ With Log detail set to Detailed it also logs one line per run, each connection o
 to HELLO, each unanswered PING, each late answer discarded and each background reconnection attempt.
 
 The bridge also tells the server how it is doing: its HELLO carries its counters since the game started, as
-"BFARemoteBridge 1.1.0 (answered 1250, fallbacks 0, timeouts 0)", and every 5 minutes, when they changed, it sends
+"BFARemoteBridge 1.1.1 (answered 1250, fallbacks 0, timeouts 0)", and every 5 minutes, when they changed, it sends
 them on a short connection of its own, so PandorumLLM's panel shows them.
 
 ## Troubleshooting

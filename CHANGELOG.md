@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1
+
+Protocol version 1 is unchanged. Made for PandorumLLM v3.97 Beta patch4.
+
+- **The client string may run to 120 characters,** which PandorumLLM's log lines keep since its patch4 (80 before),
+  so its three counters always go whole: 116 characters at most. A panel before patch4 shows the first 80 in its log.
+- The docs describe patch4: a HELLO of models already loaded is answered at once, even while another connection
+  loads a model. The bridge still holds its background HELLOs while its own model load is in flight: with patch4 that
+  costs nothing, and it keeps the bridge right with patch3.
+
 ## 1.1.0
 
 Protocol version 1 is unchanged. The scope was agreed with PandorumLLM's side: [docs/AGREEMENT-1.1.md](docs/AGREEMENT-1.1.md).
