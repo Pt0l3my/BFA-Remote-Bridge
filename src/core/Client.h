@@ -55,13 +55,13 @@ constexpr std::chrono::seconds kIdlePing{60};
 constexpr std::chrono::minutes kStatusEvery{5};
 constexpr std::chrono::minutes kSummaryEvery{10};
 constexpr std::uint64_t kSummaryRuns = 250;
-constexpr std::size_t kClientStringMax = 80;  // the panel's log lines keep 80 characters until its next patch
+constexpr std::size_t kClientStringMax = 120;  // PandorumLLM's log lines keep 120 characters since its patch4
 
 // The background thread's wait before its next try, after `failures` failed tries since the pause began (or the last
 // success): 1, 2, 5, 10, 30 s, then 30 s.
 std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-std::string ClientName();  // "BFARemoteBridge 1.1.0"
+std::string ClientName();  // "BFARemoteBridge 1.1.1"
 
 // Why a run got no answer from the server.
 enum class Why : std::uint8_t {
@@ -107,7 +107,7 @@ struct Counters {
     bool operator==(const Counters&) const = default;
 };
 
-// The HELLO's client string: "BFARemoteBridge 1.1.0 (answered N, fallbacks N, timeouts N)", keys in that order, new
+// The HELLO's client string: "BFARemoteBridge 1.1.1 (answered N, fallbacks N, timeouts N)", keys in that order, new
 // keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name alone when none
 // fits.
 std::string ClientString(const Counters& counters, std::size_t max = kClientStringMax);

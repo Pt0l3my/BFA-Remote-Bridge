@@ -1139,44 +1139,50 @@ TEST(ClientModelKeptNotReadyStaysQuiet) {
 
 // ---- the counters, the client string and the summary line
 
-TEST(ClientStringAndItsEightyCharacters) {
+TEST(ClientStringAndItsLimit) {
     const std::string name = std::string("BFARemoteBridge ") + kVersionText;
     CHECK_EQ(ClientName(), name);
     CHECK_EQ(ClientString(Counters{1250, 0, 0}), name + " (answered 1250, fallbacks 0, timeouts 0)");
-    if (std::string(kVersionText) == "1.1.0") CHECK_EQ(ClientString(Counters{1250, 0, 0}).size(), std::size_t{62});
-    // the longest that fits whole, then one digit more: the trailing key goes first, then the next
+    CHECK_EQ(ClientString(Counters{1250, 0, 0}).size(), name.size() + 41);
+    // at the default limit (120, PandorumLLM's log lines since its patch4) every key always fits whole
+    const std::string most = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX});
+    CHECK(most.size() <= kClientStringMax);
+    CHECK(most.find("timeouts 18446744073709551615)") != std::string::npos);
+    CHECK(most.find("fallbacks 18446744073709551615") != std::string::npos);
+    // a smaller limit (80, as before patch4): the longest that fits whole, then one digit more drops the trailing key
+    constexpr std::size_t max = 80;
     const std::size_t fixed = (name + " (answered , fallbacks , timeouts )").size();
     std::uint64_t big = 1;
     std::size_t digits = 1;
-    while (fixed + 3 * (digits + 1) <= 80) {
+    while (fixed + 3 * (digits + 1) <= max) {
         big = big * 10 + 1;
         ++digits;
     }
-    const std::string whole = ClientString(Counters{big, big, big});
-    CHECK(whole.size() <= 80);
+    const std::string whole = ClientString(Counters{big, big, big}, max);
+    CHECK(whole.size() <= max);
     CHECK(whole.find("timeouts") != std::string::npos);
-    const std::string cut = ClientString(Counters{big * 100, big * 100, big * 100});
-    CHECK(cut.size() <= 80);
+    const std::string cut = ClientString(Counters{big * 100, big * 100, big * 100}, max);
+    CHECK(cut.size() <= max);
     CHECK(cut.find("timeouts") == std::string::npos);
     CHECK(cut.rfind(name + " (answered ", 0) == 0);
-    const std::string most = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX});
-    CHECK(most.size() <= 80);
-    CHECK(most.find("fallbacks") == std::string::npos || most.find("timeouts") == std::string::npos);
-    // exactly 80 keeps every key; 81 drops the last
+    const std::string mostCut = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX}, max);
+    CHECK(mostCut.size() <= max);
+    CHECK(mostCut.find("fallbacks") == std::string::npos || mostCut.find("timeouts") == std::string::npos);
+    // exactly the limit keeps every key; one more drops the last
     const auto ofDigits = [](std::size_t n) {
         std::uint64_t v = 1;
         for (std::size_t i = 1; i < n; ++i) v *= 10;
         return v;
     };
-    const std::size_t room = 80 - fixed;  // the digits the three counts may have between them
+    const std::size_t room = max - fixed;  // the digits the three counts may have between them
     const std::size_t a = std::min<std::size_t>(19, room - 2), f = room - a - 1;
-    const std::string exact = ClientString(Counters{ofDigits(a), ofDigits(f), 7});
-    CHECK_EQ(exact.size(), std::size_t{80});
+    const std::string exact = ClientString(Counters{ofDigits(a), ofDigits(f), 7}, max);
+    CHECK_EQ(exact.size(), max);
     CHECK(exact.find("timeouts 7)") != std::string::npos);
-    const std::string over = ClientString(Counters{ofDigits(a), ofDigits(f), 17});
+    const std::string over = ClientString(Counters{ofDigits(a), ofDigits(f), 17}, max);
     CHECK(over.find("timeouts") == std::string::npos);
     CHECK(over.find("fallbacks") != std::string::npos);
-    CHECK(over.size() <= 80);
+    CHECK(over.size() <= max);
     CHECK_EQ(ClientString(Counters{1, 2, 3}, 10), name.substr(0, 10));
     CHECK_EQ(ClientString(Counters{1, 2, 3}, name.size()), name);
 }
@@ -1207,7 +1213,7 @@ TEST(ClientCountersGoInEveryHello) {
     g_now += std::chrono::minutes(5);  // nothing changed: no status check
     r.c.Tick();
     CHECK_EQ(clients.size(), n + 1);
-    for (const auto& c : clients) CHECK(c.size() <= 80);
+    for (const auto& c : clients) CHECK(c.size() <= kClientStringMax);
 }
 
 TEST(ClientSummaryLineByReason) {
