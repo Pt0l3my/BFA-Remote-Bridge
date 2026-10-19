@@ -1,0 +1,31 @@
+# Build output
+build*/
+out/
+*.dll
+*.pdb
+*.obj
+*.lib
+vcpkg_installed/
+CMakeUserPresets.json
+
+# Headers fetched for tools/wincheck (never committed)
+third_party/wincheck/
+
+# Models, BFA's and the tests' (never committed: tests/make_test_model.py makes the tests' own)
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Packaged releases and logs
+*.zip
+*.7z
+*.log
+settings.yaml
+
+# IDE
+.vs/
+.vscode/
+.idea/

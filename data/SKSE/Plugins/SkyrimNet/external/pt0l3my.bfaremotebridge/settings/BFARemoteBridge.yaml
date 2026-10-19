@@ -1,0 +1,74 @@
+# BFA Remote Bridge's page on SkyrimNet's plugin settings. SkyrimNet keeps the player's values in
+# config/plugins/BFARemoteBridge/settings.yaml, which is never shipped: it can hold the access key. The file's
+# name is the config's name, BFARemoteBridge (Plugin_BFARemoteBridge). The DLL reads every key with
+# PublicGetPluginConfigValue("BFARemoteBridge", key, default), at the data-loaded message, at each game load and
+# whenever the page is saved. Keys are flat. Every default, type and range here must equal the DLL's
+# (SettingKeys() in src/core/Settings.cpp); tests/CoreTests.cpp checks them both ways.
+
+plugin:
+  name: "BFARemoteBridge"
+  version: "1.1.0"
+  description: "Runs Better Facial Animations' lip-sync model on another PC on your network (PandorumLLM's A2F server) instead of this one."
+
+schema:
+  fields:
+    # Bridge
+    - name: "Bridge"
+      path: "enabled"
+      type: "bool"
+      description: "Runs Better Facial Animations' lip-sync model on the server below, and never on this PC. Takes effect when BFA next loads its model: restart the game, or switch the model in BFA's menu. Off, BFA runs as if the bridge weren't installed."
+      defaultValue: true
+      category: "Bridge"
+    - name: "Server address"
+      path: "serverAddress"
+      type: "string"
+      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Empty keeps the bridge idle, and BFA runs as usual."
+      defaultValue: ""
+      category: "Bridge"
+    - name: "Port"
+      path: "serverPort"
+      type: "int"
+      description: "The A2F server's port, as set in PandorumLLM."
+      defaultValue: 7871
+      min: 1
+      max: 65535
+      category: "Bridge"
+    - name: "Access key"
+      path: "accessKey"
+      type: "string"
+      description: "The key set in PandorumLLM, if any."
+      defaultValue: ""
+      category: "Bridge"
+    - name: "Timeout (ms)"
+      path: "timeoutMs"
+      type: "int"
+      description: "How long each lip-sync call waits for the server. A line it doesn't answer in time gets the game's own lip sync. If the connection fails, lines get the game's own lip sync until the bridge has reconnected in the background."
+      defaultValue: 1000
+      min: 200
+      max: 5000
+      category: "Bridge"
+
+    # Diagnostics
+    - name: "Check results"
+      path: "checkCalls"
+      type: "int"
+      description: "A diagnostic: also loads BFA's model on this PC, runs this many of each model's first calls on both PCs and logs how far apart the results are. While it is above 0 the model runs on this PC too, so keep it at 0 for play. Takes effect at BFA's next model load."
+      defaultValue: 0
+      min: 0
+      max: 50
+      category: "Diagnostics"
+    - name: "Status on load"
+      path: "showStatus"
+      type: "bool"
+      description: "Shows the bridge's state on screen when a save loads and when BFA loads its model, and once per session if BFA is set to GPU."
+      defaultValue: true
+      category: "Diagnostics"
+    - name: "Log detail"
+      path: "logDetail"
+      type: "select"
+      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt in BFARemoteBridge.log."
+      defaultValue: "Normal"
+      options:
+        - Normal
+        - Detailed
+      category: "Diagnostics"
