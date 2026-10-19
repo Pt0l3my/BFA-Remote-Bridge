@@ -94,7 +94,7 @@ first, until it fits, and the name and version alone are sent when no key fits.
 **HELLO_OK**
 
 ```
-str  server          e.g. "PandorumLLM v3.98 A2F"
+str  server          e.g. "PandorumLLM v3.97-p4 Beta A2F"
 str  device          e.g. "DirectML 0: NVIDIA GeForce RTX 3090"
 u16  model_count     the same models, in the same order
   per model:
