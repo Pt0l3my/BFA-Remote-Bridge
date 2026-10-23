@@ -82,7 +82,7 @@ malformed in either version.
 bridge then sends its current list again).
 
 ```
-str  client          e.g. "BFARemoteBridge 1.2.0 (answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)"
+str  client          e.g. "BFARemoteBridge 1.3.0 (answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)"
 str  key             the access key, empty if none
 str  ort_version     the gaming PC's runtime, e.g. "1.24.4" (informational)
 u16  model_count
@@ -99,7 +99,8 @@ The bridge's **client string** is its name and version, then its keys in parenth
 
 - The counters are cumulative from Skyrim's start: `answered` counts the runs the server answered, `fallbacks` every
   run it didn't (the line got the game's own lip sync), and `timeouts` the part of those that timed out.
-- `fallback REASON` (since 1.2.0) comes only in a status check the bridge sends because a line fell back: REASON is
+- `fallback REASON` (since 1.2.0) comes only in a status check the bridge sends because a line fell back, to a
+  server not known to speak version 2 (one that does is told by NOTICE instead): REASON is
   one word, `unreachable`, `paused`, `timeout`, `error`, `notready`, `refused` or `incompatible`
   (`src/core/Reasons.h`; a word, once released, never changes).
 - `BFA V` and `ORT V` (since 1.2.0) are the gaming PC's BFA version (from its DLL) and the runtime BFA loaded, each
@@ -283,8 +284,8 @@ fallback: a line the server doesn't answer in time gets the game's own lip sync.
 PandorumLLM's choice; the bridge reports it.
 
 - **Settings** on SkyrimNet's Settings > Plugins page, only what the server can't tell the bridge: **Server address**
-  and **Port** (default 7871), for a server that doesn't answer discovery yet (today's), **Status on load** and **Log
-  detail**. 1.1's Bridge, Access key, Timeout and Check results are gone; their saved values are ignored. The access
+  (empty: the server is found on the local network, below; an address is needed for a version 1 server) and **Port**
+  (default 7871, also the port FIND goes to), **Status on load** and **Log detail**. 1.1's Bridge, Access key, Timeout and Check results are gone; their saved values are ignored. The access
   key is empty, and each call's timeout is 1000 ms.
 - **Attaching.** At SKSE's post-load message it finds `BetterFacialAnimations.dll`, reads its version from its
   `SKSEPlugin_Version` data (for the log and the client string only: any version is tried), and patches the entry for
@@ -325,8 +326,8 @@ PandorumLLM's choice; the bridge reports it.
     PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
     if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
     session without releasing it); a run on a replaced session gets the NaN answer below.
-  - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed), or no server address
-    set: BFA gets an error status made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the
+  - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed), or no server found
+    on the local network: BFA gets an error status made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the
     reason. BFA then has no model, and lip sync is the game's own until BFA loads its model again (a restart, a model
     switch in BFA's menu, or BFA's own retry). A refusal met again on BFA's retries is logged once until it changes.
 - **A run** on a bridge session, BFA's warm-up run included, always goes to the server, on the **main connection**:
@@ -342,6 +343,27 @@ PandorumLLM's choice; the bridge reports it.
     a model not ready), the call still succeeds, with each requested output a one-element float tensor holding NaN.
     BFA's output check rejects it and that one line plays with the game's own lip sync; an error status would make
     BFA drop its model. Nothing runs on the gaming PC for it.
+- **The version rule** (["Version 2"](#version-2)): every connection, the main one, each model load's and each status
+  check's, opens with a version 2 HELLO. On ERROR 6 framed in version 1, the bridge connects again at once in version
+  1 (within a run's own deadline, for a run's connect), and opens every later connection to that server in version 1
+  until the game restarts or the address changes; the log says so once ("The server speaks protocol version 1
+  only ..."). The first status check's log line names the version the server answered in.
+- **Finding the server** when the address setting is empty: FIND to the Port setting on each IPv4 adapter's broadcast
+  address, at most one search every 5 seconds while none answers, the first FOUND taken, and its address kept with the
+  Port setting. A search goes at start-up (the first status check's), at a model load when no server has been found,
+  and after a lost connection (a connection failure that starts the pause, or a connect to the address found that
+  fails): the address found is then stale, and the background thread's next attempt searches again. A run never
+  searches: with no server found, it gets the NaN answer at once. A search that finds none is logged once until one
+  is found; the server found is logged by its `server` string and port, never its address. A model load that finds
+  none is refused, with a note once per session: "no server answered on the local network, so lip sync is the game's
+  own. In PandorumLLM, set the A2F server's Remote IP to this PC and allow port 7871 (UDP and TCP) through that PC's
+  firewall, or enter its address on SkyrimNet's Settings > Plugins page."
+- **NOTICE** (version 2 only): each line that falls back is counted, with its model, reason and detail. The
+  background thread sends a NOTICE on the main connection when one is due (at once for the first, then at most one a
+  minute), only once the connection's HELLO was answered in version 2, and only while no request there awaits an
+  answer (it waits for a late answer to be read first, and gives way to runs). A NOTICE that can't be sent closes the
+  connection, and waits for the next. To a server that answered in version 2, a line's fallback goes by NOTICE alone;
+  a model load's refusal and a runtime entry the bridge can't serve are no line, and go to no server.
 - **A connection the server closed or reset, or a send that failed** (a reused connection) is opened again within the
   same call: the bridge reconnects, says HELLO and sends the same RUN, once, within that call's deadline. The log says
   which of the three it was.
@@ -355,19 +377,21 @@ PandorumLLM's choice; the bridge reports it.
   run or from the background thread) or a second RUN timeout in a row closes the connection and starts the pause: every run is then answered at once with NaN, without touching the network, until the background thread's
   HELLO is answered. One log line starts it and one ends it, with how long it lasted and how many runs it answered so.
 - **The background thread**, one of the bridge's own, asleep on a condition variable between its timers. It starts
-  once a server address is set, never runs on the game's threads, and lives until the game exits.
+  once the settings are read (with an address, or to search for one), never runs on the game's threads, and lives
+  until the game exits.
   - **Reconnecting:** after a failure it connects (3000 ms) and says HELLO with every live model (60 seconds) on a
     new connection, outside the main connection's lock, and swaps it in. It tries after 1, 2, 5, 10 and 30 seconds,
-    then every 30 seconds; its answered HELLO ends the pause. It also makes the main connection when there is none
+    then every 30 seconds (with the address setting empty, each attempt searches first when the address found went
+    stale, at most every 5 seconds); its answered HELLO ends the pause. It also makes the main connection when there is none
     and a model is live, and asks again, on the same schedule, about a model the server's last answer didn't have
     ready (whose runs meanwhile get the NaN answer at once).
   - **HELLO after a change:** when the live models changed, HELLO with the full list on the open main connection.
   - **PING** on a main connection idle for 60 seconds whose HELLO was answered and listed models. PONG must come
     within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
   - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
-    counters in its client string) on a connection of its own, then closed. Also once when a server address is set, and
-    within seconds of a line falling back (at most one every 30 seconds), with the fallback's reason in the client
-    string (`fallback REASON`, the latest when several came meanwhile).
+    counters in its client string) on a connection of its own, then closed. Also once when the settings are read, and,
+    to a server not known to speak version 2, within seconds of a line falling back (at most one every 30 seconds),
+    with the fallback's reason in the client string (`fallback REASON`, the latest when several came meanwhile).
   - **Never past a run's timeout:** its connect and the 60-second HELLO of a reconnect go on a new connection, outside
     the main connection's lock. Its HELLO and PING on the main connection take the lock only when it is free and no
     run waits, and last at most the run timeout. A run that arrives meanwhile waits for the lock within its own
@@ -390,9 +414,11 @@ PandorumLLM's choice; the bridge reports it.
   real one.
 - **Everything else** BFA calls (options, providers, tensors, memory information, statuses) is the real runtime's. In
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
-  no inference runs on it; the bridge logs that BFA is set to GPU and, once per session, shows "BFA Remote Bridge: BFA
-  is set to GPU, so it keeps a graphics device open on this PC. Tick Force CPU in BFA's menu: its model runs on the
-  server either way." BFA's CPU route sets no free-dimension overrides, so its HELLO lists none.
+  no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge advises
+  nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. BFA's CPU route
+  sets no free-dimension overrides, so its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
+  (PandorumLLM's patch, to be confirmed; [AGREEMENT-1.2.md](AGREEMENT-1.2.md), "To measure"), so it serves BFA in
+  either mode.
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
   game load (ready lines only while Status on load allows them), a model load the server refuses included, with its

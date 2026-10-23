@@ -1,12 +1,48 @@
 # Changelog
 
+## 1.3.0
+
+Protocol version 2, the agreement's stage 2 ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md)), written first in
+[docs/PROTOCOL.md](docs/PROTOCOL.md). 1.3.0 also carries every change of 1.2.0, below, which wasn't released on its
+own: players go from 1.1.1 straight to 1.3.0.
+
+- **The version rule.** Every connection (the speech connection, each model load's and each status check's) opens
+  with a version 2 HELLO. A version 1 server (PandorumLLM v3.97-p6 and earlier) answers ERROR 6 framed in version 1;
+  the bridge then connects again at once in version 1, within a run's own deadline when a run made the connection, and
+  stays on version 1 for that server until the game restarts or the address changes, logged once. Nothing of version
+  2 goes to a server that hasn't answered in version 2, and an answer framed in a version the bridge didn't open with
+  is malformed. HELLO and HELLO_OK carry no field beyond version 1's: only the frame's version says 2.
+- **Finding the server: FIND and FOUND on UDP.** With the address setting empty, the bridge sends FIND (the client
+  string) to the Port setting on each IPv4 adapter's own broadcast address, from the adapter list Windows reports,
+  never to 255.255.255.255; at start-up and after a lost connection, at most once every 5 seconds while no server
+  answers. It waits up to a second, takes the first FOUND, and connects on the port FIND reached. A run never
+  searches. A model load that finds no server is refused, with a note once per session saying what to set in
+  PandorumLLM and to allow UDP as well as TCP on the port. The log names the server found by its own name and port,
+  never its address. The Windows part (the adapter list and the UDP socket) is `src/plugin/WinsockDiscovery.cpp`,
+  behind a seam like the TCP transport's, so the core and its tests stay on Linux.
+- **NOTICE.** To a server that answered in version 2, each line that falls back is told on the speech connection by
+  the background thread: the model, the reason's word, the detail (on one line, as shown on screen) and the lines
+  since the last NOTICE; at most one a minute, as the fallback note, and only while no request there awaits an
+  answer. A version 1 server is told by 1.2.0's status check with `fallback REASON` instead.
+- **No hardware advice.** Every hardware choice is PandorumLLM's, BFA's own Force CPU included: the on-screen note
+  "BFA is set to GPU ... Tick Force CPU" is gone, and BFA's GPU mode is logged once, as a fact, at Log detail
+  Detailed only. The measurement behind it is in the agreement's "To measure": with no sizes listed, the server fills
+  in BFA 4.3.2.3's (PandorumLLM's patch, to be confirmed).
+- **The settings page:** the Server address and Port texts say that an empty address means the server is found on
+  the local network.
+- **The reference server** speaks both versions (`--v1-only` for version 1 alone), logs NOTICE (`--notice-log`), and
+  answers FIND from its `--remote-ip` alone, at most once a second. The tests run the bridge against it in both
+  versions, a version 1 server refusing the version 2 HELLO, and find it on the loopback address.
+
 ## 1.2.0
+
+Not released on its own: these changes ship in 1.3.0.
 
 Protocol version 1 is unchanged; it works with PandorumLLM v3.97-p6. What needs the server's side is agreed with it,
 in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
 
 - **Not an alternative to BFA: a bridge to PandorumLLM's A2F server.** The README says so at the top, says that BFA
-  stays installed (with Force CPU ticked) and how to give PandorumLLM's PC the same BFA files.
+  stays installed (with Force CPU ticked, advice 1.3.0 withdraws) and how to give PandorumLLM's PC the same BFA files.
 - **The settings page keeps only what the server can't tell the bridge:** the server address and port (for a server
   that doesn't answer discovery yet, as today's), Status on load and Log detail. **Bridge**, **Access key**,
   **Timeout** (now fixed at 1000 ms) and **Check results** are gone, with the code that loaded and ran the model on
@@ -30,7 +66,8 @@ in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
   past 30) is known to be incompatible: BFA gets no table, so it has no model and lip sync is the game's own, and a
   note says to update the bridge (or BFA, for a runtime older than 1.10).
 - **BFA's GPU mode is reported, not changed:** once per session, on screen whatever Status on load says, with "Tick
-  Force CPU in BFA's menu". The bridge changes nothing else of BFA's.
+  Force CPU in BFA's menu" (gone in 1.3.0: the hardware is PandorumLLM's choice). The bridge changes nothing else of
+  BFA's.
 - A model load BFA retries after a refusal is logged once until the refusal changes. A model the server answers as
   not ready shows on screen with the server's detail. Every server text shown or logged goes on one line (line
   breaks and control characters become spaces), loses any path and memory address, and is cut at about 160

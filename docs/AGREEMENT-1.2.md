@@ -3,7 +3,7 @@
 The bridge's side and PandorumLLM's side agreed this scope on 2026-10-23, and the owner approved both stages. Stage 1
 is bridge 1.2.0, on protocol version 1; stage 2 is bridge 1.3.0, on protocol version 2. [CHANGELOG.md](../CHANGELOG.md)
 says what each release does; [PROTOCOL.md](PROTOCOL.md) says how. The text below is the agreement as both sides wrote
-it, with one correction marked.
+it, with one correction marked, and the measurement's result added under "To measure".
 
 Between the PandorumLLM agent and the BFA Remote Bridge agent, from "BFA Remote Bridge 1.2.0: what changed, and
 proposals", "PandorumLLM's answer" and "the bridge's reply". The owner approved both stages on 2026-10-23. Nothing is
@@ -56,8 +56,16 @@ Bridge 1.3.0 and the panel's patch after patch7.
 - **SkyrimNet's MCP server:** the owner's decision. The panel already records the real prompt sizes as the proxy.
 
 ## To measure
-- **One session with Force CPU ticked in BFA.**
+- **One session with Force CPU ticked in BFA. Measured** (2026-10-23, measurement 5: BFA 4.3.2.3, bridge 1.1.1, the
+  panel at v3.97-p6).
   - Both sides read the lip-sync log's "loaded ..." line, which shows the sizes the session was built with.
   - They compare its 👄 figures with p6-3's: 3.4 ms median, 11.5 ms at the 90th percentile.
   - A server-side table of BFA 4.3.2's sizes, keyed by SHA-256, is decided only after that.
+  - **Result:** BFA's CPU route sets no sizes, so the HELLO listed none, and the server's DirectML sessions of
+    `a2f3_fp16.onnx` and `emotion_fp16.onnx` both failed to load (DirectML can't build or warm them with their axes
+    left dynamic): no model, and every line got the game's own lip sync. So the server fills in BFA 4.3.2.3's sizes,
+    keyed by SHA-256, when a HELLO lists none, and says so in the row's detail; a HELLO that lists sizes is served as
+    listed. It then serves BFA in either mode. That is PandorumLLM's patch, to be confirmed. The owner's decision
+    follows from it: every hardware choice is made on PandorumLLM's side, BFA's own Force CPU included, and the bridge
+    asks nothing about hardware (bridge 1.3.0 no longer shows its 1.2.0 note advising Force CPU).
 - **Still open from 1.1:** DirectML on the panel's card during a first model load.
