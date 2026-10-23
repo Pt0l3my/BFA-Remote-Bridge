@@ -1,8 +1,13 @@
-# The bridge's protocol, version 1
+# The bridge's protocol, versions 1 and 2
 
 BFA Remote Bridge (the client, on the gaming PC) and an A2F server (on another PC of the local network, such as
 PandorumLLM's) speak this protocol. `src/core/Protocol.h` implements both sides' encoding; `src/core/Client.h` the
-client's conduct; `tools/reference_server.py` is a reference server.
+client's conduct; `tools/reference_server.py` is a reference server, which speaks both versions (`--v1-only` for
+version 1 alone).
+
+Bridges 1.0.0 to 1.2.0 speak version 1. Bridge 1.3.0 speaks version 2, which is version 1 with three messages added
+(NOTICE, FIND and FOUND), and version 1 to a server that speaks only that (["Version 2"](#version-2) below). The
+agreement behind version 2 is [AGREEMENT-1.2.md](AGREEMENT-1.2.md), stage 2.
 
 ## 1 Facts from Better Facial Animations 4.3.2
 
@@ -41,7 +46,8 @@ all: trivial on a LAN.
 
 ## 2 The protocol
 
-TCP, one request in flight per connection, strictly request then response. All integers little-endian.
+TCP, one request in flight per connection, strictly request then response (NOTICE, in version 2, is one-way). All
+integers little-endian. FIND and FOUND, in version 2, go on UDP.
 
 **Strings** (`str`): `u16` byte length, then UTF-8 bytes, no terminator.
 
@@ -50,7 +56,7 @@ TCP, one request in flight per connection, strictly request then response. All i
 | Bytes | Field |
 |---|---|
 | 4 | magic, the ASCII bytes `BFAR` |
-| 2 | `u16` protocol version, `1` |
+| 2 | `u16` protocol version, `1` or `2` (see [the version rule](#version-2)) |
 | 2 | `u16` message type |
 | 4 | `u32` payload length (at most 64 MiB; larger is refused) |
 
@@ -65,6 +71,12 @@ TCP, one request in flight per connection, strictly request then response. All i
 | 5 | ERROR | server → client | `u32` request id (0 for HELLO), `u16` code, `str` message |
 | 6 | PING | client → server | empty |
 | 7 | PONG | server → client | empty |
+| 8 | FIND | client → local network, UDP | version 2 only: `str` client |
+| 9 | FOUND | server → client, UDP | version 2 only: `str` server |
+| 10 | NOTICE | client → server | version 2 only: see below |
+
+In version 1 a frame of type 8 or above is malformed (ERROR 1). FIND and FOUND are datagrams: on TCP they are
+malformed in either version.
 
 **HELLO** comes first on every connection, and may come again at any time (BFA can switch models mid-game: the
 bridge then sends its current list again).
@@ -148,9 +160,10 @@ u16  output_count    in the order requested
 ```
 
 **Error codes**: 1 malformed frame or payload; 2 wrong access key; 3 unknown or unready model; 4 inference failed
-(the runtime's message in `message`); 5 too large; 6 protocol version not supported; 7 busy or shutting down. After
-codes 1, 2, 5 and 6 the server closes the connection; code 7 says it is stopping, and the bridge treats it as the
-connection's end too. After codes 3 and 4 the connection stays open.
+(the runtime's message in `message`); 5 too large; 6 protocol version not supported (framed in the newest version the
+server speaks: see the version rule); 7 busy or shutting down. After codes 1, 2, 5 and 6 the server closes the
+connection; code 7 says it is stopping, and the bridge treats it as the connection's end too. After codes 3 and 4 the
+connection stays open.
 
 **Rules**
 
@@ -188,6 +201,79 @@ connection's end too. After codes 3 and 4 the connection stays open.
 - **Not measured yet: DirectML during a first load.** On the server's graphics card a load's work (the weights read
   and uploaded, the warm-up) shares the card with the runs of the models already loaded. Nothing on the server makes
   those runs wait, but the card may slow them: lines during the first load of a model may fall back.
+
+### Version 2
+
+Version 2 is version 1 with three messages added: NOTICE on the TCP connection, FIND and FOUND on UDP. Every message
+of version 1 keeps its payload: HELLO, HELLO_OK, RUN, RUN_OK, ERROR, PING and PONG are byte for byte the same in
+version 2, and only the header's version says 2. HELLO and HELLO_OK gain no field: the agreement's stage 2 adds none,
+and the versions it asked about already travel in version 1 (the gaming PC's in the client string, the server's in
+its `server` string).
+
+**The version rule.** Each side answers in the version the other opened with.
+
+- A connection's version is the version of its first frame, the client's HELLO. The server frames every answer on it
+  in that version, and every later frame from the client carries it too. A frame of another version on an open
+  connection is answered with ERROR 6, framed in the connection's version, and the connection closes.
+- A server answers a first frame of a version it doesn't speak with ERROR 6 (request id 0), framed in the newest
+  version it speaks, then closes the connection. So a version 1 server (PandorumLLM v3.97-p6 and earlier, or the
+  reference server with `--v1-only`) answers a version 2 HELLO with ERROR 6 framed in version 1.
+- Bridge 1.3.0 opens every connection with a version 2 HELLO: the speech connection's, each model load's and each
+  status check's. When the answer is ERROR 6 framed in version 1, it connects again at once and opens in version 1,
+  and it stays on version 1 for that server until the game restarts or the address changes (the setting, or the
+  address FIND found). The log says so once. Any other answer framed in a version the bridge didn't open with is
+  malformed.
+- Nothing of version 2 goes to a server that hasn't answered in version 2: NOTICE goes only on a connection whose
+  HELLO was answered with HELLO_OK framed in version 2. FIND goes to the local network, not to a server, and a
+  version 1 server doesn't listen for it.
+- Bridges 1.0.0 to 1.2.0 never open in version 2, so they never see a version 2 frame. A version 2 server answers
+  them in version 1, as it answers any connection opened in version 1.
+
+**NOTICE** (type 10): one-way, client to server, on the speech connection (the bridge's main connection). The server
+sends nothing back, not even an ERROR: a NOTICE whose payload it can't read it ignores (and may log). A NOTICE
+before HELLO is ERROR 1, and the connection closes, as for any request but HELLO.
+
+```
+str  model     the model whose line fell back: a base name the connection's HELLO listed, e.g. "a2f3_fp16.onnx"
+str  reason    one word, the status check's `fallback REASON` words (src/core/Reasons.h): unreachable, paused, timeout,
+               error, notready, refused or incompatible
+str  detail    what happened, on one line, as the bridge shows it on screen: no line break, control character, path or
+               memory address, at most about 160 characters; e.g. "ERROR 4, inference failed: ..."
+u32  lines     the lines that got the game's own lip sync since the bridge's previous NOTICE, the latest included (1
+               or more)
+```
+
+- The bridge sends NOTICE only while no request on the connection awaits an answer: after a RUN's answer has been
+  read (a late one included) and before the next request. It never comes between a request and its answer.
+- It sends one when a line falls back, at most one a minute (as often as the fallback note on screen at most). Each
+  NOTICE carries the latest fallback's model, reason and detail, and counts every line since the previous one. A line
+  that falls back while the connection is down is told by the first NOTICE once it is back.
+- PandorumLLM logs it as a warning and highlights the latest on Audio › Lip Sync until it next answers a RUN from
+  that bridge. The reference server logs it (`--notice-log` writes each one to a file, one JSON object a line).
+- A version 1 server gets no NOTICE: it is told of a fallback by the status check's `fallback REASON`, as by bridge
+  1.2.0.
+
+**FIND** (type 8) and **FOUND** (type 9): on UDP, to find the server on the local network when the bridge's address
+setting is empty.
+
+- Each is one datagram: the 12-byte header (magic `BFAR`, version 2, the type, the payload's length), then the
+  payload, and nothing after it. FIND's payload is `str` client (the client string, as in HELLO); FOUND's is `str`
+  server (as in HELLO_OK).
+- **The bridge** sends FIND to its Port setting (7871 unless changed), to each IPv4 adapter's own broadcast address
+  (its address with every host bit set, from the adapter list Windows reports; adapters that are down, loopback and
+  /31 or /32 prefixes are skipped), and never to 255.255.255.255. It sends FIND only when the address setting is
+  empty: at start-up and after a lost connection, at most once every 5 seconds while no server answers. It waits up
+  to 1 second for an answer and takes the first FOUND; a datagram that isn't one is ignored.
+- **FOUND carries no port:** the bridge connects over TCP to the address FOUND came from, on the port FIND reached.
+- **The server** answers a FIND with one FOUND, framed in version 2, to the address and port it came from; only from
+  its Remote IP, at most one a second, and only while the lip-sync server runs with a Remote IP set. It ignores every
+  other datagram: a wrong magic, version or type, a length that doesn't match the datagram, or a payload it can't
+  read. The reference server answers FIND only with `--remote-ip ADDRESS`, and only from that address.
+- A version 1 server doesn't listen on UDP, so FIND finds only version 2 servers; an older one is reached by its
+  address in the setting.
+- **Firewalls:** allow UDP as well as TCP on that port on the server's PC, for private networks only. FOUND comes back
+  to the port FIND left from on the gaming PC; Windows' firewall lets a unicast answer to a broadcast through for a
+  few seconds by default.
 
 ## 3 What the bridge does
 
