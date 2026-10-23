@@ -1,7 +1,8 @@
 #pragma once
 // The bridge's settings: their keys on SkyrimNet's Settings > Plugins page (config BFARemoteBridge, the file
 // data/SKSE/Plugins/SkyrimNet/external/pt0l3my.bfaremotebridge/settings/BFARemoteBridge.yaml), their defaults, which
-// must equal that file's, their ranges, and the parse of the text SkyrimNet returns for each.
+// must equal that file's, their ranges, and the parse of the text SkyrimNet returns for each. Keys of older versions
+// (1.1's enabled, accessKey, timeoutMs and checkCalls) are never asked for, so their saved values are ignored.
 
 #include <functional>
 #include <string>
@@ -11,16 +12,18 @@
 namespace bfarb {
 
 constexpr const char* kConfigName = "BFARemoteBridge";
+constexpr int kRunTimeoutMs = 1000;  // each lip-sync call's time limit, fixed since 1.2
 
 enum class LogDetail { Normal, Detailed };
 
+// The page holds only what the server can't tell the bridge: how to reach a server that doesn't answer discovery
+// yet (address and port), and how the monitor shows (status on load, log detail). The hardware is chosen on
+// PandorumLLM's side.
 struct Settings {
-    bool enabled = true;
-    std::string serverAddress;  // empty keeps the bridge idle
+    std::string serverAddress;  // empty: found automatically once the server answers discovery (not yet: can't be served)
     int serverPort = 7871;
-    std::string accessKey;  // never logged
-    int timeoutMs = 1000;
-    int checkCalls = 0;
+    std::string accessKey;  // not on the page since 1.2 (PandorumLLM admits by its Remote IP): empty; never logged
+    int timeoutMs = kRunTimeoutMs;  // not on the page since 1.2: fixed (kRunTimeoutMs); the tests set their own
     bool showStatus = true;
     LogDetail logDetail = LogDetail::Normal;
 

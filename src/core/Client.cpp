@@ -6,6 +6,7 @@
 #include <iterator>
 #include <utility>
 
+#include "core/Scrub.h"
 #include "core/Version.h"
 
 namespace bfarb {
@@ -28,8 +29,9 @@ std::string Join(const std::vector<std::string>& parts) {
     return s;
 }
 
+// The server's texts lose any path before they are logged or shown (a note becomes a SkyrimNet event).
 std::string ErrorText(const proto::Error& e) {
-    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + e.message);
+    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + ScrubPaths(e.message));
 }
 
 int MillisLeft(Clock::time_point deadline) {
@@ -169,6 +171,7 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
             reason = out.result.detail = "the server's answer to HELLO names its models out of order";
             return false;
         }
+    for (auto& m : ok.models) m.detail = ScrubPaths(m.detail);  // a server's detail may name its Model folder
     failure = Failure::None;
     out.result.kind = ProbeResult::Kind::Answered;
     out.result.server = ok.server;
@@ -204,12 +207,32 @@ const char* WhyName(Why why) noexcept {
     return "other";
 }
 
-std::string ClientString(const Counters& c, std::size_t max) {
+Reason ReasonOf(Why why) noexcept {
+    switch (why) {
+        case Why::NoConnection:
+        case Why::ConnectTimedOut:
+        case Why::ConnectionLost: return Reason::Unreachable;
+        case Why::RunTimedOut: return Reason::TimedOut;
+        case Why::ServerError: return Reason::ServerError;
+        case Why::NotReady: return Reason::NotReady;
+        case Why::Paused: return Reason::Paused;
+        case Why::Other: return Reason::ServerError;
+    }
+    return Reason::ServerError;
+}
+
+Reason ReasonOf(const Fallback& f) noexcept { return f.busy ? Reason::TimedOut : ReasonOf(f.why); }
+
+std::string ClientString(const Counters& c, const Versions& v, const Reason* fallback, std::size_t max) {
     const std::string name = ClientName();
-    const std::pair<const char*, std::uint64_t> keys[] = {{"answered", c.answered}, {"fallbacks", c.fallbacks}, {"timeouts", c.timeouts}};
-    for (std::size_t n = std::size(keys); n > 0; --n) {
+    std::vector<std::string> keys = {"answered " + std::to_string(c.answered), "fallbacks " + std::to_string(c.fallbacks),
+                                     "timeouts " + std::to_string(c.timeouts)};
+    if (fallback) keys.push_back(std::string("fallback ") + ReasonKey(*fallback));
+    if (!v.bfa.empty()) keys.push_back("BFA " + v.bfa);
+    if (!v.ort.empty()) keys.push_back("ORT " + v.ort);
+    for (std::size_t n = keys.size(); n > 0; --n) {
         std::string s = name + " (";
-        for (std::size_t i = 0; i < n; ++i) s += (i ? ", " : "") + std::string(keys[i].first) + " " + std::to_string(keys[i].second);
+        for (std::size_t i = 0; i < n; ++i) s += (i ? ", " : "") + keys[i];
         s += ")";
         if (s.size() <= max) return s;
     }
@@ -327,7 +350,7 @@ void Client::Configure(const Settings& settings) {
         detailed_.store(settings.logDetail == LogDetail::Detailed);
     }
     std::lock_guard lock(bgMutex_);
-    active_ = settings.enabled && !settings.serverAddress.empty();
+    active_ = !settings.serverAddress.empty();
     MaybeStartLocked();
     wake_ = true;
     wakeCv_.notify_all();
@@ -335,7 +358,32 @@ void Client::Configure(const Settings& settings) {
 
 void Client::SetOrtVersion(const std::string& version) {
     std::lock_guard lock(configMutex_);
-    ortVersion_ = version;
+    versions_.ort = version;
+}
+
+void Client::SetBfaVersion(const std::string& version) {
+    std::lock_guard lock(configMutex_);
+    versions_.bfa = version;
+}
+
+Versions Client::CurrentVersions() const {
+    std::lock_guard lock(configMutex_);
+    return versions_;
+}
+
+void Client::OnStates(StatesSink sink) {
+    Lock lock(mutex_);
+    states_ = std::move(sink);
+}
+
+void Client::TellStatesLocked(const std::string& server, const std::string& device) {
+    if (!states_) return;
+    std::vector<ModelState> models;
+    for (const auto& a : answered_) models.push_back(ModelState{a.entry.name, a.status, a.detail});
+    try {
+        states_(server, device, models);
+    } catch (...) {
+    }
 }
 
 bool Client::Resolve() {
@@ -598,12 +646,10 @@ bool Client::ConnectMainLocked(int timeoutMs, std::string& reason, bool& timedOu
 // HELLO with every live model on the main connection.
 bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failure, std::string& reason) {
     proto::Hello hello;
-    hello.client = ClientString(Totals());
+    const Versions versions = CurrentVersions();
+    hello.client = ClientString(Totals(), versions);
     hello.key = settings_.accessKey;
-    {
-        std::lock_guard lock(configMutex_);
-        hello.ortVersion = ortVersion_;
-    }
+    hello.ortVersion = versions.ort;
     for (const auto& l : listed_) hello.models.push_back(l.entry);
     ++hellosSent_;
     HelloAnswer ans;
@@ -623,6 +669,7 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
     else
         Detail(line);
     lastStatusLine_ = line;
+    TellStatesLocked(ans.result.server, ans.result.device);
     ScheduleNotReadyLocked();
     return true;
 }
@@ -630,11 +677,11 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
 Admission Client::Admit(const proto::ModelEntry& model) {
     Admission a;
     Settings s;
-    std::string ortVersion;
+    Versions versions;
     {
         std::lock_guard lock(configMutex_);
         s = pending_;
-        ortVersion = ortVersion_;
+        versions = versions_;
     }
     if (s.serverAddress.empty()) {
         a.hello.kind = ProbeResult::Kind::NoAddress;
@@ -659,9 +706,9 @@ Admission Client::Admit(const proto::ModelEntry& model) {
     }
     Detail("Side connection for " + model.name + ": connected");
     proto::Hello hello;
-    hello.client = ClientString(Totals());
+    hello.client = ClientString(Totals(), versions);
     hello.key = s.accessKey;
-    hello.ortVersion = ortVersion;
+    hello.ortVersion = versions.ort;
     hello.models = {model};
     ++sideHellos_;
     HelloAnswer ans;
@@ -704,7 +751,10 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     --runsWaiting_;
     // another run, or the background thread's PING or HELLO, holding the connection past this call's timeout: this line
     // goes without
-    if (!got) return answer(Outcome::Skipped, Why::Other, "the connection was busy past the timeout");
+    if (!got) {
+        fallback = Fallback{Why::Other, "the connection was busy past the timeout", false, true};
+        return Outcome::Skipped;
+    }
     ApplyPendingLocked();
     if (paused_.load()) return answer(Outcome::Skipped, Why::Paused, "the bridge is paused", true);
     const auto listed = std::find_if(listed_.begin(), listed_.end(), [&](const Listed& l) { return l.entry.name == model.name; });
@@ -740,7 +790,10 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     if (!proto::EncodeRun(request, payload, err)) return answer(Outcome::Skipped, Why::Other, "couldn't encode RUN (" + err + ")");
 
     const Clock::time_point start = Clock::now();
-    if (start >= deadline) return answer(Outcome::Skipped, Why::Other, "the connection was busy past the timeout");
+    if (start >= deadline) {
+        fallback = Fallback{Why::Other, "the connection was busy past the timeout", false, true};
+        return Outcome::Skipped;
+    }
     const Note note = [this](const std::string& l) { Detail(l); };
     proto::Header header;
     bool reused = transport_ != nullptr;
@@ -901,13 +954,13 @@ void Client::Summary(bool timed) {
     Log(Level::Info, line);
 }
 
-ProbeResult Client::Probe() {
+ProbeResult Client::Probe(const Reason* fallback) {
     Settings s;
-    std::string ortVersion;
+    Versions versions;
     {
         std::lock_guard lock(configMutex_);
         s = pending_;
-        ortVersion = ortVersion_;
+        versions = versions_;
     }
     ProbeResult r;
     if (s.serverAddress.empty()) {
@@ -930,9 +983,9 @@ ProbeResult Client::Probe() {
     }
     const Counters sent = Totals();
     proto::Hello hello;
-    hello.client = ClientString(sent);
+    hello.client = ClientString(sent, versions, fallback);
     hello.key = s.accessKey;
-    hello.ortVersion = ortVersion;
+    hello.ortVersion = versions.ort;
     HelloAnswer ans;
     Failure f = Failure::None;
     SayHello(*t, hello, Clock::now() + kConnectTimeout, nullptr, ans, f, reason, nullptr);
@@ -1005,7 +1058,7 @@ Clock::time_point Client::Tick() {
         s = pending_;
         looked = lookup_.done && lookup_.host == s.serverAddress && lookup_.port == s.serverPort;
     }
-    const bool on = s.enabled && !s.serverAddress.empty();
+    const bool on = !s.serverAddress.empty();
 
     // the name lookup, once per change of the address or port
     if (!s.serverAddress.empty() && !looked && !Resolve()) {
@@ -1072,8 +1125,10 @@ Clock::time_point Client::Tick() {
 
     if (on) {
         StatusCheck();
+        FallbackReport();
         std::lock_guard lock(bgMutex_);
         soon(nextStatus_);
+        if (fallbackPending_) soon(fallbackDue_);
     }
     Summary(true);
     {
@@ -1111,12 +1166,10 @@ bool Client::Recover(const Snapshot& snap) {
     std::string err = "no network";
     if (!t || !t->Connect(endpoints, static_cast<int>(kConnectTimeout.count()), err)) return failed("couldn't connect (" + err + ")");
     proto::Hello hello;
-    hello.client = ClientString(Totals());
+    const Versions versions = CurrentVersions();
+    hello.client = ClientString(Totals(), versions);
     hello.key = snap.settings.accessKey;
-    {
-        std::lock_guard lock(configMutex_);
-        hello.ortVersion = ortVersion_;
-    }
+    hello.ortVersion = versions.ort;
     hello.models = snap.models;
     HelloAnswer ans;
     Failure f = Failure::None;
@@ -1162,6 +1215,7 @@ bool Client::Recover(const Snapshot& snap) {
     else
         Detail(line);
     lastStatusLine_ = line;
+    TellStatesLocked(ans.result.server, ans.result.device);
     EndPauseLocked("the server answered the background HELLO");
     ScheduleNotReadyLocked();
     return true;
@@ -1209,7 +1263,7 @@ void Client::PingMain() {
     StartPauseLocked("The server didn't answer PING (" + reason + ")");
 }
 
-// The first status check, when the bridge comes on: logged.
+// The first status check, once a server address is set: logged.
 void Client::FirstProbe() {
     {
         std::lock_guard lock(bgMutex_);
@@ -1240,6 +1294,43 @@ void Client::StatusCheck() {
     const ProbeResult r = Probe();
     Detail(r.kind == ProbeResult::Kind::Answered ? "Status check: answered by " + r.server
                                                  : "Status check: no answer" + (r.detail.empty() ? std::string() : " (" + r.detail + ")"));
+}
+
+// A line fell back: a status check with its reason, within seconds, at most one per kFallbackReportEvery.
+void Client::ReportFallback(Reason reason) {
+    if (reason == Reason::NoServer) return;
+    {
+        std::lock_guard lock(bgMutex_);
+        const Clock::time_point now = now_();
+        const bool waiting = fallbackPending_;
+        fallbackPending_ = true;
+        fallbackReason_ = reason;
+        if (waiting) return;  // the one already due carries the latest reason
+        fallbackDue_ = fallbackReported_ ? std::max(now, lastFallbackReport_ + kFallbackReportEvery) : now;
+        wake_ = true;  // the thread sends it now, or sets its timer for it
+        wakeCv_.notify_all();
+    }
+}
+
+int Client::FallbackReports() const {
+    std::lock_guard lock(bgMutex_);
+    return fallbackReports_;
+}
+
+void Client::FallbackReport() {
+    Reason reason;
+    {
+        std::lock_guard lock(bgMutex_);
+        if (!fallbackPending_ || now_() < fallbackDue_) return;
+        fallbackPending_ = false;
+        fallbackReported_ = true;
+        lastFallbackReport_ = now_();
+        reason = fallbackReason_;
+        ++fallbackReports_;
+    }
+    const ProbeResult r = Probe(&reason);
+    Detail(std::string("Status check for a fallback (") + ReasonKey(reason) + "): " +
+           (r.kind == ProbeResult::Kind::Answered ? "answered by " + r.server : "no answer" + (r.detail.empty() ? std::string() : " (" + r.detail + ")")));
 }
 
 }  // namespace bfarb

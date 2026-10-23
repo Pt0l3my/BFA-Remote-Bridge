@@ -70,7 +70,7 @@ TCP, one request in flight per connection, strictly request then response. All i
 bridge then sends its current list again).
 
 ```
-str  client          e.g. "BFARemoteBridge 1.1.1 (answered 1250, fallbacks 0, timeouts 0)"
+str  client          e.g. "BFARemoteBridge 1.2.0 (answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)"
 str  key             the access key, empty if none
 str  ort_version     the gaming PC's runtime, e.g. "1.24.4" (informational)
 u16  model_count
@@ -82,14 +82,22 @@ u16  model_count
     per override: str dim_name, i64 value
 ```
 
-The bridge's **client string** is its name and version, then its counters in parentheses: `BFARemoteBridge 1.1.1
-(answered N, fallbacks N, timeouts N)`. The counters are cumulative from Skyrim's start: `answered` counts the runs
-the server answered, `fallbacks` every run it didn't (the line got the game's own lip sync), and `timeouts` the part of
-those that timed out. The keys keep this order; new keys are only ever added at the end. A server may show the string
-as given or parse it. The string stays within **120 characters**, which PandorumLLM's log lines keep since its patch4
-(80 before). The three counts have at most 60 digits between them, so today's keys always fit whole, at 116
-characters at most; the example is 62. Should keys added later make it longer, the trailing keys are dropped, last
-first, until it fits, and the name and version alone are sent when no key fits.
+The bridge's **client string** is its name and version, then its keys in parentheses: `BFARemoteBridge 1.2.0
+(answered N, fallbacks N, timeouts N, fallback REASON, BFA V, ORT V)`.
+
+- The counters are cumulative from Skyrim's start: `answered` counts the runs the server answered, `fallbacks` every
+  run it didn't (the line got the game's own lip sync), and `timeouts` the part of those that timed out.
+- `fallback REASON` (since 1.2.0) comes only in a status check the bridge sends because a line fell back: REASON is
+  one word, `unreachable`, `paused`, `timeout`, `error`, `notready`, `refused` or `incompatible`
+  (`src/core/Reasons.h`; a word, once released, never changes).
+- `BFA V` and `ORT V` (since 1.2.0) are the gaming PC's BFA version (from its DLL) and the runtime BFA loaded, each
+  only once known.
+
+The keys keep this order; new keys are only ever added at the end. A server may show the string as given or parse it
+by its key words. The string stays within **120 characters**, which PandorumLLM's log lines keep since its patch4 (80
+before). The three counts fit whole in any case (116 characters at most); the example is 87. When the keys would make
+it longer, the trailing keys are dropped, last first, until it fits (so `ORT`, then `BFA`, then `fallback`), and the
+name and version alone are sent when no key fits.
 
 **HELLO_OK**
 
@@ -183,29 +191,58 @@ connection's end too. After codes 3 and 4 the connection stays open.
 
 ## 3 What the bridge does
 
-The bridge takes BFA's model inference over completely while it is on: no model runs on the gaming PC, on its
-graphics card or its processor. A late lip sync looks worse than none, and inference on the processor stutters too,
-so there is no local fallback: a line the server doesn't answer in time gets the game's own lip sync.
+The bridge takes BFA's model inference over completely: no model runs on the gaming PC, on its graphics card or its
+processor. A late lip sync looks worse than none, and inference on the processor stutters too, so there is no local
+fallback: a line the server doesn't answer in time gets the game's own lip sync. The hardware the server runs on is
+PandorumLLM's choice; the bridge reports it.
 
-- **Settings** on SkyrimNet's Settings > Plugins page: **Bridge** (on or off), **Server address**, **Port** (default
-  7871), **Access key**, **Timeout** (ms per call, default 1000, 200 to 5000), **Check results**, **Status on load**,
-  **Log detail**. The bridge is on when Bridge is ticked and a server address is set.
+- **Settings** on SkyrimNet's Settings > Plugins page, only what the server can't tell the bridge: **Server address**
+  and **Port** (default 7871), for a server that doesn't answer discovery yet (today's), **Status on load** and **Log
+  detail**. 1.1's Bridge, Access key, Timeout and Check results are gone; their saved values are ignored. The access
+  key is empty, and each call's timeout is 1000 ms.
 - **Attaching.** At SKSE's post-load message it finds `BetterFacialAnimations.dll`, reads its version from its
-  `SKSEPlugin_Version` data (4.3.x only: any other BFA runs as if the bridge weren't installed), and patches the entry for KERNEL32's `GetProcAddress` in BFA's import address table. Its
-  replacement changes one answer only: BFA's lookup of `OrtGetApiBase` in `onnxruntime.dll` gets the bridge's. That
-  one's `GetApi(24)` is a copy of the real `OrtApi` table with a few entries replaced; any other API version gets the
-  real table, untouched, and BFA runs as if the bridge weren't installed.
-- **A model load** (`CreateSession`, while the bridge is on) never reaches the real runtime. The bridge hashes the
+  `SKSEPlugin_Version` data (for the log and the client string only: any version is tried), and patches the entry for
+  KERNEL32's `GetProcAddress` in BFA's import address table. Its replacement changes one answer only: BFA's lookup of
+  `OrtGetApiBase` in `onnxruntime.dll` gets the bridge's. When the patch can't be made (no such import, BFA's runtime
+  loaded already), BFA runs as it would without the bridge, and a note says so.
+- **The API version BFA asks for** (`GetApi(N)`) is served from the real table:
+  - N up to 24: a copy of the runtime's entries, only as many as the runtime's own API version (read from its
+    `GetVersionString`) has: OrtApi is append-only, and the bridge knows each version's first entry from 1.11 on (by
+    its `\since` note in the 1.24.4 header; each version's count is also checked against ONNX Runtime's own
+    published sizes, such as 390 entries for 1.23), so it never reads past a shorter table. The entries below are replaced,
+    each only where the runtime has it; the device check on tensors (`MemoryInfoGetDeviceType`, since 1.14) is
+    skipped for an older runtime.
+  - N from 25 to 30, of a runtime that has it: 1.24.4's entries as above, then every entry past them answered by the
+    bridge with an error status naming it (`ORT_NOT_IMPLEMENTED`, "ONNX Runtime entry K is newer than the runtime the
+    bridge knows"), never the runtime's. The bridge can't tell which of them could meet its sessions or values, so
+    none of them reaches the runtime: whatever needs one fails safely, and the log and the monitor name it once. The
+    stubs take no parameters: both x64 calling conventions leave the arguments to the caller. One limit: an entry
+    that returns something other than a status (a table, a string) gets a status pointer, which BFA would misread;
+    the log names the entry first.
+    `GetExperimentalFunction` (index 422, since 1.28) returns a function pointer: its stub answers null, its
+    documented "not available".
+  - A runtime older than API version 10 (whose table length the header can't tell), one whose version can't be read,
+    or N past 30: known to be incompatible, so `GetApi` answers null. BFA then has no model (its own "wrong
+    version"), lip sync is the game's own, nothing runs on this PC, and a note says to update the bridge (or BFA, for
+    a runtime older than 1.10).
+  - The runtime's other session makers (`CreateSessionFromArray`, `CreateSessionWithPrepackedWeightsContainer`,
+    `CreateSessionFromArrayWithPrepackedWeightsContainer`, and the model editor's `CreateSessionFromModel`,
+    `CreateModelEditorSession` and `CreateModelEditorSessionFromArray`) answer with an error status naming them,
+    without the runtime, logged once with a note: a model loaded so would run on this PC.
+  - The model editor's table is served only to BFA asking at most 24 of a runtime at least that new (its layout is
+    1.24.4's); otherwise `GetModelEditorApi` answers null, as a minimal build does. The DirectML table is wrapped
+    only at version 24 of such a runtime.
+- **A model load** (`CreateSession`) never reaches the real runtime. The bridge hashes the
   model file (base name, size, SHA-256), takes the overrides BFA set on the options, and sends HELLO with that model
   alone on a **side connection** of its own (3000 ms to connect, 60 seconds for the answer), closed after the answer.
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
     PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
     if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
     session without releasing it); a run on a replaced session gets the NaN answer below.
-  - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed): BFA gets an error status
-    made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the reason. BFA then has no model, and
-    lip sync is the game's own until BFA loads its model again (a restart, a model switch in BFA's menu, or BFA's own
-    retry).
+  - Not (no answer, the wrong key, not found, a different file, failed to load, not allowed), or no server address
+    set: BFA gets an error status made by the real `CreateStatus(ORT_FAIL, "BFA Remote Bridge: ...")` naming the
+    reason. BFA then has no model, and lip sync is the game's own until BFA loads its model again (a restart, a model
+    switch in BFA's menu, or BFA's own retry). A refusal met again on BFA's retries is logged once until it changes.
 - **A run** on a bridge session, BFA's warm-up run included, always goes to the server, on the **main connection**:
   RUN, then RUN_OK checked against the call (the count, the names and order, and the types and shapes of any outputs
   the caller passed), then the outputs handed to BFA as the runtime would (new values made by the real
@@ -232,7 +269,7 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   run or from the background thread) or a second RUN timeout in a row closes the connection and starts the pause: every run is then answered at once with NaN, without touching the network, until the background thread's
   HELLO is answered. One log line starts it and one ends it, with how long it lasted and how many runs it answered so.
 - **The background thread**, one of the bridge's own, asleep on a condition variable between its timers. It starts
-  once the bridge is on with a server address, never runs on the game's threads, and lives until the game exits.
+  once a server address is set, never runs on the game's threads, and lives until the game exits.
   - **Reconnecting:** after a failure it connects (3000 ms) and says HELLO with every live model (60 seconds) on a
     new connection, outside the main connection's lock, and swaps it in. It tries after 1, 2, 5, 10 and 30 seconds,
     then every 30 seconds; its answered HELLO ends the pause. It also makes the main connection when there is none
@@ -242,7 +279,9 @@ so there is no local fallback: a line the server doesn't answer in time gets the
   - **PING** on a main connection idle for 60 seconds whose HELLO was answered and listed models. PONG must come
     within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
   - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
-    counters in its client string) on a connection of its own, then closed. Also once when the bridge comes on.
+    counters in its client string) on a connection of its own, then closed. Also once when a server address is set, and
+    within seconds of a line falling back (at most one every 30 seconds), with the fallback's reason in the client
+    string (`fallback REASON`, the latest when several came meanwhile).
   - **Never past a run's timeout:** its connect and the 60-second HELLO of a reconnect go on a new connection, outside
     the main connection's lock. Its HELLO and PING on the main connection take the lock only when it is free and no
     run waits, and last at most the run timeout. A run that arrives meanwhile waits for the lock within its own
@@ -253,24 +292,28 @@ so there is no local fallback: a line the server doesn't answer in time gets the
 - **Before the settings are read**: SkyrimNet registers the bridge's settings during its own start-up, so the bridge
   reads them at the data-loaded message, when the main menu opens, before each game loads and when its page is
   saved, and counts them read once SkyrimNet names the config. A model load before that is refused ("the bridge's
-  settings weren't read yet"; BFA tries a failed load again 30 seconds later) while SkyrimNet is loaded, and loads on
-  the gaming PC as usual when SkyrimNet isn't. Every model load that passes through is logged with its reason.
+  settings weren't read yet"; BFA tries a failed load again 30 seconds later) while SkyrimNet is loaded, and as having
+  no server address when SkyrimNet isn't.
 - **The server's name** is looked up once per change of the address or port, off the game's threads, and connections
   use the addresses found. A failed lookup is logged once, and runs get the NaN answer until the settings change.
 - **Every other entry that takes a session** (the 22 of `OrtApi` besides `Run`, such as `SessionGetInputCount`,
   `SessionGetOutputName`, `CreateIoBinding`, `RunWithBinding` and `RunAsync`, and the model editor's three) answers a
   bridge session with an error status made by `CreateStatus`, without the runtime. BFA calls none of them.
-- **Releasing** a bridge session frees it in the bridge; it never reaches the runtime. Sessions made while the bridge
-  was off are the runtime's own, and every call on them is the real one: the on/off setting takes effect at BFA's
-  next model load.
+- **Releasing** a bridge session frees it in the bridge; it never reaches the runtime. A session the runtime made
+  itself (through another entry, such as `CreateSessionFromArray`) is the runtime's own, and every call on it is the
+  real one.
 - **Everything else** BFA calls (options, providers, tensors, memory information, statuses) is the real runtime's. In
-  GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code), but no inference runs
-  on it; the bridge logs that BFA is set to GPU and, once per session while the bridge is on with an address and its
-  Status on load setting allows notices, shows "BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it
-  off this PC's graphics card." Force CPU avoids even that device.
-- **Check mode** (Check results above 0) is a diagnostic that does run the model on the gaming PC: only while it is
-  on, a model load also makes the real session, and each session's first N runs run both ways, the largest difference
-  per output logged.
+  GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
+  no inference runs on it; the bridge logs that BFA is set to GPU and, once per session, shows "BFA Remote Bridge: BFA
+  is set to GPU, so it keeps a graphics device open on this PC. Tick Force CPU in BFA's menu: its model runs on the
+  server either way." BFA's CPU route sets no free-dimension overrides, so its HELLO lists none.
+- **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
+  HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
+  game load (ready lines only while Status on load allows them), a model load the server refuses included, with its
+  detail; a note when lines fall back, naming the reason, at most one a minute however the lines alternate; one when
+  lines are back on the server after such a note, at most one a minute. Every server text shown or logged loses any
+  path first (`ScrubPaths`). Every note goes through one
+  function (the plugin's `ShowNote`): Skyrim's corner note today, which SkyrimNet sees as a `notification` event.
 - **The log**, `BFARemoteBridge.log` in SKSE's log folder, times in UTC: BFA found or not, its version, the attachment,
   the settings (the address and the key only as set or not), each model's size, SHA-256 and overrides, the server's
   answer to each model load and to the main connection's HELLO when it changes, the pause's start and end, and **each

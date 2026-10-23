@@ -117,12 +117,8 @@ std::string_view Unquote(std::string_view s) noexcept {
 
 const std::vector<SettingKey>& SettingKeys() {
     static const std::vector<SettingKey> keys = {
-        {"enabled", SettingType::Bool, "true"},
         {"serverAddress", SettingType::String, ""},
         {"serverPort", SettingType::Int, "7871", 1, 65535},
-        {"accessKey", SettingType::String, ""},
-        {"timeoutMs", SettingType::Int, "1000", 200, 5000},
-        {"checkCalls", SettingType::Int, "0", 0, 50},
         {"showStatus", SettingType::Bool, "true"},
         {"logDetail", SettingType::Select, "Normal", 0, 0, {"Normal", "Detailed"}},
     };
@@ -132,21 +128,16 @@ const std::vector<SettingKey>& SettingKeys() {
 Settings ReadSettings(const ConfigGetter& get, std::vector<std::string>* warnings) {
     Reader r(get, warnings);
     Settings s;
-    s.enabled = r.Bool("enabled");
     s.serverAddress = r.String("serverAddress");
     s.serverPort = r.Int("serverPort");
-    s.accessKey = r.String("accessKey");
-    s.timeoutMs = r.Int("timeoutMs");
-    s.checkCalls = r.Int("checkCalls");
     s.showStatus = r.Bool("showStatus");
     s.logDetail = r.Select("logDetail") == "Detailed" ? LogDetail::Detailed : LogDetail::Normal;
     return s;
 }
 
 std::string Describe(const Settings& s) {
-    return std::string("bridge ") + (s.enabled ? "on" : "off") + ", server address " + (s.serverAddress.empty() ? "not set" : "set") +
-           ", port " + std::to_string(s.serverPort) + ", access key " + (s.accessKey.empty() ? "not set" : "set") + ", timeout " +
-           std::to_string(s.timeoutMs) + " ms, check results " + std::to_string(s.checkCalls) + ", status on load " +
+    return std::string("server address ") + (s.serverAddress.empty() ? "not set" : "set") + ", port " + std::to_string(s.serverPort) +
+           ", timeout " + std::to_string(s.timeoutMs) + " ms, status on load " +
            (s.showStatus ? "on" : "off") + ", log detail " + (s.logDetail == LogDetail::Detailed ? "Detailed" : "Normal");
 }
 

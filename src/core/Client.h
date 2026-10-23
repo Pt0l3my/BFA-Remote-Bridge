@@ -26,7 +26,8 @@
 // - The background thread sleeps on a condition variable between its timers: reconnecting with a backoff of 1, 2, 5,
 //   10 and 30 s (then every 30 s), its HELLO's answer ending the pause; a HELLO on the main connection when the live
 //   models changed; a PING after 60 s idle on a connection whose HELLO listed models; a status check on a connection
-//   of its own every 5 minutes when the counters changed; the summary line every 10 minutes when anything happened.
+//   of its own every 5 minutes when the counters changed, and within seconds of a fallback (at most one per 30 s) with
+//   the fallback's reason in its client string; the summary line every 10 minutes when anything happened.
 //   It never makes a run wait past the run's own timeout: connecting and HELLO go on a new connection outside the
 //   lock, swapped in under it, and its HELLO and PING on the main connection use a try-lock, give way to runs, and
 //   last no longer than the run timeout.
@@ -37,6 +38,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -44,6 +46,7 @@
 
 #include "core/Log.h"
 #include "core/Protocol.h"
+#include "core/Reasons.h"
 #include "core/Settings.h"
 #include "core/Transport.h"
 
@@ -56,12 +59,13 @@ constexpr std::chrono::minutes kStatusEvery{5};
 constexpr std::chrono::minutes kSummaryEvery{10};
 constexpr std::uint64_t kSummaryRuns = 250;
 constexpr std::size_t kClientStringMax = 120;  // PandorumLLM's log lines keep 120 characters since its patch4
+constexpr std::chrono::seconds kFallbackReportEvery{30};  // the prompt status check after a fallback, at most this often
 
 // The background thread's wait before its next try, after `failures` failed tries since the pause began (or the last
 // success): 1, 2, 5, 10, 30 s, then 30 s.
 std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-std::string ClientName();  // "BFARemoteBridge 1.1.1"
+std::string ClientName();  // "BFARemoteBridge 1.2.0"
 
 // Why a run got no answer from the server.
 enum class Why : std::uint8_t {
@@ -77,6 +81,11 @@ enum class Why : std::uint8_t {
 };
 constexpr std::size_t kWhyCount = 8;
 const char* WhyName(Why why) noexcept;
+// The reason the player and the server are told (core/Reasons.h) for a run's: Other is ServerError (an answer that
+// doesn't fit the call); the bridge says Incompatible itself for an input the protocol can't carry.
+Reason ReasonOf(Why why) noexcept;
+struct Fallback;
+Reason ReasonOf(const Fallback& fallback) noexcept;
 
 // How one exchange on a connection ended.
 enum class ExchangeFailure {
@@ -97,6 +106,7 @@ struct Fallback {
     Why why = Why::Other;
     std::string text;
     bool quiet = false;  // counted, not logged (runs answered at once without the network, after the first of a series)
+    bool busy = false;   // Other because the connection was held past the run's timeout: told as TimedOut
 };
 
 // Cumulative from Skyrim's start. fallbacks counts every run the server didn't answer; timeouts is a part of it.
@@ -107,10 +117,19 @@ struct Counters {
     bool operator==(const Counters&) const = default;
 };
 
-// The HELLO's client string: "BFARemoteBridge 1.1.1 (answered N, fallbacks N, timeouts N)", keys in that order, new
-// keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name alone when none
-// fits.
-std::string ClientString(const Counters& counters, std::size_t max = kClientStringMax);
+// The versions on the gaming PC, in one place: BFA's (from its SKSEPlugin_Version) and its runtime's (from
+// GetVersionString). The client string names them today; a HELLO field may carry them once a server takes one.
+struct Versions {
+    std::string bfa;  // "4.3.2.3"; empty when unknown
+    std::string ort;  // "1.24.4"; empty until BFA loads its runtime
+};
+
+// The HELLO's client string: "BFARemoteBridge 1.2.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
+// ORT V)", keys in that order, each of the last three only when known (fallback only in a status check sent for a
+// fallback), new keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name
+// alone when none fits.
+std::string ClientString(const Counters& counters, const Versions& versions = {}, const Reason* fallback = nullptr,
+                         std::size_t max = kClientStringMax);
 
 // The runs since the last summary line.
 struct Period {
@@ -139,6 +158,14 @@ struct ProbeResult {
     std::string detail;
 };
 
+// One model's state in a HELLO_OK of the main connection, for the monitor.
+struct ModelState {
+    std::string name;
+    std::uint8_t status = 0xFF;  // proto::ModelStatus
+    std::string detail;
+};
+using StatesSink = std::function<void(const std::string& server, const std::string& device, const std::vector<ModelState>& models)>;
+
 // Admit's answer for the model asked.
 struct Admission {
     ProbeResult hello;          // kind Answered when the server answered HELLO_OK
@@ -159,6 +186,11 @@ public:
     // Never waits for the connection: applied by the next Run or the background thread.
     void Configure(const Settings& settings);
     void SetOrtVersion(const std::string& version);
+    void SetBfaVersion(const std::string& version);
+    Versions CurrentVersions() const;
+    // Each HELLO_OK on the main connection: the server, its device and every model's state. Called with the
+    // connection's lock held: the sink must not call the client.
+    void OnStates(StatesSink sink);
 
     // Looks the latest settings' server name up and keeps the addresses. Called off the game's threads.
     bool Resolve();
@@ -194,11 +226,17 @@ public:
     // Whether the pause is on: runs fall back at once until the background HELLO is answered.
     bool Paused() const noexcept;
 
-    // A connection of its own: HELLO with no models and the counters in its client string, the answer, then closed.
-    // Never touches the main connection, its lock or the pause, and never waits for a side load.
-    ProbeResult Probe();
+    // A connection of its own: HELLO with no models and the counters in its client string (with the fallback's
+    // reason when one is given), the answer, then closed. Never touches the main connection, its lock or the pause,
+    // and never waits for a side load.
+    ProbeResult Probe(const Reason* fallback = nullptr);
 
-    // The background thread: allowed by StartBackground, it starts while the bridge is on with a server address
+    // A line fell back: the background thread sends a status check with the reason, at once or, within
+    // kFallbackReportEvery of the last, when that has passed. NoServer has nowhere to go and is ignored.
+    void ReportFallback(Reason reason);
+    int FallbackReports() const;  // status checks sent for a fallback, for the tests
+
+    // The background thread: allowed by StartBackground, it starts once a server address is set
     // (now, or at a later Configure). StopBackground ends and joins it.
     void StartBackground();
     void StopBackground();
@@ -252,6 +290,8 @@ private:
     void PingMain();
     void FirstProbe();
     void StatusCheck();
+    void FallbackReport();
+    void TellStatesLocked(const std::string& server, const std::string& device);
     void Summary(bool timed);
     std::string StatusLine(const std::string& server, const std::string& device, const std::vector<Answered>& models) const;
     static std::vector<Listed> Newest(const std::vector<proto::ModelEntry>& models);
@@ -265,7 +305,8 @@ private:
     mutable std::mutex configMutex_;
     Settings pending_;
     std::uint64_t pendingGeneration_ = 0;
-    std::string ortVersion_;
+    Versions versions_;
+    StatesSink states_;
     struct Lookup {
         bool done = false;
         bool ok = false;
@@ -327,6 +368,12 @@ private:
     bool probeWanted_ = true;
     Clock::time_point nextStatus_{};
     Counters reported_;
+    bool fallbackPending_ = false;
+    Reason fallbackReason_ = Reason::Unreachable;
+    Clock::time_point fallbackDue_{};
+    Clock::time_point lastFallbackReport_{};
+    bool fallbackReported_ = false;
+    int fallbackReports_ = 0;
 
     // the counters
     mutable std::mutex statsMutex_;

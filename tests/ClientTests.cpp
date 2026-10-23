@@ -9,6 +9,7 @@
 #include "Scripted.h"
 #include "Test.h"
 #include "core/Client.h"
+#include "core/Reasons.h"
 #include "core/Version.h"
 
 using namespace bfarb;
@@ -1158,14 +1159,14 @@ TEST(ClientStringAndItsLimit) {
         big = big * 10 + 1;
         ++digits;
     }
-    const std::string whole = ClientString(Counters{big, big, big}, max);
+    const std::string whole = ClientString(Counters{big, big, big}, {}, nullptr, max);
     CHECK(whole.size() <= max);
     CHECK(whole.find("timeouts") != std::string::npos);
-    const std::string cut = ClientString(Counters{big * 100, big * 100, big * 100}, max);
+    const std::string cut = ClientString(Counters{big * 100, big * 100, big * 100}, {}, nullptr, max);
     CHECK(cut.size() <= max);
     CHECK(cut.find("timeouts") == std::string::npos);
     CHECK(cut.rfind(name + " (answered ", 0) == 0);
-    const std::string mostCut = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX}, max);
+    const std::string mostCut = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX}, {}, nullptr, max);
     CHECK(mostCut.size() <= max);
     CHECK(mostCut.find("fallbacks") == std::string::npos || mostCut.find("timeouts") == std::string::npos);
     // exactly the limit keeps every key; one more drops the last
@@ -1176,15 +1177,91 @@ TEST(ClientStringAndItsLimit) {
     };
     const std::size_t room = max - fixed;  // the digits the three counts may have between them
     const std::size_t a = std::min<std::size_t>(19, room - 2), f = room - a - 1;
-    const std::string exact = ClientString(Counters{ofDigits(a), ofDigits(f), 7}, max);
+    const std::string exact = ClientString(Counters{ofDigits(a), ofDigits(f), 7}, {}, nullptr, max);
     CHECK_EQ(exact.size(), max);
     CHECK(exact.find("timeouts 7)") != std::string::npos);
-    const std::string over = ClientString(Counters{ofDigits(a), ofDigits(f), 17}, max);
+    const std::string over = ClientString(Counters{ofDigits(a), ofDigits(f), 17}, {}, nullptr, max);
     CHECK(over.find("timeouts") == std::string::npos);
     CHECK(over.find("fallbacks") != std::string::npos);
     CHECK(over.size() <= max);
-    CHECK_EQ(ClientString(Counters{1, 2, 3}, 10), name.substr(0, 10));
-    CHECK_EQ(ClientString(Counters{1, 2, 3}, name.size()), name);
+    CHECK_EQ(ClientString(Counters{1, 2, 3}, {}, nullptr, 10), name.substr(0, 10));
+    CHECK_EQ(ClientString(Counters{1, 2, 3}, {}, nullptr, name.size()), name);
+}
+
+// The versions and a fallback's reason join the counters, in that order; the trailing keys drop first.
+TEST(ClientStringVersionsAndReason) {
+    const std::string name = std::string("BFARemoteBridge ") + kVersionText;
+    const Versions v{"4.3.2.3", "1.24.4"};
+    CHECK_EQ(ClientString(Counters{1250, 3, 1}, v), name + " (answered 1250, fallbacks 3, timeouts 1, BFA 4.3.2.3, ORT 1.24.4)");
+    const Reason why = Reason::TimedOut;
+    CHECK_EQ(ClientString(Counters{1250, 3, 1}, v, &why),
+             name + " (answered 1250, fallbacks 3, timeouts 1, fallback timeout, BFA 4.3.2.3, ORT 1.24.4)");
+    CHECK_EQ(ClientString(Counters{1, 0, 0}, Versions{"", "1.24.4"}), name + " (answered 1, fallbacks 0, timeouts 0, ORT 1.24.4)");
+    // whole within 120 characters for a long session (a million runs, a thousand fallbacks) and the longest reason
+    const Reason longest = Reason::Incompatible;
+    const std::string busy = ClientString(Counters{1234567, 1234, 123}, v, &longest);
+    CHECK(busy.size() <= kClientStringMax);
+    CHECK(busy.find("fallback incompatible, BFA 4.3.2.3, ORT 1.24.4)") != std::string::npos);
+    // past the limit: ORT goes first, then BFA, then the reason, then the counters as before
+    const std::string most = ClientString(Counters{UINT64_MAX, UINT64_MAX, UINT64_MAX}, v, &longest);
+    CHECK(most.size() <= kClientStringMax);
+    CHECK(most.find("ORT") == std::string::npos);
+    CHECK(most.find("timeouts 18446744073709551615") != std::string::npos);
+    // every reason has a key of one word
+    for (std::size_t i = 0; i < kReasonCount; ++i) {
+        const std::string key = ReasonKey(static_cast<Reason>(i));
+        CHECK(!key.empty());
+        CHECK(key.find(' ') == std::string::npos);
+        CHECK(key != "other");
+    }
+}
+
+// A fallback is told to the server: a status check with its reason at once, then at most one every 30 s carrying the
+// latest reason; NoServer has nowhere to go.
+TEST(ClientFallbackReportsAreRateLimited) {
+    Rig r;
+    r.c.SetBfaVersion("4.3.2.3");
+    r.c.SetOrtVersion("1.24.4");
+    std::vector<std::string> checks;
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1 && DecodedHello(p).models.empty()) checks.push_back(DecodedHello(p).client);
+        return Serve(type, p);
+    };
+    r.Serving(Model("a.onnx"));  // the start-up status check
+    CHECK_EQ(checks.size(), std::size_t{1});
+    r.c.ReportFallback(Reason::NoServer);
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 0);
+    r.c.ReportFallback(Reason::TimedOut);
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 1);
+    CHECK_EQ(checks.size(), std::size_t{2});
+    CHECK(checks.back().find("fallback timeout, BFA 4.3.2.3, ORT 1.24.4)") != std::string::npos);
+    g_now += std::chrono::seconds(10);
+    r.c.ReportFallback(Reason::Paused);
+    r.c.ReportFallback(Reason::NotReady);
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 1);  // within 30 s of the last: held
+    g_now += std::chrono::seconds(20);
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 2);
+    CHECK(checks.back().find("fallback notready") != std::string::npos);
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 2);  // nothing new
+    CHECK_EQ(r.Logged("Status check for a fallback (notready): answered by"), 1);
+}
+
+// Each HELLO_OK on the main connection tells the states sink every model's state, for the monitor.
+TEST(ClientTellsTheModelStates) {
+    Rig r;
+    std::vector<std::string> seen;
+    r.c.OnStates([&](const std::string& server, const std::string& device, const std::vector<ModelState>& models) {
+        for (const auto& m : models) seen.push_back(server + "|" + device + "|" + m.name + "|" + std::to_string(m.status));
+    });
+    r.Serving(Model("a.onnx"));
+    CHECK(!seen.empty());
+    CHECK(seen.back().find("|CPU|a.onnx|0") != std::string::npos);
+    r.c.OnStates(nullptr);
 }
 
 // The counters go in every HELLO: the main connection's, a side load's and the status checks' (every 5 minutes, only

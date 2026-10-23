@@ -1,5 +1,7 @@
-// SHA-256, the settings, the status texts and the PE reads.
+// SHA-256, the settings, the status texts, the monitor, the runtime's API versions and the PE reads.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -8,6 +10,8 @@
 #include <sstream>
 
 #include "Test.h"
+#include "core/Bridge.h"
+#include "core/Monitor.h"
 #include "core/PeImage.h"
 #include "core/Scrub.h"
 #include "core/Settings.h"
@@ -71,20 +75,30 @@ TEST(SettingsDefaults) {
     // SkyrimNet missing or the keys unsaved: every key gives its default
     const Settings s = ReadSettings([](std::string_view, std::string_view def) { return std::string(def); });
     CHECK(s == Settings{});
-    CHECK(s.enabled);
     CHECK(s.serverAddress.empty());
     CHECK_EQ(s.serverPort, 7871);
-    CHECK_EQ(s.timeoutMs, 1000);
-    CHECK_EQ(s.checkCalls, 0);
+    CHECK(s.accessKey.empty());
+    CHECK_EQ(s.timeoutMs, kRunTimeoutMs);
+    CHECK_EQ(kRunTimeoutMs, 1000);
     CHECK(s.showStatus);
     CHECK(s.logDetail == LogDetail::Normal);
     CHECK(ReadSettings(nullptr) == Settings{});
+    // the page holds four keys; 1.1's removed ones are never asked for
+    CHECK_EQ(SettingKeys().size(), std::size_t{4});
+    std::vector<std::string> asked;
+    ReadSettings([&](std::string_view k, std::string_view def) {
+        asked.emplace_back(k);
+        return std::string(def);
+    });
+    for (const char* gone : {"enabled", "accessKey", "timeoutMs", "checkCalls"})
+        CHECK(std::find(asked.begin(), asked.end(), gone) == asked.end());
 }
 
 TEST(SettingsParseAndClamp) {
+    // older saved values of the removed keys are there, and ignored
     std::map<std::string, std::string> values = {
-        {"enabled", "False"},      {"serverAddress", " \"192.0.2.10\" "}, {"serverPort", "99999"}, {"accessKey", "'k e y'"},
-        {"timeoutMs", "10000.6"},     {"checkCalls", "-3"},                  {"showStatus", "no"},    {"logDetail", "detailed"},
+        {"enabled", "False"},   {"serverAddress", " \"192.0.2.10\" "}, {"serverPort", "99999"}, {"accessKey", "'k e y'"},
+        {"timeoutMs", "10000.6"}, {"checkCalls", "3"},                  {"showStatus", "no"},    {"logDetail", "detailed"},
     };
     std::vector<std::string> warnings;
     const auto get = [&](std::string_view k, std::string_view def) {
@@ -92,43 +106,40 @@ TEST(SettingsParseAndClamp) {
         return it == values.end() ? std::string(def) : it->second;
     };
     Settings s = ReadSettings(get, &warnings);
-    CHECK(!s.enabled);
     CHECK_EQ(s.serverAddress, std::string("192.0.2.10"));
     CHECK_EQ(s.serverPort, 65535);
-    CHECK_EQ(s.accessKey, std::string("k e y"));
-    CHECK_EQ(s.timeoutMs, 5000);
-    CHECK_EQ(s.checkCalls, 0);
+    CHECK(s.accessKey.empty());
+    CHECK_EQ(s.timeoutMs, kRunTimeoutMs);
     CHECK(!s.showStatus);
     CHECK(s.logDetail == LogDetail::Detailed);
-    CHECK_EQ(warnings.size(), std::size_t{3});  // port, timeout, check calls
+    CHECK_EQ(warnings.size(), std::size_t{1});  // the port
 
-    values = {{"enabled", "maybe"}, {"serverPort", "port"}, {"timeoutMs", "100"}, {"logDetail", "Verbose"}};
+    values = {{"serverPort", "port"}, {"showStatus", "maybe"}, {"logDetail", "Verbose"}};
     warnings.clear();
     s = ReadSettings(get, &warnings);
-    CHECK(s.enabled);
     CHECK_EQ(s.serverPort, 7871);
-    CHECK_EQ(s.timeoutMs, 200);
+    CHECK(s.showStatus);
     CHECK(s.logDetail == LogDetail::Normal);
-    CHECK_EQ(warnings.size(), std::size_t{4});
+    CHECK_EQ(warnings.size(), std::size_t{3});
 
     // a getter that throws gives the default
     s = ReadSettings([](std::string_view, std::string_view) -> std::string { throw 1; });
     CHECK(s == Settings{});
 }
 
-TEST(SettingsDescribeHidesKeyAndAddress) {
+TEST(SettingsDescribeHidesTheAddress) {
     Settings s;
     s.serverAddress = "192.0.2.10";
-    s.accessKey = "hunter2";
     const std::string line = Describe(s);
     CHECK(line.find("192.0.2.10") == std::string::npos);
-    CHECK(line.find("hunter2") == std::string::npos);
-    CHECK(line.find("access key set") != std::string::npos);
     CHECK(line.find("server address set") != std::string::npos);
-    std::map<std::string, std::string> v = {{"accessKey", "hunter2"}, {"serverPort", "x"}};
+    CHECK(line.find("access key") == std::string::npos);
+    CHECK(line.find("check results") == std::string::npos);
+    CHECK(line.find("bridge on") == std::string::npos);
+    std::map<std::string, std::string> v = {{"serverAddress", "192.0.2.10"}, {"serverPort", "x"}};
     std::vector<std::string> warnings;
     ReadSettings([&](std::string_view k, std::string_view def) { return v.count(std::string(k)) ? v[std::string(k)] : std::string(def); }, &warnings);
-    for (const auto& w : warnings) CHECK(w.find("hunter2") == std::string::npos);
+    for (const auto& w : warnings) CHECK(w.find("192.0.2.10") == std::string::npos);
 }
 
 // The shipped schema says what the DLL does: every key, its type, default and range, in the same order.
@@ -200,43 +211,219 @@ TEST(SettingsSchemaMatchesTheDll) {
     CHECK(yaml.find(std::string("version: \"") + kVersionText + "\"") != std::string::npos);
 }
 
-// ---- the status texts
+// ---- the status texts and the monitor
 
 TEST(StatusTexts) {
     StatusFacts f;
-    f.enabled = false;
-    CHECK_EQ(LoadStatusText(f), std::string("BFA Remote Bridge: off."));
-    f.enabled = true;
     CHECK_EQ(LoadStatusText(f), std::string("BFA Remote Bridge: Better Facial Animations wasn't found, so the bridge is idle."));
     f.bfaFound = true;
-    f.bfaVersion = "4.3.2";
-    CHECK(LoadStatusText(f).find("couldn't attach") != std::string::npos);
-    f.knownBfa = false;  // another BFA than 4.3.x: never attached to
-    CHECK_EQ(LoadStatusText(f),
-             std::string("BFA Remote Bridge: this Better Facial Animations uses an ONNX Runtime the bridge doesn't know, so BFA runs as usual."));
-    f.knownBfa = true;
+    f.bfaVersion = "4.4.0";
+    f.problem = "it doesn't look ONNX Runtime up the way the bridge knows";
+    CHECK_EQ(LoadStatusText(f), std::string("BFA Remote Bridge: couldn't attach to Better Facial Animations 4.4.0 (it doesn't look ONNX "
+                                            "Runtime up the way the bridge knows), so BFA runs on this PC as it would without the "
+                                            "bridge. Update the bridge."));
     f.hooked = true;
-    CHECK(LoadStatusText(f).find("no server address is set") != std::string::npos);
-    f.skyrimNet = false;
-    CHECK(LoadStatusText(f).find("SkyrimNet wasn't found") != std::string::npos);
-    f.skyrimNet = true;
-    f.addressSet = true;
-    CHECK(LoadStatusText(f).empty());  // the model loads tell
-
-    Notice n;
-    n.model = "a2f3_fp16.onnx";
-    CHECK_EQ(NoticeText(n, "4.3.2"), std::string("BFA Remote Bridge: on. Better Facial Animations 4.3.2 found; the server runs its model."));
-    n.kind = Notice::Kind::NoAnswer;
-    CHECK(NoticeText(n, "4.3.2").find("Start the server, then reload the model in BFA's menu or restart.") != std::string::npos);
-    n.kind = Notice::Kind::Missing;
-    CHECK_EQ(NoticeText(n, "4.3.2"),
-             std::string("BFA Remote Bridge: the server lacks a2f3_fp16.onnx or has a different copy; lip sync is the game's own."));
-    n.kind = Notice::Kind::GpuMode;  // the owner's approved text, word for word
-    CHECK_EQ(NoticeText(n, "4.3.2"), std::string("BFA Remote Bridge: BFA is set to GPU. Its Force CPU setting keeps it off this PC's graphics card."));
-    for (auto k : {Notice::Kind::WrongKey, Notice::Kind::CouldNotLoad, Notice::Kind::UnknownRuntime}) {
-        n.kind = k;
-        CHECK(NoticeText(n, "4.3.2").rfind("BFA Remote Bridge: ", 0) == 0);
+    CHECK(LoadStatusText(f).empty());  // the monitor's lines follow
+    CHECK_EQ(CantServeText("4.5.0", "1.31.0", true), std::string("BFA Remote Bridge: Better Facial Animations 4.5.0 uses ONNX Runtime 1.31.0, "
+                                                               "which the bridge can't serve, so lip sync is the game's own. Update the bridge."));
+    CHECK(CantServeText("3.0.0", "1.9.0", false).find("Update Better Facial Animations.") != std::string::npos);
+    CHECK(NoServerText(true).find("no server address is set, so lip sync is the game's own") != std::string::npos);
+    CHECK(NoServerText(false).find("SkyrimNet wasn't found") != std::string::npos);
+    CHECK(GpuText().find("Tick Force CPU in BFA's menu") != std::string::npos);
+    CHECK_EQ(DeviceText("DirectML 3: NVIDIA GeForce RTX 5090"), std::string("NVIDIA GeForce RTX 5090 (DirectML 3)"));
+    CHECK_EQ(DeviceText("CPU"), std::string("CPU"));
+    CHECK_EQ(DeviceText("CPU: "), std::string("CPU: "));
+    CHECK_EQ(ModelLine("a2f3_fp16.onnx", "PandorumLLM v3.97-p6 Beta A2F", "DirectML 3: NVIDIA GeForce RTX 5090", "ready"),
+             std::string("BFA Remote Bridge: a2f3_fp16.onnx on NVIDIA GeForce RTX 5090 (DirectML 3), PandorumLLM v3.97-p6 Beta A2F: ready"));
+    CHECK_EQ(FallbackLine("a2f3_fp16.onnx", ReasonWords(Reason::TimedOut)),
+             std::string("BFA Remote Bridge: a2f3_fp16.onnx: lines get the game's own lip sync, since the server didn't answer in time."));
+    CHECK_EQ(BackLine("a2f3_fp16.onnx"), std::string("BFA Remote Bridge: a2f3_fp16.onnx: lines are back on the server."));
+    // every note starts so, for a SkyrimNet trigger to tell them apart; plain words, no emoji
+    for (std::size_t i = 0; i < kReasonCount; ++i) {
+        const std::string w = ReasonWords(static_cast<Reason>(i));
+        CHECK(!w.empty());
+        for (unsigned char c : FallbackLine("", w)) CHECK(c < 0x80);
     }
+    for (const std::string& t : {NoServerText(true), NoServerText(false), GpuText(), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
+        CHECK(t.rfind("BFA Remote Bridge: ", 0) == 0);
+        for (unsigned char c : t) CHECK(c < 0x80);
+    }
+}
+
+namespace {
+Clock::time_point g_monitorNow = Clock::time_point{} + std::chrono::hours(1);
+Clock::time_point MonitorNow() { return g_monitorNow; }
+}  // namespace
+
+TEST(MonitorLinesAndTheirRate) {
+    Monitor m(&MonitorNow);
+    std::vector<std::string> notes;
+    m.SetSink([&](const std::string& t) { notes.push_back(t); });  // the one function every note goes through
+    const std::string server = "PandorumLLM v3.97-p6 Beta A2F", card = "DirectML 3: NVIDIA GeForce RTX 5090";
+    m.ModelState("a2f3_fp16.onnx", server, card, "ready", true);
+    CHECK_EQ(notes.size(), std::size_t{1});
+    CHECK_EQ(notes[0], std::string("BFA Remote Bridge: a2f3_fp16.onnx on NVIDIA GeForce RTX 5090 (DirectML 3), PandorumLLM v3.97-p6 Beta A2F: ready"));
+    m.ModelState("a2f3_fp16.onnx", server, card, "ready", true);  // unchanged: nothing
+    CHECK_EQ(notes.size(), std::size_t{1});
+    m.ModelState("a2f3_fp16.onnx", server, "DirectML 0: Another card", "ready", true);  // the card changed
+    CHECK_EQ(notes.size(), std::size_t{2});
+    // a fallback: the first note, then at most one a minute while it lasts
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    m.Fallback(Reason::Paused, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{3});
+    CHECK(notes.back().find("since the server didn't answer in time") != std::string::npos);
+    g_monitorNow += std::chrono::seconds(59);
+    m.Fallback(Reason::Paused, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{3});
+    g_monitorNow += std::chrono::seconds(1);
+    m.Fallback(Reason::Paused, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{4});
+    CHECK(notes.back().find("since the bridge is reconnecting to the server") != std::string::npos);
+    CHECK(m.InFallback());
+    // back on the server: once
+    m.Answered("a2f3_fp16.onnx");
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{5});
+    CHECK_EQ(notes.back(), std::string("BFA Remote Bridge: a2f3_fp16.onnx: lines are back on the server."));
+    // lines that alternate (one in five missed): still at most one fallback note and one back note a minute
+    for (int i = 0; i < 20; ++i) {
+        g_monitorNow += std::chrono::seconds(2);
+        m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+        m.Answered("a2f3_fp16.onnx");
+    }
+    CHECK_EQ(notes.size(), std::size_t{5});  // 40 s since the last of each: none
+    g_monitorNow += std::chrono::seconds(20);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{7});  // a minute on: one of each
+    for (int i = 0; i < 20; ++i) {
+        g_monitorNow += std::chrono::seconds(2);
+        m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+        m.Answered("a2f3_fp16.onnx");
+    }
+    CHECK_EQ(notes.size(), std::size_t{7});
+    // a back line names its model only when the fallback note named the same one
+    g_monitorNow += std::chrono::seconds(60);
+    m.Fallback(Reason::ServerError, "emotion_fp16.onnx", "the server couldn't run it");
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{9});
+    CHECK_EQ(notes.back(), std::string("BFA Remote Bridge: lines are back on the server."));
+    // a back note held by the minute comes with a later answer
+    g_monitorNow += std::chrono::seconds(60);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{10});
+    g_monitorNow += std::chrono::seconds(1);
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{11});
+    g_monitorNow += std::chrono::seconds(59);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{12});
+    m.Answered("a2f3_fp16.onnx");  // within the minute of the last back note: held
+    CHECK_EQ(notes.size(), std::size_t{12});
+    g_monitorNow += std::chrono::seconds(1);
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{13});
+    CHECK(!m.InFallback());
+    notes.resize(6);
+    // once per session
+    m.Once("gpu", "BFA Remote Bridge: gpu");
+    m.Once("gpu", "BFA Remote Bridge: gpu");
+    CHECK_EQ(notes.size(), std::size_t{7});
+    // status on load: the lines at a load, and a ready line, only while it allows them; a problem always
+    m.Loaded();
+    CHECK_EQ(notes.size(), std::size_t{8});  // the one model it knows
+    m.SetShowStatus(false);
+    m.Loaded();
+    m.ModelState("emotion_fp16.onnx", server, card, "ready", true);
+    CHECK_EQ(notes.size(), std::size_t{8});
+    m.ModelState("emotion_fp16.onnx", server, card, "not ready (different file)", false);
+    CHECK_EQ(notes.size(), std::size_t{9});
+    m.Forget("emotion_fp16.onnx");
+    m.SetShowStatus(true);
+    notes.clear();
+    m.Loaded();
+    CHECK_EQ(notes.size(), std::size_t{1});
+    for (const auto& n : notes) CHECK(n.rfind("BFA Remote Bridge: ", 0) == 0);
+}
+
+// ---- the runtime's API versions
+
+// The first entry of each API version, as the bridge lists it, is the vendored header's: the entry right after the
+// first "\since Version 1.N" note inside struct OrtApi, and no entry before it carries that version.
+TEST(OrtApiStartsMatchTheHeader) {
+    const std::string header = ReadText(std::filesystem::path(kRepo) / "third_party/onnxruntime/onnxruntime_c_api.h");
+    const auto begin = header.find("\nstruct OrtApi {");
+    CHECK(begin != std::string::npos);
+    const auto end = header.find("\n};", begin);
+    std::istringstream in(header.substr(begin, end - begin));
+    std::map<unsigned, std::string> firstOf;
+    unsigned since = 0, pending = 0;
+    std::string line;
+    const auto entryName = [](const std::string& l) -> std::string {
+        // ORT_API_T(RETURN_TYPE, NAME, ...): the name is the second argument
+        if (const auto at = l.find("ORT_API_T("); at != std::string::npos) {
+            const auto comma = l.find(',', at);
+            if (comma == std::string::npos) return {};
+            const auto from = l.find_first_not_of(' ', comma + 1);
+            return l.substr(from, l.find_first_of(",)", from) - from);
+        }
+        for (const char* m : {"ORT_API2_STATUS(", "ORT_CLASS_RELEASE("}) {
+            const auto at = l.find(m);
+            if (at == std::string::npos) continue;
+            const auto from = at + std::strlen(m);
+            const auto to = l.find_first_of(",)", from);
+            const std::string n = l.substr(from, to - from);
+            return std::string(m) == "ORT_CLASS_RELEASE(" ? "Release" + n : n;
+        }
+        const auto star = l.find("ORT_API_CALL* ");
+        if (star == std::string::npos) return {};
+        const auto from = star + std::strlen("ORT_API_CALL* ");
+        return l.substr(from, l.find(')', from) - from);
+    };
+    while (std::getline(in, line)) {
+        const auto at = line.find("\\since Version 1.");
+        if (at != std::string::npos) {
+            const unsigned v = static_cast<unsigned>(std::stoul(line.substr(at + 17)));
+            if (v > since) pending = v;
+            since = std::max(since, v);
+            continue;
+        }
+        const std::string name = entryName(line);
+        if (name.empty() || line.find("//") < line.find(name)) continue;
+        if (pending) {
+            firstOf[pending] = name;
+            pending = 0;
+        }
+    }
+    const auto& starts = OrtApiStarts();
+    CHECK_EQ(starts.size(), firstOf.size());
+    std::size_t last = 0;
+    for (const OrtApiStart& s : starts) {
+        CHECK_EQ(firstOf[s.version], std::string(s.name));
+        CHECK(s.index > last);
+        last = s.index;
+    }
+    CHECK_EQ(kKnownOrtEntries, std::size_t{415});
+    // each version's count pinned to ONNX Runtime's own static_asserts (onnxruntime_c_api.cc, "Size of version N"),
+    // not to the bridge's list
+    const std::map<unsigned, std::size_t> published = {{10, 204}, {11, 210}, {12, 219}, {13, 225}, {14, 239}, {15, 255},
+                                                       {16, 266}, {17, 276}, {18, 280}, {19, 280}, {20, 285}, {21, 285},
+                                                       {22, 318}, {23, 390}, {24, 415}};
+    for (const auto& [version, count] : published) CHECK_EQ(OrtApiEntries(version), count);
+    CHECK_EQ(OrtApiEntries(9), std::size_t{0});
+    CHECK_EQ(OrtApiEntries(10), starts.front().index);
+    CHECK_EQ(OrtApiEntries(18), OrtApiEntries(19));  // 19 and 21 added nothing
+    CHECK_EQ(OrtApiEntries(20), OrtApiEntries(21));
+    CHECK(OrtApiEntries(23) < OrtApiEntries(24));
+    CHECK_EQ(OrtApiEntries(24), kKnownOrtEntries);
+    CHECK_EQ(OrtApiEntries(26), kKnownOrtEntries);
+    CHECK_EQ(OrtApiVersionOf("1.24.4"), 24u);
+    CHECK_EQ(OrtApiVersionOf("1.9.0"), 9u);
+    CHECK_EQ(OrtApiVersionOf("1.26.0-dev"), 26u);
+    CHECK_EQ(OrtApiVersionOf("2.0.0"), 0u);
+    CHECK_EQ(OrtApiVersionOf("1."), 0u);
+    CHECK_EQ(OrtApiVersionOf("1.2x"), 0u);
+    CHECK_EQ(OrtApiVersionOf(nullptr), 0u);
 }
 
 // ---- PE reads

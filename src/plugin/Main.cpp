@@ -2,17 +2,18 @@
 //
 //   load            the log (BFARemoteBridge.log in SKSE's log folder), VR refused, the messaging listener
 //   post-load       every plugin is loaded: find Better Facial Animations, read its version, attach to its lookup of
-//                   ONNX Runtime (Hook.cpp); note whether SkyrimNet is loaded, so a model load waits for its settings;
-//                   and, once attached, allow the client's background thread (src/core/Client.h)
+//                   ONNX Runtime (Hook.cpp), whatever its version; note whether SkyrimNet is loaded, so a model load
+//                   waits for its settings; and, once attached, allow the client's background thread (src/core/Client.h)
 //   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
-//   main menu,      registered them; also whenever that page is saved. The first read with the bridge on and an
-//   pre-load game   address starts the background thread, which looks the server's name up (again after each change
+//   main menu,      registered them; also whenever that page is saved. The first read with a server address set
+//   pre-load game   starts the background thread, which looks the server's name up (again after each change
 //                   of the address or port), says HELLO with no models and logs the answer
-//   game loaded     the settings again; at the first load, the status notification (setting showStatus), and the
-//                   model loads' notices held until then
+//   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
+//                   the monitor's lines (src/core/Monitor.h; setting showStatus)
 //
-// A model load's outcome comes later, on BFA's worker thread; its notice goes to the game's main thread through SKSE's
-// task interface. Nothing here waits for the network: the client's Configure never does.
+// Every note goes through ShowNote, the one seam for SkyrimNet's notification call once it has one. A model load's
+// outcome comes later, on BFA's worker thread; its note goes to the game's main thread through SKSE's task interface.
+// Nothing here waits for the network: the client's Configure never does.
 //
 // At process exit: the bridge, its client and the background thread live until the process ends and are never
 // destroyed, so nothing joins the thread in a static destructor during DLL unload (which could deadlock). Windows ends
@@ -35,7 +36,6 @@ bool g_settingsRead = false;  // main thread only
 std::mutex g_noticeMutex;
 bool g_gameLoaded = false;
 std::vector<std::string> g_pending;
-std::string g_lastShown;
 
 spdlog::logger* g_log = nullptr;  // never destroyed: see the top of this file
 
@@ -56,16 +56,8 @@ void OpenLog() {
 
 bool ShowStatus() { return g_bridge && g_bridge->CurrentSettings().showStatus; }
 
-// On the main thread, now or at the first game load; the same line twice in a row is shown once.
-void Notify(const std::string& text) {
-    if (text.empty()) return;
-    std::lock_guard lock(g_noticeMutex);
-    if (text == g_lastShown) return;
-    g_lastShown = text;
-    if (!g_gameLoaded) {
-        g_pending.push_back(text);
-        return;
-    }
+// Skyrim's corner note, on the main thread.
+void CornerNote(const std::string& text) {
     if (const auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([text] { RE::DebugNotification(text.c_str()); });
 }
 
@@ -75,7 +67,9 @@ void ApplySettings(const char* when) {
     std::vector<std::string> warnings;
     const SettingsRead read = ReadSkyrimNetSettings(s, warnings);
     if (read == SettingsRead::NoSkyrimNet) {
-        if (!g_settingsRead) Log(Level::Warn, std::string("SkyrimNet isn't loaded (") + when + "): the bridge is idle and BFA runs as usual");
+        if (!g_settingsRead)
+            Log(Level::Warn, std::string("SkyrimNet isn't loaded (") + when +
+                                 "): the bridge has no server address, so BFA's model loads are refused and lip sync is the game's own");
         return;
     }
     if (read == SettingsRead::NotRegistered) {
@@ -85,7 +79,7 @@ void ApplySettings(const char* when) {
     g_settingsRead = true;
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
-    g_bridge->Apply(s);  // starts the background thread once the bridge is on with an address
+    g_bridge->Apply(s);  // starts the background thread once a server address is set
 }
 
 class ConfigSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent> {
@@ -117,27 +111,27 @@ public:
 void OnGameLoaded() {
     ApplySettings("game loaded");
     std::vector<std::string> pending;
+    bool first = false;
     {
         std::lock_guard lock(g_noticeMutex);
-        if (g_gameLoaded) return;
+        first = !g_gameLoaded;
         g_gameLoaded = true;
         pending.swap(g_pending);
     }
-    if (!ShowStatus()) return;
-    const Settings s = g_bridge->CurrentSettings();
-    StatusFacts f;
-    f.enabled = s.enabled;
-    f.skyrimNet = g_skyrimNet;
-    f.bfaFound = g_bfa.found;
-    f.bfaVersion = g_bfa.version;
-    f.knownBfa = g_bfa.knownVersion;
-    f.hooked = g_bfa.hooked;
-    f.addressSet = !s.serverAddress.empty();
-    const std::string status = LoadStatusText(f);
-    const auto* tasks = SKSE::GetTaskInterface();
-    if (!tasks) return;
-    if (!status.empty()) tasks->AddTask([status] { RE::DebugNotification(status.c_str()); });
-    for (const auto& text : pending) tasks->AddTask([text] { RE::DebugNotification(text.c_str()); });
+    if (first) {
+        StatusFacts f;
+        f.bfaFound = g_bfa.found;
+        f.bfaVersion = g_bfa.version;
+        f.hooked = g_bfa.hooked;
+        f.problem = g_bfa.problem;
+        // BFA missing is a status (Status on load); the bridge unable to attach is said either way
+        const std::string status = LoadStatusText(f);
+        if (!status.empty() && (!g_bfa.found ? ShowStatus() : true)) ShowNote(status);
+        if (g_bfa.hooked && g_bridge->CurrentSettings().serverAddress.empty())
+            g_bridge->Notes().Once("noserver", NoServerText(g_skyrimNet));
+    }
+    for (const auto& text : pending) CornerNote(text);  // each came through ShowNote already, held until now
+    if (g_bfa.hooked) g_bridge->Notes().Loaded();  // every model's line, while Status on load allows it
 }
 
 void OnSkse(SKSE::MessagingInterface::Message* message) {
@@ -148,6 +142,7 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 g_bfa = FindAndHookBfa();
                 g_skyrimNet = SkyrimNetLoaded();
                 g_bridge->ExpectSettings(g_skyrimNet);
+                g_bridge->Connection().SetBfaVersion(g_bfa.version);
                 if (g_bfa.hooked) g_bridge->Connection().StartBackground();
                 break;
             case SKSE::MessagingInterface::kDataLoaded: {
@@ -177,6 +172,18 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
 
 }  // namespace
 
+void ShowNote(const std::string& text) {
+    if (text.empty()) return;
+    {
+        std::lock_guard lock(g_noticeMutex);
+        if (!g_gameLoaded) {
+            g_pending.push_back(text);
+            return;
+        }
+    }
+    CornerNote(text);
+}
+
 void Log(Level level, const std::string& line) {
     if (!g_log) return;
     try {
@@ -204,9 +211,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     }
     g_bridge = new Bridge(WinsockFactory(), &WinsockResolve, [](Level level, const std::string& line) { Log(level, line); });
     Bridge::SetCurrent(g_bridge);
-    g_bridge->OnNotice([](const Notice& n) {
-        if (ShowStatus()) Notify(NoticeText(n, g_bfa.version));
-    });
+    g_bridge->Notes().SetSink([](const std::string& text) { ShowNote(text); });
     const auto* messaging = SKSE::GetMessagingInterface();
     if (!messaging || !messaging->RegisterListener(OnSkse)) {
         Log(Level::Error, "SKSE's messaging interface isn't there: the bridge stays off");
