@@ -205,6 +205,10 @@ public:
     // The search for the server on the local network (the plugin's: Winsock and the adapter list Windows reports).
     // Without one, an empty address finds nothing.
     void SetDiscovery(DiscoveryFactory discovery);
+    // The protocol version the server answered in, each time it changes (1 or 2; again after the address changes).
+    // Called on whichever thread learnt it, maybe with the connection's lock held: the sink must not wait or call the
+    // client (the plugin's queues a task for the game's main thread).
+    void OnVersion(std::function<void(std::uint16_t)> sink);
     void SetOrtVersion(const std::string& version);
     void SetBfaVersion(const std::string& version);
     Versions CurrentVersions() const;
@@ -354,6 +358,7 @@ private:
     Versions versions_;
     StatesSink states_;
     DiscoveryFactory discovery_;
+    std::function<void(std::uint16_t)> versionSink_;
     bool configured_ = false;  // Configure was called: the settings were read
     // what the last search found: kept until a lost connection makes it stale, or the address or port setting changes
     struct Found {

@@ -21,6 +21,10 @@ alone, as PandorumLLM v3.97-p6 and earlier). A first frame of a version it doesn
 newest version it speaks, and the connection closes; so does a later frame of another version. Version 2 adds
 NOTICE (one-way, logged; --notice-log FILE appends each as a JSON line) and, with --remote-ip ADDRESS, FIND and FOUND
 on UDP on the same port: a FIND from that address alone is answered with FOUND, at most one a second.
+
+The sizes rule (version 2, and PandorumLLM's patch7 in version 1): a HELLO that lists no overrides for a file of
+BFA 4.3.2.3's set gets that set's sizes, with the detail "built with BFA 4.3.2.3's sizes"; one that lists overrides
+is served as listed. This server holds no such table: --fill-sizes gives one for its test files.
 """
 
 import argparse
@@ -46,6 +50,9 @@ MAX_PAYLOAD = 64 * 1024 * 1024
 HELLO, HELLO_OK, RUN, RUN_OK, ERROR, PING, PONG = 1, 2, 3, 4, 5, 6, 7
 FIND, FOUND, NOTICE = 8, 9, 10  # version 2: FIND and FOUND on UDP only, NOTICE one-way on TCP
 FOUND_EVERY = 1.0  # at most one FOUND a second
+# the row's detail when the sizes were filled in (the agreed words; with --fill-sizes the test files stand in for
+# BFA 4.3.2.3's)
+FILLED_DETAIL = "built with BFA 4.3.2.3's sizes"
 
 READY, NOT_FOUND, DIFFERENT_FILE, FAILED_TO_LOAD, NOT_ALLOWED = 0, 1, 2, 3, 4
 
@@ -189,8 +196,9 @@ def file_digest(path):
 class Models:
     """The model folder and the sessions built from it: one per (name, overrides), kept until the server stops."""
 
-    def __init__(self, folder, providers, allowed=None, optimization="extended", threads=0):
+    def __init__(self, folder, providers, allowed=None, optimization="extended", threads=0, fill=None):
         self.folder = folder
+        self.fill = fill or {}  # SHA-256 -> [(dim, value)]: the sizes filled in when a HELLO lists none
         self.threads = threads
         self.providers = providers
         self.optimization = optimization
@@ -220,6 +228,10 @@ class Models:
         have_size, have_sha = self.digest(path)
         if have_size != size or have_sha != sha:
             return DIFFERENT_FILE, "the file here has another size or SHA-256", None
+        # the sizes rule: a HELLO that lists none gets the set's own, for a file of that set alone (by SHA-256)
+        filled = not overrides and sha in self.fill
+        if filled:
+            overrides = self.fill[sha]
         key = (name, tuple(overrides))
         with self.lock:
             entry = self.sessions.get(key)
@@ -242,7 +254,7 @@ class Models:
                     entry["error"] = self.scrub(e)
             if entry["error"] is not None:
                 return FAILED_TO_LOAD, entry["error"], None
-        return READY, "", key
+        return READY, FILLED_DETAIL if filled else "", key
 
     def scrub(self, error):
         """The runtime's message, its first line, with the model folder's path cut (a client never sees it)."""
@@ -519,6 +531,9 @@ def main(argv=None):
     p.add_argument("--remote-ip", default="",
                    help="answer FIND (UDP, on the same port) from this address alone, as PandorumLLM's Remote IP (empty: no FIND)")
     p.add_argument("--notice-log", default="", help="append each NOTICE to this file, one JSON object a line")
+    p.add_argument("--fill-sizes", action="append", default=[], metavar="SHA256:DIM=VALUE[,DIM=VALUE]",
+                   help="the sizes rule, for test files: a HELLO that lists no overrides for the file of this SHA-256 (hex) "
+                        "gets these, and the row's detail says so; repeatable")
     cfg = p.parse_args(argv)
 
     providers = [x for x in cfg.providers.split(",") if x]
@@ -531,7 +546,11 @@ def main(argv=None):
     server.idle_seconds = cfg.idle_seconds or None
     server.fault_lock = threading.Lock()
     server.faults_used = 0
-    server.models = Models(cfg.models, providers, allowed, cfg.optimization, cfg.threads)
+    fill = {}
+    for spec in cfg.fill_sizes:
+        digest, _, dims = spec.partition(":")
+        fill[bytes.fromhex(digest)] = [(d, int(v)) for d, _, v in (x.partition("=") for x in dims.split(",") if x)]
+    server.models = Models(cfg.models, providers, allowed, cfg.optimization, cfg.threads, fill)
     server.name = "BFA Remote Bridge reference server (onnxruntime %s)" % ort.__version__
     server.device = ", ".join(providers)
     server.log = (lambda line: None) if cfg.quiet else (lambda line: print(line, file=sys.stderr, flush=True))

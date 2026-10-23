@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "core/BfaMode.h"
 #include "core/Bridge.h"
 #include "core/Settings.h"
 #include "core/Transport.h"
@@ -45,6 +46,12 @@ bool WinsockStarted();  // WSAStartup, once
 // FIND and FOUND on UDP: FIND to each IPv4 adapter's own broadcast address, from the adapter list Windows reports
 // (GetAdaptersAddresses: adapters that are up, not loopback, prefixes shorter than /31), never to 255.255.255.255.
 DiscoveryFactory WinsockDiscovery();
+
+// ---- BfaIni.cpp
+
+// BFA's INI (Data\SKSE\Plugins\BetterFacialAnimations.ini, the relative path BFA itself uses) and the bridge's own
+// state (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] FoundForceCPU), through Windows' profile calls, as BFA's.
+std::unique_ptr<IniStore> BfaIniStore();
 
 // ---- Main.cpp
 

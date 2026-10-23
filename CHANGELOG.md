@@ -24,15 +24,29 @@ own: players go from 1.1.1 straight to 1.3.0.
   the background thread: the model, the reason's word, the detail (on one line, as shown on screen) and the lines
   since the last NOTICE; at most one a minute, as the fallback note, and only while no request there awaits an
   answer. A version 1 server is told by 1.2.0's status check with `fallback REASON` instead.
-- **No hardware advice.** Every hardware choice is PandorumLLM's, BFA's own Force CPU included: the on-screen note
-  "BFA is set to GPU ... Tick Force CPU" is gone, and BFA's GPU mode is logged once, as a fact, at Log detail
-  Detailed only. The measurement behind it is in the agreement's "To measure": with no sizes listed, the server fills
-  in BFA 4.3.2.3's (PandorumLLM's patch, to be confirmed).
+- **No hardware advice.** Every hardware choice is PandorumLLM's, BFA's own Force CPU included, and neither side
+  advises on BFA's GPU or CPU setting: the on-screen note "BFA is set to GPU ... Tick Force CPU", its code and tests
+  are gone, and BFA's GPU mode is logged once, as a fact, at Log detail Detailed only.
+- **BFA's mode, set by the bridge.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA
+  to its CPU mode itself, from the next game start, so BFA opens nothing on this PC's graphics card; the model still
+  runs on the server. Once a server has answered in version 2 this session, it writes `[General] ForceCPU=1` in
+  BFA's `BetterFacialAnimations.ini` (the relative path BFA uses), and again at each game save (SKSE's save message),
+  so a save of BFA's menu in the session can't undo it. The first time, it records the value it found in its own
+  `SKSE/Plugins/BFARemoteBridge.ini`; a server that answers only in version 1 gets that value put back. One log
+  line, no setting, no note. The rule is `src/core/BfaMode.h`, the files `src/plugin/BfaIni.cpp`, behind an IniStore
+  seam. If you remove the bridge, BFA keeps the CPU mode the bridge set; BFA's own menu shows it.
+- **The sizes rule** ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5): every version 2 server, given
+  a HELLO that lists no overrides for a file of BFA 4.3.2.3's set (by SHA-256), fills in that set's sizes and says so
+  in the row's detail, so BFA's CPU mode is served (PandorumLLM's patch7 does the same in version 1). The bridge
+  tells a server's version by its frames alone, never by a detail's words, so it sets BFA's CPU mode only for a
+  version 2 server.
 - **The settings page:** the Server address and Port texts say that an empty address means the server is found on
   the local network.
-- **The reference server** speaks both versions (`--v1-only` for version 1 alone), logs NOTICE (`--notice-log`), and
-  answers FIND from its `--remote-ip` alone, at most once a second. The tests run the bridge against it in both
-  versions, a version 1 server refusing the version 2 HELLO, and find it on the loopback address.
+- **The reference server** speaks both versions (`--v1-only` for version 1 alone), logs NOTICE (`--notice-log`),
+  answers FIND from its `--remote-ip` alone, at most once a second, and fills in sizes for its test files when a HELLO
+  lists none (`--fill-sizes`), so a test shows that BFA's mode follows the version, not the detail. The tests run
+  the bridge against it in both versions, a version 1 server refusing the version 2 HELLO, and find it on the
+  loopback address.
 
 ## 1.2.0
 

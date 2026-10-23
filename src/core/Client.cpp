@@ -421,6 +421,11 @@ void Client::SetDiscovery(DiscoveryFactory discovery) {
     discovery_ = std::move(discovery);
 }
 
+void Client::OnVersion(std::function<void(std::uint16_t)> sink) {
+    std::lock_guard lock(configMutex_);
+    versionSink_ = std::move(sink);
+}
+
 std::uint16_t Client::ServerVersion() const {
     std::lock_guard lock(configMutex_);
     return serverVersion_;
@@ -440,12 +445,21 @@ std::uint16_t Client::VersionFor(const std::string& key) const {
 
 // What the server at key answered in: a version 1 server is spoken to in version 1 from now on, logged once.
 void Client::LearnVersion(const std::string& key, std::uint16_t version) {
-    bool first = false;
+    bool first = false, changed = false;
+    std::function<void(std::uint16_t)> sink;
     {
         std::lock_guard lock(configMutex_);
-        first = version == proto::kVersion1 && !(versionKey_ == key && serverVersion_ == proto::kVersion1);
+        changed = !(versionKey_ == key && serverVersion_ == version);
+        first = version == proto::kVersion1 && changed;
         versionKey_ = key;
         serverVersion_ = version;
+        if (changed) sink = versionSink_;
+    }
+    if (sink) {
+        try {
+            sink(version);
+        } catch (...) {
+        }
     }
     if (first)
         Log(Level::Info,

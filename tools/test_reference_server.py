@@ -495,6 +495,28 @@ class ReferenceServerTests(unittest.TestCase):
         self.assertIsNone(u.ask(self.other_server("--remote-ip", "127.0.0.1", "--v1-only"), find()))
         self.assertIsNone(u.ask(self.port, find()))  # no Remote IP: no FIND
 
+    def test_the_sizes_are_filled_in_when_a_hello_lists_none(self):
+        port = self.other_server("--fill-sizes", self.entry[2].hex() + ":batch=2")
+        details = []
+        for overrides in ([], [("batch", 2)]):
+            c = self.connect(port)
+            c.send(hello("sesame", [(self.entry[0], self.entry[1], self.entry[2], overrides)], version=2))
+            kind, payload = c.answer()
+            self.assertEqual(kind, 2)
+            at = 0
+            for _ in range(2):
+                (n,) = struct.unpack_from("<H", payload, at)
+                at += 2 + n
+            at += 2
+            (n,) = struct.unpack_from("<H", payload, at)
+            at += 2 + n
+            status = payload[at]
+            (n,) = struct.unpack_from("<H", payload, at + 1)
+            details.append((status, payload[at + 3:at + 3 + n].decode()))
+            c.send(run(61, "tiny.onnx", tiny_inputs(1), ["y"], version=2))  # batch 2 either way
+            self.assertEqual(c.answer()[0], 4)
+        self.assertEqual(details, [(0, "built with BFA 4.3.2.3's sizes"), (0, "")])
+
 
 if __name__ == "__main__":
     MODELS = sys.argv.pop(1)

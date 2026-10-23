@@ -11,6 +11,9 @@
 //                   models and logs the answer
 //   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
 //                   the monitor's lines (src/core/Monitor.h; setting showStatus)
+//   game saved      BFA's CPU mode written again, while a server answered in protocol version 2 this session
+//                   (src/core/BfaMode.h); the server's version itself comes from the client, as a task on the main
+//                   thread
 //
 // Every note goes through ShowNote, the one seam for SkyrimNet's notification call once it has one. A model load's
 // outcome comes later, on BFA's worker thread; its note goes to the game's main thread through SKSE's task interface.
@@ -30,6 +33,7 @@ namespace bfarb::plugin {
 namespace {
 
 Bridge* g_bridge = nullptr;  // lives until the game exits: BFA's worker may call it at any time
+BfaCpuMode* g_mode = nullptr;  // BFA's mode, set by the bridge (core/BfaMode.h); main thread only
 BfaFacts g_bfa;
 std::atomic<bool> g_skyrimNet{false};
 bool g_settingsRead = false;  // main thread only
@@ -160,6 +164,9 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
             case SKSE::MessagingInterface::kPreLoadGame:
                 ApplySettings("before a game loads");
                 break;
+            case SKSE::MessagingInterface::kSaveGame:
+                if (g_mode) g_mode->OnGameSave();  // BFA's menu may have saved its file since: its CPU mode again
+                break;
             case SKSE::MessagingInterface::kPostLoadGame:
             case SKSE::MessagingInterface::kNewGame:
                 OnGameLoaded();
@@ -212,6 +219,12 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     }
     g_bridge = new Bridge(WinsockFactory(), &WinsockResolve, [](Level level, const std::string& line) { Log(level, line); });
     g_bridge->Connection().SetDiscovery(WinsockDiscovery());  // an empty address: FIND on each adapter's broadcast address
+    g_mode = new BfaCpuMode(BfaIniStore(), [](Level level, const std::string& line) { Log(level, line); });
+    // the version the server answered in, on the game's main thread: BFA's CPU mode with version 2, its own value back
+    // with version 1
+    g_bridge->Connection().OnVersion([](std::uint16_t version) {
+        if (const auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([version] { g_mode->OnServerVersion(version); });
+    });
     Bridge::SetCurrent(g_bridge);
     g_bridge->Notes().SetSink([](const std::string& text) { ShowNote(text); });
     const auto* messaging = SKSE::GetMessagingInterface();

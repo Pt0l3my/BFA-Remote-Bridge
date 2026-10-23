@@ -25,7 +25,9 @@
 #include "PosixDiscovery.h"
 #include "PosixTransport.h"
 #include "Test.h"
+#include "core/BfaMode.h"
 #include "core/Bridge.h"
+#include "core/Sha256.h"
 #include "core/Scrub.h"
 #include "core/Status.h"
 
@@ -760,6 +762,57 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     CHECK_EQ(h.bridge.Connection().HellosSent(), 2);
     h.api->ReleaseSession(a);
     fs::remove_all(folder);
+}
+
+// BFA's mode follows the version the server answers in, never a detail's words: a version 1 server that fills in
+// BFA's sizes when a HELLO lists none (as PandorumLLM's patch7 does), and says so in the row's detail, still gets BFA's
+// own mode; a version 2 server gets its CPU mode.
+namespace {
+struct MemoryIni final : IniStore {
+    int forceCpu = 0, recorded = -1;
+    int ReadForceCpu() override { return forceCpu; }
+    bool WriteForceCpu(int v, std::string&) override {
+        forceCpu = v;
+        return true;
+    }
+    int ReadRecorded() override { return recorded; }
+    bool WriteRecorded(int v, std::string&) override {
+        recorded = v;
+        return true;
+    }
+};
+}  // namespace
+
+TEST(ForwardBfaModeFollowsTheVersionNotTheDetail) {
+    Need();
+    std::uint64_t size = 0;
+    Sha256::Digest digest{};
+    std::string err;
+    CHECK(HashFile(Models() / "tiny.onnx", size, digest, err));
+    const std::string fill = Sha256::Hex(digest) + ":batch=2";
+    for (const bool v1 : {true, false}) {
+        std::vector<std::string> args = {"--fill-sizes", fill};
+        if (v1) args.push_back("--v1-only");
+        Server server(Models(), args);
+        Harness h(On(server.Port()));
+        auto store = std::make_unique<MemoryIni>();
+        MemoryIni* ini = store.get();
+        BfaCpuMode mode(std::move(store), nullptr);
+        h.bridge.Connection().OnVersion([&](std::uint16_t version) { mode.OnServerVersion(version); });
+        OrtSession* session = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {}, &session));  // BFA's CPU mode: no sizes listed
+        CHECK(h.Logged("(built with BFA 4.3.2.3's sizes)"));
+        CHECK_EQ(h.CountNotes("tiny.onnx on "), 1);
+        TinyInputs in(h.api, h.cpu, 6);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+        CHECK_EQ(h.bridge.Connection().ServerVersion(), v1 ? 1 : 2);
+        CHECK_EQ(mode.Set(), !v1);
+        CHECK_EQ(ini->forceCpu, v1 ? 0 : 1);
+        h.bridge.Connection().OnVersion(nullptr);
+        h.api->ReleaseSession(session);
+    }
 }
 
 // BFA's GPU mode is its own choice, and the hardware PandorumLLM's: the bridge passes it through, says nothing about

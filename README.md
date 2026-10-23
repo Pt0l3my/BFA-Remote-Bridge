@@ -8,7 +8,8 @@ server does.
 server:
 
 - **BFA stays installed on the gaming PC.** Its game side (catching each line, reading the audio, fitting the face
-  and moving it every frame) and its settings stay there, and its menu can stay as it is.
+  and moving it every frame) and its settings stay there. You set nothing in BFA's menu for the bridge (see
+  [BFA's mode](#bfas-mode)).
 - **PandorumLLM's PC needs BFA's files too**: the server runs BFA's models there, so it needs the same models and
   runtime as your BFA folder. See [On PandorumLLM's PC](#on-pandorumllms-pc).
 - **What still runs on the gaming PC:** BFA's game side only. The model runs on the server, on the card PandorumLLM
@@ -40,6 +41,9 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   Access key, Timeout and Check results are gone, and nothing about hardware is asked on the gaming PC.
 - **No model on the gaming PC, ever** (from 1.2.0): with no server, lip sync is the game's own.
 - **Any BFA version is tried** (from 1.2.0), and what the bridge can't serve is said on screen.
+- **BFA's mode, set by the bridge.** With a PandorumLLM server that speaks protocol version 2, the bridge switches
+  BFA to its CPU mode itself, from the next game start, so BFA opens nothing on this PC's graphics card. Nothing to
+  tick in BFA's menu, and nothing about hardware asked anywhere in Skyrim.
 - **Server texts on one line:** a server's detail (such as ONNX Runtime's message for a model that failed to load)
   is shown on one line, without folders or memory addresses, and cut at about 160 characters.
 
@@ -71,6 +75,9 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   never logged.
 - **Protocol versions.** The bridge opens each connection in protocol version 2; a server that speaks only version 1
   says so, and the bridge then speaks version 1 to it until the game restarts or the address changes.
+- **BFA's mode.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode
+  itself, from the next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the
+  server. See [BFA's mode](#bfas-mode).
 - The bridge keeps one connection for speech. When BFA loads a model, the server loads it on a short-lived connection
   of its own, so the lines of a model already loaded keep flowing meanwhile. After a minute without speech the bridge
   checks the connection (PING), so it is ready before the next line needs it.
@@ -106,7 +113,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 
 By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 
-To run BFA on its own again, disable the bridge in Mod Organizer 2.
+To run BFA on its own again, disable the bridge in Mod Organizer 2. If you remove the bridge, BFA keeps the CPU
+mode the bridge set; BFA's own menu shows it.
 
 ## On PandorumLLM's PC
 
@@ -127,13 +135,23 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 4. **Keep both copies the same version.** After updating BFA on the gaming PC, copy its folder again: a model that
    differs from the server's copy (by size or SHA-256) is refused, and its lines get the game's own lip sync.
 
-## BFA's own menu
+## BFA's mode
 
-BFA's menu can stay as it is. The hardware the model runs on is chosen in PandorumLLM, not in Skyrim: with the
-bridge, BFA's model runs on the server whichever mode BFA's own menu is in, and the bridge asks nothing about it.
-When BFA's GPU route is off, BFA sets none of the fixed input sizes its GPU route gives the runtime, and the server
-fills in BFA 4.3.2.3's own (PandorumLLM's patch, to be confirmed), so it serves BFA in either mode
-([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), "To measure").
+The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you set nothing about it on the gaming PC.
+
+- With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode itself, from the
+  next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the server. It writes
+  `ForceCPU=1` under `[General]` in BFA's own `BetterFacialAnimations.ini` (BFA reads that file once, as the game
+  starts), says so once in its log, and writes it again at each game save, so a change in BFA's menu in the same
+  session doesn't undo it. In Mod Organizer 2 the change goes to BFA's own file, in BFA's mod folder, and the
+  bridge's new file below to Overwrite.
+- The first time, the bridge keeps the value it found, in its own `SKSE/Plugins/BFARemoteBridge.ini`. With a server
+  that speaks only protocol version 1 (PandorumLLM v3.97-p6 and earlier, which can't serve BFA's CPU mode), it puts
+  that value back, from the next game start, so lip sync keeps working.
+- In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime, and a version 2 server fills
+  in BFA 4.3.2.3's own (part of protocol version 2, agreed with PandorumLLM's side;
+  [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5).
+- No setting and no note on screen: the log line is all.
 
 ## Settings
 

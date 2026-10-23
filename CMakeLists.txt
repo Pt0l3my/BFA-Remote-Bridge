@@ -65,6 +65,7 @@ find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------- core
 add_library(bfarb_core STATIC
+  src/core/BfaMode.cpp
   src/core/Bridge.cpp
   src/core/Client.cpp
   src/core/Monitor.cpp
@@ -147,6 +148,7 @@ if(BFARB_PLUGIN_DLL)
     AUTHOR "Pt0l3my"
     VERSION ${PROJECT_VERSION}
     SOURCES
+      src/plugin/BfaIni.cpp
       src/plugin/Hook.cpp
       src/plugin/Main.cpp
       src/plugin/SkyrimNet.cpp

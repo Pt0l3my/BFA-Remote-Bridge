@@ -211,6 +211,16 @@ version 2, and only the header's version says 2. HELLO and HELLO_OK gain no fiel
 and the versions it asked about already travel in version 1 (the gaming PC's in the client string, the server's in
 its `server` string).
 
+**The sizes rule.** A version 2 server, given a HELLO that lists no overrides for a model whose SHA-256 is one of BFA
+4.3.2.3's files, builds that model's session with BFA 4.3.2.3's own sizes (the free-dimension overrides BFA's GPU
+route sets, in section 1's table), and says so in the row's detail: "built with BFA 4.3.2.3's sizes". A file outside
+that set gets no sizes of the server's own, and a HELLO that lists overrides is served exactly as listed. So BFA's CPU
+route, which lists none, is served ([AGREEMENT-1.2.md](AGREEMENT-1.2.md), measurement 5, which names the two files'
+SHA-256). PandorumLLM's v3.97 patch7 does the same in version 1. The bridge never reads a detail as a sign of the
+server's version or abilities: it knows the version by the frames alone, and sets BFA's CPU mode only for a server
+that answered in version 2 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
+stands in for one with the test files.
+
 **The version rule.** Each side answers in the version the other opened with.
 
 - A connection's version is the version of its first frame, the client's HELLO. The server frames every answer on it
@@ -414,11 +424,15 @@ PandorumLLM's choice; the bridge reports it.
   real one.
 - **Everything else** BFA calls (options, providers, tensors, memory information, statuses) is the real runtime's. In
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
-  no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge advises
-  nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. BFA's CPU route
+  no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge asks the
+  player nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. It sets
+  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, it records the value
+  of `[General] ForceCPU` it found in `Data\SKSE\Plugins\BetterFacialAnimations.ini` (in its own
+  `BFARemoteBridge.ini`, the first time only) and writes `ForceCPU=1`, again at each game save (SKSE's save message)
+  so a save of BFA's menu can't undo it; BFA reads the file at its start, so it applies from the next start. A server
+  that answers only in version 1 gets the recorded value put back. Logged once, at info level; no setting, no note. BFA's CPU route
   sets no free-dimension overrides, so its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
-  (PandorumLLM's patch, to be confirmed; [AGREEMENT-1.2.md](AGREEMENT-1.2.md), "To measure"), so it serves BFA in
-  either mode.
+  (the sizes rule, ["Version 2"](#version-2)), so it serves BFA in either mode.
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
   game load (ready lines only while Status on load allows them), a model load the server refuses included, with its

@@ -1625,3 +1625,26 @@ TEST(ClientVersionRuleFollowsTheAddressFound) {
     CHECK(VersionsOf(cs.back()) == (std::vector<std::uint16_t>{1}));
     CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 2);
 }
+
+// The version the server answered in goes to the sink each time it changes (BFA's mode follows it, core/BfaMode.h):
+// nothing before an answer, 2 once however many answers, and again after the address changes; 1 from a version 1
+// server.
+TEST(ClientTellsTheServersVersion) {
+    Rig r;
+    std::vector<std::uint16_t> told;
+    r.c.OnVersion([&](std::uint16_t v) { told.push_back(v); });
+    r.script->refuseConnect = true;
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::NoAnswer);
+    CHECK(told.empty());
+    r.script->refuseConnect = false;
+    r.Serving(Model("a.onnx"));
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    CHECK(told == (std::vector<std::uint16_t>{2}));
+    Settings s = On();
+    s.serverAddress = "server.example";
+    r.c.Configure(s);
+    r.script->speaks = 1;
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    CHECK(told == (std::vector<std::uint16_t>{2, 1}));
+    r.c.OnVersion(nullptr);
+}
