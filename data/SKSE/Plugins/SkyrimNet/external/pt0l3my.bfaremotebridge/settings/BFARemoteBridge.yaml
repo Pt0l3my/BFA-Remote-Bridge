@@ -10,7 +10,7 @@
 
 plugin:
   name: "BFARemoteBridge"
-  version: "1.3.0"
+  version: "1.4.0"
   description: "Sends Better Facial Animations' lip-sync model runs to PandorumLLM's A2F server on another PC of your network, and shows what the server does."
 
 schema:
@@ -31,6 +31,14 @@ schema:
       max: 65535
       category: "Server"
 
+    # Lip sync
+    - name: "Lip sync in scenes"
+      path: "sceneLipSync"
+      type: "bool"
+      description: "Better Facial Animations otherwise leaves the faces of everyone in an OStim or SexLab scene to the scene. With this on, speakers in a scene get BFA's lip sync and expression for their lines. Takes effect at once."
+      defaultValue: true
+      category: "Lip sync"
+
     # Monitor
     - name: "Status on load"
       path: "showStatus"
@@ -41,7 +49,7 @@ schema:
     - name: "Log detail"
       path: "logDetail"
       type: "select"
-      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt in BFARemoteBridge.log."
+      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and a line kept in a scene at most once a minute."
       defaultValue: "Normal"
       options:
         - Normal

@@ -17,13 +17,14 @@ constexpr int kRunTimeoutMs = 1000;  // each lip-sync call's time limit, fixed s
 enum class LogDetail { Normal, Detailed };
 
 // The page holds only what the server can't tell the bridge: where the server is (an address for a server that
-// doesn't answer the search, a version 1 one; and the port), and how the monitor shows (status on load, log detail).
-// The hardware is chosen on PandorumLLM's side.
+// doesn't answer the search, a version 1 one; and the port), whether BFA's lip sync reaches speakers in a scene, and
+// how the monitor shows (status on load, log detail). The hardware is chosen on PandorumLLM's side.
 struct Settings {
     std::string serverAddress;  // empty: found on the local network (FIND and FOUND, protocol version 2)
     int serverPort = 7871;
     std::string accessKey;  // not on the page since 1.2 (PandorumLLM admits by its Remote IP): empty; never logged
     int timeoutMs = kRunTimeoutMs;  // not on the page since 1.2: fixed (kRunTimeoutMs); the tests set their own
+    bool sceneLipSync = true;  // BFA's scene checks answered "not in a scene" (core/SceneLipSync.h); applies at once
     bool showStatus = true;
     LogDetail logDetail = LogDetail::Normal;
 

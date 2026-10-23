@@ -12,7 +12,7 @@
 # BFARB_BFA_DLL=<BFA's BetterFacialAnimations.dll>, in the environment when the tests run, add BFA's own files
 # (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.3.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,7 @@ add_library(bfarb_core STATIC
   src/core/Monitor.cpp
   src/core/PeImage.cpp
   src/core/Protocol.cpp
+  src/core/SceneLipSync.cpp
   src/core/Scrub.cpp
   src/core/Settings.cpp
   src/core/Sha256.cpp
@@ -91,6 +92,7 @@ if(NOT WIN32)
     tests/CoreTests.cpp
     tests/ForwardTests.cpp
     tests/ProtocolTests.cpp
+    tests/SceneTests.cpp
     tests/TestMain.cpp)
   target_compile_definitions(bfarb_tests PRIVATE BFARB_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
   if(BFARB_TSAN AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -142,7 +144,8 @@ if(BFARB_PLUGIN_DLL)
   endif()
   find_package(CommonLibSSE CONFIG REQUIRED)
   find_package(spdlog CONFIG REQUIRED)
-  # Address Library, no game structures used: SE 1.5.97 and AE 1.6.x (1.6.1170 among them) alike; VR is refused at load.
+  # Address Library, for two vtables only (Character's and PlayerCharacter's, src/plugin/SceneHook.cpp); no other game
+  # structure is used: SE 1.5.97 and AE 1.6.x (1.6.1170 among them) alike; VR is refused at load.
   add_commonlibsse_plugin(BFARemoteBridge
     NAME BFARemoteBridge
     AUTHOR "Pt0l3my"
@@ -151,6 +154,7 @@ if(BFARB_PLUGIN_DLL)
       src/plugin/BfaIni.cpp
       src/plugin/Hook.cpp
       src/plugin/Main.cpp
+      src/plugin/SceneHook.cpp
       src/plugin/SkyrimNet.cpp
       src/plugin/WinsockDiscovery.cpp
       src/plugin/WinsockTransport.cpp)

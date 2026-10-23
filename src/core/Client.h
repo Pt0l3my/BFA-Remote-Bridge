@@ -80,7 +80,7 @@ constexpr std::chrono::milliseconds kFindWait{1000};      // a search waits this
 // success): 1, 2, 5, 10, 30 s, then 30 s.
 std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-std::string ClientName();  // "BFARemoteBridge 1.3.0"
+std::string ClientName();  // "BFARemoteBridge 1.4.0"
 
 // Why a run got no answer from the server.
 enum class Why : std::uint8_t {
@@ -140,7 +140,7 @@ struct Versions {
     std::string ort;  // "1.24.4"; empty until BFA loads its runtime
 };
 
-// The HELLO's client string: "BFARemoteBridge 1.3.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
+// The HELLO's client string: "BFARemoteBridge 1.4.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
 // ORT V)", keys in that order, each of the last three only when known (fallback only in a status check sent for a
 // fallback), new keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name
 // alone when none fits.
