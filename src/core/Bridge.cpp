@@ -710,17 +710,12 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     } else if (a.hello.kind == K::WrongKey) {
         why = "the server refused the access key";
         words = "the server refused the access key";
-    } else if (a.hello.kind == K::Answered && (a.status == static_cast<std::uint8_t>(proto::ModelStatus::NotFound) ||
-                                                a.status == static_cast<std::uint8_t>(proto::ModelStatus::DifferentFile))) {
-        why = "the server's copy: " + std::string(proto::ModelStatusName(a.status)) + (a.detail.empty() ? "" : " (" + a.detail + ")");
-        words = "the server lacks it or has a different copy";
     } else if (a.hello.kind == K::Answered) {
         why = "the server's copy: " + std::string(proto::ModelStatusName(a.status)) + (a.detail.empty() ? "" : " (" + a.detail + ")");
-        words = "the server couldn't load it";
     } else {
         reason = Reason::Incompatible;
         why = a.detail;
-        words = "the bridge couldn't send it (" + a.detail + ")";
+        words = "the bridge couldn't send it (" + ScrubPaths(a.detail) + ")";
     }
     OrtStatus* status = RefuseWith(real, model, why);
     if (a.hello.kind == K::Answered) {
