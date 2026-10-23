@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "Test.h"
+#include "core/BfaMode.h"
 #include "core/Bridge.h"
 #include "core/Monitor.h"
 #include "core/PeImage.h"
@@ -227,9 +228,10 @@ TEST(StatusTexts) {
     CHECK_EQ(CantServeText("4.5.0", "1.31.0", true), std::string("BFA Remote Bridge: Better Facial Animations 4.5.0 uses ONNX Runtime 1.31.0, "
                                                                "which the bridge can't serve, so lip sync is the game's own. Update the bridge."));
     CHECK(CantServeText("3.0.0", "1.9.0", false).find("Update Better Facial Animations.") != std::string::npos);
-    CHECK(NoServerText(true).find("no server address is set, so lip sync is the game's own") != std::string::npos);
-    CHECK(NoServerText(false).find("SkyrimNet wasn't found") != std::string::npos);
-    CHECK(GpuText().find("Tick Force CPU in BFA's menu") != std::string::npos);
+    CHECK(NoServerText().find("SkyrimNet wasn't found") != std::string::npos);
+    CHECK_EQ(NotFoundText(7871), std::string("BFA Remote Bridge: no server answered on the local network, so lip sync is the game's own. In "
+                                             "PandorumLLM, set the A2F server's Remote IP to this PC and allow port 7871 (UDP and TCP) through "
+                                             "that PC's firewall, or enter its address on SkyrimNet's Settings > Plugins page."));
     CHECK_EQ(DeviceText("DirectML 3: NVIDIA GeForce RTX 5090"), std::string("NVIDIA GeForce RTX 5090 (DirectML 3)"));
     CHECK_EQ(DeviceText("CPU"), std::string("CPU"));
     CHECK_EQ(DeviceText("CPU: "), std::string("CPU: "));
@@ -244,7 +246,7 @@ TEST(StatusTexts) {
         CHECK(!w.empty());
         for (unsigned char c : FallbackLine("", w)) CHECK(c < 0x80);
     }
-    for (const std::string& t : {NoServerText(true), NoServerText(false), GpuText(), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
+    for (const std::string& t : {NoServerText(), NotFoundText(7871), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
         CHECK(t.rfind("BFA Remote Bridge: ", 0) == 0);
         for (unsigned char c : t) CHECK(c < 0x80);
     }
@@ -545,6 +547,41 @@ TEST(PeReadsBetterFacialAnimationsDll) {
 
 // ---- paths out of other programs' messages
 
+// A server's detail as PandorumLLM sent it in the owner's Force CPU test: ONNX Runtime's raw message, with addresses
+// and a line break. Logged on one line, without the addresses; shown capped.
+TEST(ServerTextsGoOnOneLine) {
+    const std::string raw =
+        "Non-zero status code returned while running Concat node. Name:'Concat_7' Status Message: "
+        "MLOperatorAuthorImpl.cpp(2508)onnxruntime.dll!00007FFC19A9F444: (caller: 00007FFC\xE2\x80\xA6\n"
+        "Exception(1) tid(2f40) 80070057 The parameter is incorrect.\r\n";
+    const std::string line = ServerText(raw);
+    CHECK_EQ(line, std::string("Non-zero status code returned while running Concat node. Name:'Concat_7' Status Message: "
+                               "MLOperatorAuthorImpl.cpp(2508)onnxruntime.dll: Exception(1) tid(2f40) 80070057 The parameter is incorrect."));
+    for (unsigned char c : line) CHECK(c >= 0x20 && c != 0x7F);
+    CHECK(line.find("00007FFC") == std::string::npos);
+    CHECK(line.find("  ") == std::string::npos);
+    const std::string shown = ShownServerText(raw);
+    CHECK(shown.size() <= kShownTextMax);
+    CHECK(shown.size() >= kShownTextMax - 30);
+    CHECK(shown.rfind("...") == shown.size() - 3);
+    CHECK(line.rfind(shown.substr(0, shown.size() - 3), 0) == 0);  // the line's own start
+    CHECK(shown.find('\n') == std::string::npos);
+    // short texts are shown whole; other shapes of address go too; a path keeps its base name; UTF-8 isn't cut inside
+    CHECK_EQ(ShownServerText("the file here has another size or SHA-256"), std::string("the file here has another size or SHA-256"));
+    CHECK_EQ(ServerText("at 0x00007ffc19a9f444 and 00007FFC19A9F444 in\tC:\\Users\\someone\\m.onnx"), std::string("at and in m.onnx"));
+    CHECK_EQ(ServerText("\x01\x02 a \x7F  b \n"), std::string("a b"));
+    const std::string accents(200, 'a');
+    std::string utf = accents.substr(0, 156) + "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9";
+    const std::string cut = ShownServerText(utf, 160);
+    CHECK(cut.size() <= 160);
+    CHECK((static_cast<unsigned char>(cut[cut.size() - 4]) & 0xC0) != 0xC0);  // no lead byte left without its tail
+    // the monitor's line for a refused model: one line, capped
+    const std::string note = ModelLine("a2f3_fp16.onnx", "PandorumLLM v3.97-p7 Beta A2F", "DirectML 3: NVIDIA GeForce RTX 5090",
+                                       "not ready (failed to load) (" + ShownServerText(raw) + ")");
+    CHECK(note.find('\n') == std::string::npos);
+    CHECK(note.find("00007FFC") == std::string::npos);
+}
+
 TEST(ScrubPathsKeepsBaseNamesOnly) {
     const std::string win = "C:\\Games\\Skyrim Special Edition\\Data\\SKSE\\Plugins\\BetterFacialAnimations\\a2f3_fp16.onnx";
     CHECK_EQ(ScrubPaths("Load model from " + win + " failed: no such file", win),
@@ -557,4 +594,193 @@ TEST(ScrubPathsKeepsBaseNamesOnly) {
     CHECK_EQ(ScrubPaths("in D:/mods/BFA/net.onnx."), std::string("in net.onnx."));
     CHECK_EQ(ScrubPaths("Check tiny.onnx 1/2: y largest difference 0"), std::string("Check tiny.onnx 1/2: y largest difference 0"));
     CHECK_EQ(ScrubPaths("ratio 3/4 and http-ish a/b"), std::string("ratio 3/4 and http-ish a/b"));
+}
+
+// ---- BFA's mode, set by the bridge (core/BfaMode.h)
+
+namespace {
+
+// BFA's INI and the bridge's state, in memory, with every write counted.
+struct FakeIni {
+    bool present = true;
+    int forceCpu = 0;
+    bool setByBridge = false;
+    int iniWrites = 0;
+    int recordWrites = 0;
+    bool failRecord = false;
+};
+
+class FakeIniStore final : public IniStore {
+public:
+    explicit FakeIniStore(std::shared_ptr<FakeIni> ini) : ini_(std::move(ini)) {}
+    bool BfaIniPresent() override { return ini_->present; }
+    int ReadForceCpu() override { return ini_->forceCpu; }
+    bool WriteForceCpu(int value, std::string&) override {
+        CHECK(ini_->present);  // never created
+        ini_->forceCpu = value;
+        ++ini_->iniWrites;
+        return true;
+    }
+    bool ReadSetByBridge() override { return ini_->setByBridge; }
+    bool WriteSetByBridge(bool set, std::string& err) override {
+        if (ini_->failRecord) {
+            err = "read-only";
+            return false;
+        }
+        ini_->setByBridge = set;
+        ++ini_->recordWrites;
+        return true;
+    }
+
+private:
+    std::shared_ptr<FakeIni> ini_;
+};
+
+struct ModeRig {
+    std::shared_ptr<FakeIni> ini = std::make_shared<FakeIni>();
+    std::vector<std::string> log;
+    BfaCpuMode mode{std::make_unique<FakeIniStore>(ini), [this](Level, const std::string& l) { log.push_back(l); }};
+    explicit ModeRig(const char* bfa = kCpuModeBfaVersion) { mode.SetBfaVersion(bfa); }
+    int Logged(const std::string& part) const {
+        int n = 0;
+        for (const auto& l : log) n += l.find(part) != std::string::npos;
+        return n;
+    }
+};
+
+}  // namespace
+
+// Nothing while no server has answered; version 2 sets ForceCPU=1, recording that the bridge set it; logged once.
+// Each game save writes it again.
+TEST(BfaModeSetOnVersionTwo) {
+    ModeRig r;
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(0);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    CHECK(r.log.empty());
+    r.mode.OnServerVersion(2);
+    CHECK(r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 1);
+    CHECK(r.ini->setByBridge);
+    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0)"), 1);
+    CHECK_EQ(r.Logged("from the next game start"), 1);
+    // BFA's menu saves its file with ForceCPU=0 in this session: the next game save writes 1 again, silently
+    r.ini->forceCpu = 0;
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 1);
+    CHECK_EQ(r.ini->iniWrites, 2);
+    CHECK_EQ(r.log.size(), std::size_t{1});
+    // already 1: nothing written
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites, 2);
+}
+
+// The record is written once, and only when the bridge changes a 0: a 1 it finds (the player's, or its own whose record
+// was lost) is never recorded, so nothing is put back for it.
+TEST(BfaModeRecordsTheValueFoundOnce) {
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    r.ini->forceCpu = 0;
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->recordWrites, 1);
+    CHECK(r.ini->setByBridge);
+    // the next start: the file says 1 (the bridge's), the record stays
+    BfaCpuMode again(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    again.SetBfaVersion(kCpuModeBfaVersion);
+    again.OnServerVersion(2);
+    CHECK_EQ(r.ini->recordWrites, 1);
+    // BFA already in its CPU mode: nothing recorded, nothing written, nothing put back at version 1
+    ModeRig cpu;
+    cpu.ini->forceCpu = 1;
+    cpu.mode.OnServerVersion(2);
+    CHECK(!cpu.ini->setByBridge);
+    CHECK_EQ(cpu.ini->iniWrites + cpu.ini->recordWrites, 0);
+    cpu.mode.OnServerVersion(1);
+    CHECK_EQ(cpu.ini->forceCpu, 1);
+    CHECK_EQ(cpu.ini->iniWrites, 0);
+    // the bridge's record lost after it set 1: its own 1 isn't taken for the player's, and nothing is put back
+    ModeRig lost;
+    lost.mode.OnServerVersion(2);
+    lost.ini->setByBridge = false;
+    BfaCpuMode later(std::make_unique<FakeIniStore>(lost.ini), nullptr);
+    later.SetBfaVersion(kCpuModeBfaVersion);
+    later.OnServerVersion(2);
+    CHECK(!lost.ini->setByBridge);
+    later.OnServerVersion(1);
+    CHECK_EQ(lost.ini->forceCpu, 1);
+    // the record can't be written: BFA's file is left as it is
+    ModeRig ro;
+    ro.ini->failRecord = true;
+    ro.mode.OnServerVersion(2);
+    CHECK_EQ(ro.ini->forceCpu, 0);
+    CHECK_EQ(ro.ini->iniWrites, 0);
+    CHECK_EQ(ro.Logged("BFA's mode is left as it is"), 1);
+}
+
+// A version 1 server: the value the bridge set goes back and the record is cleared; saves then leave BFA's file alone.
+TEST(BfaModeRestoredOnVersionOne) {
+    ModeRig r;
+    r.mode.OnServerVersion(1);  // nothing recorded: nothing to put back
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 1);
+    r.mode.OnServerVersion(1);
+    CHECK(!r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 0);
+    CHECK(!r.ini->setByBridge);
+    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
+                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from "
+                      "the next game start."),
+             1);
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 0);
+    const int writes = r.ini->iniWrites;
+    r.mode.OnServerVersion(1);
+    CHECK_EQ(r.ini->iniWrites, writes);
+}
+
+// BFA's INI missing: never created. Nothing recorded or written at version 2, at saves or at version 1, one log
+// line; a record left with nothing to put back is cleared.
+TEST(BfaModeNeverCreatesBfasIni) {
+    ModeRig r;
+    r.ini->present = false;
+    r.mode.OnServerVersion(2);
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(1);
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    CHECK_EQ(r.Logged("BFA's mode is left as it is: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini isn't there, and the bridge never "
+                      "creates it"),
+             1);
+    // set earlier, then the file went: the record is cleared, and the file isn't made again
+    ModeRig gone;
+    gone.mode.OnServerVersion(2);
+    CHECK(gone.ini->setByBridge);
+    gone.ini->present = false;
+    gone.mode.OnServerVersion(1);
+    CHECK(!gone.ini->setByBridge);
+    CHECK_EQ(gone.ini->iniWrites, 1);
+}
+
+// Another BFA version (or one unknown): its mode is left as it is, and a value the bridge set earlier is put back.
+TEST(BfaModeOnlyForBfa4323) {
+    for (const char* other : {"4.3.2.2", "4.4.0", ""}) {
+        ModeRig r(other);
+        r.mode.OnServerVersion(2);
+        r.mode.OnGameSave();
+        CHECK_EQ(r.ini->forceCpu, 0);
+        CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+        CHECK_EQ(r.Logged("BFA's mode is left as it is: this is Better Facial Animations"), 1);
+    }
+    // set under 4.3.2.3, then BFA updated: put back
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 1);
+    BfaCpuMode updated(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    updated.SetBfaVersion("4.4.0");
+    updated.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 0);
+    CHECK(!r.ini->setByBridge);
 }

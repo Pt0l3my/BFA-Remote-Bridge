@@ -1,6 +1,7 @@
 #include "core/Scrub.h"
 
 #include <cctype>
+#include <regex>
 
 namespace bfarb {
 namespace {
@@ -75,6 +76,45 @@ std::string ScrubPaths(std::string text, std::string_view known) {
         i = j;
     }
     return out;
+}
+
+std::string ServerText(std::string text) {
+    for (char& c : text)
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) c = ' ';
+    // hexadecimal addresses, such as a runtime's "onnxruntime.dll!00007FFC19A9F444" or "(caller: 00007FFC...", with
+    // the label, the marker and the truncation after them
+    // An address is a run of hex digits marked as one: after "!" (module!address) or "0x", labelled "caller:" (with
+    // its brackets, cut short or not), or a full 16 digits. Shorter unmarked runs, such as an HRESULT, stay.
+    static const std::regex address(
+        R"(\(?\s*caller:\s*[0-9A-Fa-f]{4,16}(?:\.\.\.|\xE2\x80\xA6)?\s*\)?|(?:!|0[xX])[0-9A-Fa-f]{6,16}\b(?:\.\.\.|\xE2\x80\xA6)?|\b(?=[0-9A-Fa-f]*[0-9])[0-9A-Fa-f]{16}\b)");
+    text = std::regex_replace(text, address, " ");
+    static const std::regex emptyBrackets(R"(\(\s*\)|\[\s*\]|\(\s*$)");
+    text = std::regex_replace(text, emptyBrackets, " ");
+    text = ScrubPaths(std::move(text));
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        if (c == ' ' && (out.empty() || out.back() == ' ')) continue;
+        out.push_back(c);
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    // a space left before punctuation by a dropped address
+    for (const char* p : {" :", " ,", " ;", " )"}) {
+        for (std::size_t at = out.find(p); at != std::string::npos; at = out.find(p, at)) out.erase(at, 1);
+    }
+    return out;
+}
+
+std::string ShownServerText(const std::string& text, std::size_t max) {
+    std::string line = ServerText(text);
+    if (line.size() <= max) return line;
+    std::size_t cut = max > 3 ? max - 3 : 0;
+    while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) --cut;  // not inside a UTF-8 character
+    const std::size_t space = line.rfind(' ', cut);
+    if (space != std::string::npos && space + 24 >= cut) cut = space;  // a word's end, when one is near
+    line.resize(cut);
+    while (!line.empty() && (line.back() == ' ' || line.back() == ',' || line.back() == ':' || line.back() == ';')) line.pop_back();
+    return line + "...";
 }
 
 }  // namespace bfarb

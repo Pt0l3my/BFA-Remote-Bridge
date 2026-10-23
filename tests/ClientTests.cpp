@@ -284,10 +284,10 @@ TEST(ClientAdmitRefusals) {
         r.script->answer = [](std::uint16_t, const std::vector<std::uint8_t>&) { return Frame(proto::MsgType::HelloOk, {1, 2, 3}); };
         CHECK(r.c.Admit(m).hello.kind == ProbeResult::Kind::Refused);
     }
-    // no address
+    // no address, and no search here: not found, nothing connected
     {
         Rig r(Settings{});
-        CHECK(r.c.Admit(m).hello.kind == ProbeResult::Kind::NoAddress);
+        CHECK(r.c.Admit(m).hello.kind == ProbeResult::Kind::NotFound);
         CHECK_EQ(r.script->connects.load(), 0);
     }
 }
@@ -368,10 +368,12 @@ TEST(ClientAnAttemptBeforeAFailureDoesntEndItsPause) {
     r.c.SetModels({m});
     Joined attempt{&release, std::thread([&] { r.c.Tick(); })};  // the start-up status check, then the main connection
     WaitFor([&] { return holding.load(); });
-    r.script->closeBeforeAnswer = true;  // a run's own connection fails meanwhile
+    r.script->closeBeforeAnswer = true;  // a run's own connection fails meanwhile (its retry in version 2 can't connect)
+    r.script->refuseConnect = true;
     Fallback fb;
     CHECK(r.Run(m, fb) == Client::Outcome::Failed);
     CHECK(r.c.Paused());
+    r.script->refuseConnect = false;
     release = true;
     attempt.t.join();
     CHECK(r.c.Paused());
@@ -729,7 +731,7 @@ TEST(ClientModelNoLongerReady) {
 
 TEST(ClientProbe) {
     Rig r(Settings{});
-    CHECK(r.c.Probe().kind == ProbeResult::Kind::NoAddress);
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::NotFound);
     r.c.Configure(On());
     std::string client;
     r.script->answer = [&](std::uint16_t, const std::vector<std::uint8_t>& p) {
@@ -745,7 +747,7 @@ TEST(ClientProbe) {
     r.script->answer = nullptr;
     CHECK(r.c.Probe().kind == ProbeResult::Kind::NoAnswer);
     auto bad = Frame(proto::MsgType::HelloOk, {});
-    bad[4] = 2;  // version 2
+    bad[4] = 3;  // version 3
     r.script->answer = [&](std::uint16_t, const std::vector<std::uint8_t>&) { return bad; };
     CHECK(r.c.Probe().kind == ProbeResult::Kind::Refused);
 }
@@ -967,8 +969,8 @@ TEST(ClientRunNeverWaitsPastItsTimeoutForThePing) {
     }
 }
 
-// No address (cleared mid-game), or one not looked up yet: runs fall back at once, and only the first of a series is
-// logged.
+// No address (cleared mid-game, and no server found on the local network yet), or one not looked up yet: runs fall
+// back at once, and only the first of a series is logged.
 TEST(ClientNoAddressIsLoggedOnce) {
     Rig r;
     const auto m = Model("a.onnx");
@@ -987,7 +989,7 @@ TEST(ClientNoAddressIsLoggedOnce) {
         CHECK_EQ(r.Logged("a.onnx: not answered (no connection: " + text + ")"), 1);
     };
     r.c.Configure(s);
-    series("no server address is set");
+    series("no server has been found on the local network yet");
     s.serverAddress = "server.example";  // a new address, not looked up yet: a new series
     r.c.Configure(s);
     series("the server's address hasn't been looked up yet");
@@ -1216,10 +1218,11 @@ TEST(ClientStringVersionsAndReason) {
     }
 }
 
-// A fallback is told to the server: a status check with its reason at once, then at most one every 30 s carrying the
-// latest reason; NoServer has nowhere to go.
+// A fallback is told to a version 1 server: a status check with its reason at once, then at most one every 30 s
+// carrying the latest reason; NoServer has nowhere to go.
 TEST(ClientFallbackReportsAreRateLimited) {
     Rig r;
+    r.script->speaks = 1;
     r.c.SetBfaVersion("4.3.2.3");
     r.c.SetOrtVersion("1.24.4");
     std::vector<std::string> checks;
@@ -1356,4 +1359,377 @@ TEST(ClientBackgroundThreadEndsThePause) {
     CHECK(took >= 1000 && took < 3000);  // the first try after 1 s
     CHECK(r.Run(m) == Client::Outcome::Forwarded);
     r.c.StopBackground();
+}
+
+// ---- protocol version 2: the version rule, NOTICE and the search
+
+namespace {
+
+std::vector<std::uint16_t> VersionsOf(const Connection& c) {
+    std::vector<std::uint16_t> v;
+    for (const auto& s : c.sent) v.push_back(s.version);
+    return v;
+}
+
+Settings Searching() {
+    Settings s = On();
+    s.serverAddress.clear();
+    return s;
+}
+
+}  // namespace
+
+// Every connection opens in version 2. A version 1 server answers ERROR 6 framed in version 1: the bridge connects
+// again at once in version 1, logs it once, and opens every later connection to it in version 1, until the address
+// changes.
+TEST(ClientVersionOneServerIsSpokenToInVersionOne) {
+    Rig r;
+    r.script->speaks = 1;
+    const auto m = Model("a.onnx");
+    CHECK_EQ(r.c.ServerVersion(), 0);
+    CHECK(r.c.Admit(m).Ready());
+    auto cs = r.script->Connections();
+    CHECK_EQ(cs.size(), std::size_t{2});
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));  // refused
+    CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{1}));  // answered
+    CHECK_EQ(r.c.ServerVersion(), 1);
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
+    r.c.SetModels({m});
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    cs = r.script->Connections();
+    CHECK_EQ(cs.size(), std::size_t{4});
+    CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1, 1}));  // the main connection: HELLO and RUN in version 1
+    CHECK(VersionsOf(cs[3]) == (std::vector<std::uint16_t>{1}));     // the status check
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
+    // another address: version 2 first again
+    Settings s = On();
+    s.serverAddress = "server.example";
+    r.c.Configure(s);
+    CHECK_EQ(r.c.ServerVersion(), 0);
+    CHECK(r.c.Admit(m).Ready());
+    cs = r.script->Connections();
+    CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs[5]) == (std::vector<std::uint16_t>{1}));
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 2);
+}
+
+// A run that makes the main connection to a version 1 server not yet known as one: refused in version 2, connected
+// again in version 1 and answered, all within the run's own call.
+TEST(ClientRunConnectsAgainInVersionOne) {
+    Rig r;
+    r.script->speaks = 1;
+    const auto m = Model("a.onnx");
+    CHECK(r.c.Resolve());
+    r.c.SetModels({m});
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    const auto cs = r.script->Connections();
+    CHECK_EQ(cs.size(), std::size_t{2});
+    CHECK(r.script->ByConnection()[0] == (std::vector<std::uint16_t>{1}));
+    CHECK(r.script->ByConnection()[1] == (std::vector<std::uint16_t>{1, 3}));
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{1, 1}));
+    CHECK(!r.c.Paused());
+    CHECK_EQ(r.c.ServerVersion(), 1);
+}
+
+// A version 2 server: every frame in version 2, and a line that falls back is told by NOTICE on the main connection
+// (its model, the reason's word, the detail on one line without a path, the lines since the last), at most one a
+// minute; no status check carries `fallback`. A model load's refusal (no line) sends none.
+TEST(ClientNoticeToAVersionTwoServer) {
+    Rig r;
+    const auto m = Model("a.onnx");
+    r.Serving(m);
+    CHECK_EQ(r.c.ServerVersion(), 2);
+    for (const auto v : r.script->Versions()) CHECK_EQ(v, 2);
+    r.c.ReportFallback(Reason::ServerError, "a.onnx", "ERROR 4, inference failed: scripted\nat C:\\Games\\Skyrim\\Data\\a.onnx");
+    r.c.Tick();
+    auto notices = r.script->Notices();
+    CHECK_EQ(notices.size(), std::size_t{1});
+    CHECK_EQ(notices[0].model, std::string("a.onnx"));
+    CHECK_EQ(notices[0].reason, std::string("error"));
+    CHECK_EQ(notices[0].detail, std::string("ERROR 4, inference failed: scripted at a.onnx"));
+    CHECK_EQ(notices[0].lines, 1u);
+    CHECK_EQ(r.c.FallbackReports(), 0);
+    // on the main connection, after the RUN's answer
+    const auto main = r.script->ByConnection()[1];
+    CHECK_EQ(main.back(), 10);
+    CHECK_EQ(main[main.size() - 2], 3);
+    // within the minute: held, the lines counted
+    g_now += std::chrono::seconds(20);
+    r.c.ReportFallback(Reason::TimedOut, "a.onnx", "no answer within 300 ms");
+    r.c.ReportFallback(Reason::NotReady, "a.onnx", "the server doesn't have it ready (not found)");
+    CHECK(r.c.Tick() <= g_now + std::chrono::seconds(40));  // due when the minute is over
+    CHECK_EQ(r.script->Notices().size(), std::size_t{1});
+    g_now += std::chrono::seconds(40);
+    r.c.Tick();
+    notices = r.script->Notices();
+    CHECK_EQ(notices.size(), std::size_t{2});
+    CHECK_EQ(notices[1].reason, std::string("notready"));
+    CHECK_EQ(notices[1].lines, 2u);
+    // no line, no NOTICE: a model load's refusal (or a runtime entry) keeps 1.2.0's status check, in version 2
+    std::string checked;
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1 && DecodedHello(p).models.empty()) checked = DecodedHello(p).client;
+        return Serve(type, p);
+    };
+    r.c.ReportFallback(Reason::ModelRefused);
+    g_now += std::chrono::seconds(61);
+    r.c.Tick();
+    CHECK_EQ(r.script->Notices().size(), std::size_t{2});
+    CHECK_EQ(r.c.NoticesSent(), 2);
+    CHECK_EQ(r.c.FallbackReports(), 1);
+    CHECK(checked.find("fallback refused") != std::string::npos);
+    const auto versions = r.script->Versions();
+    CHECK_EQ(versions.back(), 2);
+    r.c.ReportFallback(Reason::Incompatible);
+    g_now += kFallbackReportEvery;
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 2);
+    CHECK(checked.find("fallback incompatible") != std::string::npos);
+    CHECK_EQ(r.Logged("NOTICE: a.onnx, notready, 2 lines since the last"), 1);
+}
+
+// NOTICE never comes between a request and its answer: after a RUN timed out, it waits until that late answer is read.
+TEST(ClientNoticeWaitsForALateAnswer) {
+    Rig r;
+    const auto m = Model("a.onnx");
+    r.Serving(m);
+    LateOnce late;
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) { return late(type, p); };
+    Fallback fb;
+    CHECK(r.Run(m, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    r.c.ReportFallback(ReasonOf(fb), m.name, fb.text);
+    CHECK(r.c.Tick() > g_now + std::chrono::seconds(1));  // no polling: the run that reads the late answer wakes it
+    CHECK_EQ(r.script->Notices().size(), std::size_t{0});  // an answer is owed
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);        // reads the late answer, then its own
+    r.c.Tick();
+    const auto notices = r.script->Notices();
+    CHECK_EQ(notices.size(), std::size_t{1});
+    CHECK_EQ(notices[0].reason, std::string("timeout"));
+    const auto main = r.script->ByConnection()[1];
+    CHECK((std::vector<std::uint16_t>(main.end() - 3, main.end())) == (std::vector<std::uint16_t>{3, 3, 10}));
+}
+
+// NOTICE names only a model the connection's last HELLO listed: one released meanwhile is dropped, not told.
+TEST(ClientNoticeOnlyForAModelTheHelloListed) {
+    Rig r;
+    const auto a = Model("a.onnx"), b = Model("b.onnx");
+    r.Serving(a);
+    r.c.ReportFallback(Reason::TimedOut, "a.onnx", "no answer within 300 ms");
+    CHECK(r.c.Admit(b).Ready());
+    r.c.SetModels({b});  // a released: the HELLO with b alone comes first
+    r.c.Tick();          // waits for the HELLO
+    CHECK_EQ(r.script->Notices().size(), std::size_t{0});
+    r.c.Tick();  // the HELLO again, listing b
+    r.c.Tick();
+    CHECK_EQ(r.script->Notices().size(), std::size_t{0});
+    CHECK_EQ(r.c.NoticesSent(), 0);
+    r.c.ReportFallback(Reason::TimedOut, "b.onnx", "no answer within 300 ms");
+    r.c.Tick();
+    const auto notices = r.script->Notices();
+    CHECK_EQ(notices.size(), std::size_t{1});
+    CHECK_EQ(notices[0].model, std::string("b.onnx"));
+}
+
+// A version 1 server gets no NOTICE: the status check's `fallback REASON`, as from 1.2.0.
+TEST(ClientNoNoticeToAVersionOneServer) {
+    Rig r;
+    r.script->speaks = 1;
+    r.Serving(Model("a.onnx"));
+    r.c.ReportFallback(Reason::TimedOut, "a.onnx", "no answer within 300 ms");
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 1);
+    g_now += std::chrono::minutes(2);
+    r.c.Tick();
+    CHECK_EQ(r.c.NoticesSent(), 0);
+    CHECK_EQ(r.script->Count(proto::MsgType::Notice), 0);
+    for (const auto v : r.script->Versions()) CHECK(v == 1 || v == 2);
+}
+
+// No address: FIND (version 2, to the Port setting) finds the server, and the bridge connects to the address FOUND
+// came from. After a lost connection it searches again, at most once every 5 s.
+TEST(ClientFindsTheServerOnTheLocalNetwork) {
+    Rig r(Searching());
+    auto net = std::make_shared<Network>();
+    net->answer = [](const std::vector<std::uint8_t>&) { return std::vector<std::vector<std::uint8_t>>{FoundDatagram("PandorumLLM scripted")}; };
+    r.c.SetDiscovery(ScriptedSearch(net));
+    const auto m = Model("a.onnx");
+    CHECK(r.c.Admit(m).Ready());
+    CHECK_EQ(net->Sent(), 1);
+    {
+        std::lock_guard lock(net->mutex);
+        proto::Header h;
+        std::vector<std::uint8_t> p;
+        std::string err, client;
+        CHECK(proto::DecodeDatagram(net->sent[0].data(), net->sent[0].size(), h, p, err));
+        CHECK_EQ(h.type, 8);
+        CHECK(proto::DecodeFind(p.data(), p.size(), client, err));
+        CHECK(client.rfind(ClientName() + " (answered 0", 0) == 0);
+        CHECK_EQ(net->ports[0], 7871);
+    }
+    CHECK_EQ(r.Logged("Found the server on the local network: PandorumLLM scripted, port 7871"), 1);
+    r.c.SetModels({m});
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    r.c.Tick();  // the start-up status check: no second search
+    CHECK_EQ(net->Sent(), 1);
+    // the connection is lost: searched again, on the backoff schedule, at most every 5 s
+    r.script->closeBeforeAnswer = true;
+    r.script->refuseConnect = true;
+    CHECK(r.Run(m) == Client::Outcome::Failed);
+    CHECK(r.c.Paused());
+    r.script->refuseConnect = false;
+    g_now += std::chrono::seconds(1);
+    r.c.Tick();  // within 5 s of the last search: none
+    CHECK_EQ(net->Sent(), 1);
+    CHECK(r.c.Paused());
+    g_now += std::chrono::seconds(5);
+    r.c.Tick();
+    CHECK_EQ(net->Sent(), 2);
+    CHECK(!r.c.Paused());
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.Logged("Found the server on the local network"), 2);
+}
+
+// No FOUND: not found, said once in the log, and no second search within 5 s. Datagrams that aren't FOUND are
+// ignored. No adapter: nothing sent.
+TEST(ClientSearchFindsNothing) {
+    Rig r(Searching());
+    auto net = std::make_shared<Network>();
+    net->answer = [](const std::vector<std::uint8_t>& find) {
+        auto wrong = FoundDatagram();
+        wrong[4] = 1;  // version 1
+        return std::vector<std::vector<std::uint8_t>>{find, wrong, {1, 2, 3}};
+    };
+    r.c.SetDiscovery(ScriptedSearch(net));
+    const auto m = Model("a.onnx");
+    Admission a = r.c.Admit(m);
+    CHECK(a.hello.kind == ProbeResult::Kind::NotFound);
+    CHECK_EQ(a.detail, std::string("no server answered FIND on the local network (port 7871, 1 broadcast address)"));
+    CHECK_EQ(r.script->connects.load(), 0);
+    CHECK(r.c.Admit(m).hello.kind == ProbeResult::Kind::NotFound);
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::NotFound);
+    CHECK_EQ(net->Sent(), 1);
+    CHECK_EQ(r.Logged("no server answered FIND on the local network"), 1);
+    CHECK_EQ(r.Logged("Ignored a datagram that isn't FOUND"), 3);
+    g_now += kFindEvery;
+    net->adapters = 0;
+    a = r.c.Admit(m);
+    CHECK(a.hello.kind == ProbeResult::Kind::NotFound);
+    CHECK(a.detail.find("FIND couldn't be sent on any network adapter") != std::string::npos);
+    // a server found after all: the next search, 5 s on
+    net->adapters = 1;
+    net->answer = [](const std::vector<std::uint8_t>&) { return std::vector<std::vector<std::uint8_t>>{FoundDatagram()}; };
+    CHECK(r.c.Admit(m).hello.kind == ProbeResult::Kind::NotFound);
+    g_now += kFindEvery;
+    CHECK(r.c.Admit(m).Ready());
+    // without a search at all (no discovery set): not found
+    Rig bare(Searching());
+    CHECK(bare.c.Admit(m).detail.find("can't search the local network") != std::string::npos);
+}
+
+// The address found counts as the address for the version rule: a version 1 server found again at the same address
+// stays on version 1; found at another address, it is asked in version 2 first.
+TEST(ClientVersionRuleFollowsTheAddressFound) {
+    Rig r(Searching());
+    r.script->speaks = 1;
+    auto net = std::make_shared<Network>();
+    net->answer = [](const std::vector<std::uint8_t>&) { return std::vector<std::vector<std::uint8_t>>{FoundDatagram()}; };
+    r.c.SetDiscovery(ScriptedSearch(net));
+    const auto m = Model("a.onnx");
+    CHECK(r.c.Admit(m).Ready());
+    CHECK_EQ(r.c.ServerVersion(), 1);
+    r.c.SetModels({m});
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    const auto lose = [&] {
+        r.script->closeBeforeAnswer = true;
+        r.script->refuseConnect = true;
+        CHECK(r.Run(m) == Client::Outcome::Failed);
+        r.script->refuseConnect = false;
+        g_now += kFindEvery;
+        r.c.Tick();
+        CHECK(!r.c.Paused());
+    };
+    lose();  // found again at the same address: version 1 at once
+    auto cs = r.script->Connections();
+    CHECK(VersionsOf(cs.back()) == (std::vector<std::uint16_t>{1}));
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
+    net->from = Endpoint{2, {8, 8, 8, 8}};
+    lose();  // another address: version 2 first, then 1
+    cs = r.script->Connections();
+    CHECK(VersionsOf(cs[cs.size() - 2]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs.back()) == (std::vector<std::uint16_t>{1}));
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 2);
+}
+
+// The version the server answered in goes to the sink each time it changes (BFA's mode follows it, core/BfaMode.h):
+// nothing before an answer, 2 once however many answers, and again after the address changes; 1 from a version 1
+// server.
+TEST(ClientTellsTheServersVersion) {
+    Rig r;
+    std::vector<std::uint16_t> told;
+    r.c.OnVersion([&](std::uint16_t v) { told.push_back(v); });
+    r.script->refuseConnect = true;
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::NoAnswer);
+    CHECK(told.empty());
+    r.script->refuseConnect = false;
+    r.Serving(Model("a.onnx"));
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    CHECK(told == (std::vector<std::uint16_t>{2}));
+    Settings s = On();
+    s.serverAddress = "server.example";
+    r.c.Configure(s);
+    r.script->speaks = 1;
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    CHECK(told == (std::vector<std::uint16_t>{2, 1}));
+    r.c.OnVersion(nullptr);
+}
+
+// A version 2 HELLO that gets no frame back (the connection reset, as PandorumLLM v3.97-p6 and earlier can on Windows,
+// closing with the payload unread) is said once more in version 2; no frame again, and the server is taken as a
+// version 1 server, logged once. No frame once, then HELLO_OK in version 2, stays on version 2. ERROR 6 at once goes
+// straight to version 1 (ClientVersionOneServerIsSpokenToInVersionOne).
+TEST(ClientNoFrameTwiceIsVersionOne) {
+    {
+        Rig r;
+        r.script->speaks = 1;
+        r.script->p6 = true;
+        CHECK(r.c.Admit(Model("a.onnx")).Ready());
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{3});
+        CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1}));
+        CHECK_EQ(r.c.ServerVersion(), 1);
+        CHECK_EQ(r.Logged("The server speaks protocol version 1 only (two version 2 HELLOs got no answer"), 1);
+        CHECK_EQ(r.Logged("The connection was reset before any answer to a version 2 HELLO"), 2);
+        CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);  // version 1 at once from now on
+        CHECK(VersionsOf(r.script->Connections().back()) == (std::vector<std::uint16_t>{1}));
+    }
+    {
+        Rig r;
+        r.script->resetHellos = 1;  // a lost connection, once
+        CHECK(r.c.Admit(Model("a.onnx")).Ready());
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{2});
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+        CHECK_EQ(r.c.ServerVersion(), 2);
+        CHECK_EQ(r.Logged("speaks protocol version 1 only"), 0);
+    }
+    // a run that makes the main connection to such a server: all within its own call
+    {
+        Rig r;
+        r.script->speaks = 1;
+        r.script->p6 = true;
+        const auto m = Model("a.onnx");
+        CHECK(r.c.Resolve());
+        r.c.SetModels({m});
+        CHECK(r.Run(m) == Client::Outcome::Forwarded);
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{3});
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1, 1}));
+        CHECK_EQ(r.c.ServerVersion(), 1);
+        CHECK(!r.c.Paused());
+    }
 }

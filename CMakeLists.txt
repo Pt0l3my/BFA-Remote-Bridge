@@ -12,7 +12,7 @@
 # BFARB_BFA_DLL=<BFA's BetterFacialAnimations.dll>, in the environment when the tests run, add BFA's own files
 # (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.2.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,7 @@ find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------- core
 add_library(bfarb_core STATIC
+  src/core/BfaMode.cpp
   src/core/Bridge.cpp
   src/core/Client.cpp
   src/core/Monitor.cpp
@@ -147,13 +148,15 @@ if(BFARB_PLUGIN_DLL)
     AUTHOR "Pt0l3my"
     VERSION ${PROJECT_VERSION}
     SOURCES
+      src/plugin/BfaIni.cpp
       src/plugin/Hook.cpp
       src/plugin/Main.cpp
       src/plugin/SkyrimNet.cpp
+      src/plugin/WinsockDiscovery.cpp
       src/plugin/WinsockTransport.cpp)
   target_compile_definitions(BFARemoteBridge PRIVATE _UNICODE UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(BFARemoteBridge PRIVATE /Zc:preprocessor /EHsc)
   target_precompile_headers(BFARemoteBridge PRIVATE src/plugin/PCH.h)
   target_include_directories(BFARemoteBridge PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(BFARemoteBridge PRIVATE bfarb_core bfarb_options spdlog::spdlog ws2_32)
+  target_link_libraries(BFARemoteBridge PRIVATE bfarb_core bfarb_options spdlog::spdlog ws2_32 iphlpapi)
 endif()

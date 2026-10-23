@@ -16,11 +16,11 @@ constexpr int kRunTimeoutMs = 1000;  // each lip-sync call's time limit, fixed s
 
 enum class LogDetail { Normal, Detailed };
 
-// The page holds only what the server can't tell the bridge: how to reach a server that doesn't answer discovery
-// yet (address and port), and how the monitor shows (status on load, log detail). The hardware is chosen on
-// PandorumLLM's side.
+// The page holds only what the server can't tell the bridge: where the server is (an address for a server that
+// doesn't answer the search, a version 1 one; and the port), and how the monitor shows (status on load, log detail).
+// The hardware is chosen on PandorumLLM's side.
 struct Settings {
-    std::string serverAddress;  // empty: found automatically once the server answers discovery (not yet: can't be served)
+    std::string serverAddress;  // empty: found on the local network (FIND and FOUND, protocol version 2)
     int serverPort = 7871;
     std::string accessKey;  // not on the page since 1.2 (PandorumLLM admits by its Remote IP): empty; never logged
     int timeoutMs = kRunTimeoutMs;  // not on the page since 1.2: fixed (kRunTimeoutMs); the tests set their own

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Tests of the reference server (tools/reference_server.py), from a client written here in Python: every message
 type, the refusals and their codes, which ones close the connection, results equal to a local run, PONG only after
-HELLO, and answers in order, late ones too.
+HELLO, and answers in order, late ones too; and version 2: the version rule (a version 1 server refusing a version 2
+HELLO with ERROR 6 framed in version 1), NOTICE, and FIND and FOUND on UDP from the Remote IP alone.
 
     python3 tools/test_reference_server.py <folder holding tiny.onnx and other/tiny.onnx (tests/make_test_model.py)>
 """
 
 import hashlib
+import json
 import os
-import time
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -35,17 +38,22 @@ def frame(kind, payload, magic=b"BFAR", version=1, length=None):
 
 
 def digest(path):
-    data = open(path, "rb").read()
+    with open(path, "rb") as f:
+        data = f.read()
     return len(data), hashlib.sha256(data).digest()
 
 
-def hello(key="", models=()):
+def hello(key="", models=(), version=1):
     p = pstr("test client") + pstr(key) + pstr("1.24.4") + struct.pack("<H", len(models))
     for name, size, sha, overrides in models:
         p += pstr(name) + struct.pack("<Q", size) + sha + struct.pack("<H", len(overrides))
         for dim, value in overrides:
             p += pstr(dim) + struct.pack("<q", value)
-    return frame(1, p)
+    return frame(1, p, version=version)
+
+
+def notice(model, reason, detail, lines, version=2):
+    return frame(10, pstr(model) + pstr(reason) + pstr(detail) + struct.pack("<I", lines), version=version)
 
 
 def tensor(name, array):
@@ -55,14 +63,14 @@ def tensor(name, array):
             + struct.pack("<I", len(data)) + data)
 
 
-def run(request_id, model, inputs, outputs):
+def run(request_id, model, inputs, outputs, version=1):
     p = struct.pack("<I", request_id) + pstr(model) + struct.pack("<H", len(inputs))
     for name, array in inputs:
         p += tensor(name, array)
     p += struct.pack("<H", len(outputs))
     for name in outputs:
         p += pstr(name)
-    return frame(3, p)
+    return frame(3, p, version=version)
 
 
 class Conn:
@@ -82,11 +90,13 @@ class Conn:
         return b
 
     def answer(self):
+        """(type, payload) of the next frame; its version is kept in last_version."""
         head = self.recv_exact(12)
         if head is None:
             return None
         magic, version, kind, length = HEADER.unpack(head)
-        assert magic == b"BFAR" and version == 1
+        assert magic == b"BFAR"
+        self.last_version = version
         return kind, self.recv_exact(length) if length else b""
 
     def closed(self):
@@ -150,10 +160,38 @@ def start_server(*extra):
     return proc, int(line.split()[1])
 
 
+def find(version=2, kind=8, client="BFARemoteBridge 1.3.0 (answered 0, fallbacks 0, timeouts 0)", extra=b""):
+    """A FIND datagram (or a wrong one, for the tests)."""
+    payload = pstr(client) + extra
+    return HEADER.pack(b"BFAR", version, kind, len(payload)) + payload
+
+
+class Udp:
+    """A UDP socket of the test's own: FIND out, FOUND back."""
+
+    def __init__(self):
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.s.bind(("127.0.0.1", 0))
+
+    def ask(self, port, datagram, wait=0.5):
+        """The answer to one datagram sent to port, or None when none came within wait seconds."""
+        self.s.sendto(datagram, ("127.0.0.1", port))
+        self.s.settimeout(wait)
+        try:
+            data, sender = self.s.recvfrom(2048)
+        except (socket.timeout, ConnectionError):
+            return None
+        return data, sender
+
+    def close(self):
+        self.s.close()
+
+
 class ReferenceServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.proc, cls.port = start_server()
+        cls.notices = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False).name
+        cls.proc, cls.port = start_server("--notice-log", cls.notices)
         cls.tiny = os.path.join(MODELS, "tiny.onnx")
         size, sha = digest(cls.tiny)
         cls.entry = ("tiny.onnx", size, sha, [("batch", 2)])
@@ -162,6 +200,12 @@ class ReferenceServerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.proc.terminate()
         cls.proc.wait()
+        cls.proc.stdout.close()
+        os.unlink(cls.notices)
+
+    def logged_notices(self):
+        with open(self.notices, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
 
     def connect(self, port=None):
         c = Conn(port or self.port)
@@ -174,6 +218,7 @@ class ReferenceServerTests(unittest.TestCase):
         def stop():
             proc.terminate()
             proc.wait()
+            proc.stdout.close()
 
         self.addCleanup(stop)
         return port
@@ -232,7 +277,8 @@ class ReferenceServerTests(unittest.TestCase):
     def test_refusals_that_close(self):
         cases = [
             (frame(1, b"", magic=b"XXXX"), 1),       # bad magic
-            (frame(1, b"", version=2), 6),           # protocol version 2
+            (frame(1, b"", version=3), 6),           # protocol version 3
+            (frame(1, b"", version=0), 6),           # protocol version 0
             (hello("wrong", [self.entry]), 2),       # wrong key
             (hello("sesame", [("../tiny.onnx", 1, b"\0" * 32, [])]), 1),  # a name with a path
             (hello("sesame", [("models\\tiny.onnx", 1, b"\0" * 32, [])]), 1),  # a backslash
@@ -329,6 +375,167 @@ class ReferenceServerTests(unittest.TestCase):
         kind, payload = c.answer()
         self.assertEqual((kind, error_code(payload)[1]), (5, 5))
         self.assertTrue(c.closed())
+
+    # ---- version 2
+
+    def test_each_connection_is_answered_in_its_own_version(self):
+        for version in (1, 2):
+            c = self.connect()
+            c.send(hello("sesame", [self.entry], version=version))
+            self.assertEqual(c.answer()[0], 2)
+            self.assertEqual(c.last_version, version)
+            c.send(frame(6, b"", version=version))
+            self.assertEqual(c.answer(), (7, b""))
+            self.assertEqual(c.last_version, version)
+            c.send(run(41, "tiny.onnx", tiny_inputs(1), ["y"], version=version))
+            kind, payload = c.answer()
+            self.assertEqual((kind, parse_run_ok(payload)[0], c.last_version), (4, 41, version))
+            c.send(run(42, "missing.onnx", [], ["y"], version=version))
+            kind, payload = c.answer()
+            self.assertEqual((kind, error_code(payload), c.last_version), (5, (42, 3), version))
+
+    def test_a_frame_of_another_version_is_refused(self):
+        # on an open connection, a frame of another version: ERROR 6 framed in the connection's, then closed
+        for opened, other in ((2, 1), (1, 2)):
+            c = self.connect()
+            c.send(hello("sesame", [self.entry], version=opened))
+            self.assertEqual(c.answer()[0], 2)
+            c.send(frame(6, b"", version=other))
+            kind, payload = c.answer()
+            self.assertEqual((kind, error_code(payload)[1], c.last_version), (5, 6, opened))
+            self.assertTrue(c.closed())
+        # a version this server doesn't speak, opening: ERROR 6 framed in the newest it speaks
+        c = self.connect()
+        c.send(hello("sesame", [self.entry], version=3))
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload), c.last_version), (5, (0, 6), 2))
+        self.assertTrue(c.closed())
+
+    def test_a_version_1_server_refuses_a_version_2_hello(self):
+        port = self.other_server("--v1-only")
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=2))
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload), c.last_version), (5, (0, 6), 1))
+        self.assertTrue(c.closed())
+        # the bridge then opens in version 1, which is answered
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=1))
+        self.assertEqual((c.answer()[0], c.last_version), (2, 1))
+        # and NOTICE, version 2's, isn't a version 1 message
+        c.send(notice("tiny.onnx", "timeout", "no answer within 1000 ms", 1, version=1))
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload)[1]), (5, 1))
+        self.assertTrue(c.closed())
+
+    def test_a_p6_server_closes_with_the_hello_unread(self):
+        # p6 and earlier read only the header of a version 2 HELLO, answer ERROR 6 framed in version 1 and close with
+        # the payload unread: the client may read the ERROR, or find the connection reset (the race the bridge's
+        # no-frame rule covers). Either way the connection ends, and version 1 is then answered.
+        port = self.other_server("--p6")
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=2))
+        time.sleep(0.2)
+        try:
+            got = c.answer()
+        except ConnectionError:
+            got = "reset"
+        if got not in ("reset", None):
+            kind, payload = got
+            self.assertEqual((kind, error_code(payload), c.last_version), (5, (0, 6), 1))
+            self.assertTrue(c.closed())
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=1))
+        self.assertEqual((c.answer()[0], c.last_version), (2, 1))
+
+    def test_notice_is_one_way_and_logged(self):
+        before = len(self.logged_notices())
+        c = self.connect()
+        c.send(hello("sesame", [self.entry], version=2))
+        self.assertEqual(c.answer()[0], 2)
+        c.send(run(51, "tiny.onnx", tiny_inputs(1), ["y"], version=2))
+        self.assertEqual(c.answer()[0], 4)
+        # NOTICE between a RUN's answer and the next request: nothing comes back, so the next answer is the PING's
+        c.send(notice("tiny.onnx", "error", "ERROR 4, inference failed: a test", 3))
+        c.send(frame(6, b"", version=2))
+        self.assertEqual(c.answer(), (7, b""))
+        # one it can't read is ignored, unanswered, and the connection stays
+        c.send(frame(10, pstr("tiny.onnx") + pstr("timeout"), version=2))
+        c.send(notice("../tiny.onnx", "timeout", "", 1))
+        c.send(frame(6, b"", version=2))
+        self.assertEqual(c.answer(), (7, b""))
+        got = self.logged_notices()[before:]
+        self.assertEqual(got, [{"client": "test client", "model": "tiny.onnx", "reason": "error",
+                                "detail": "ERROR 4, inference failed: a test", "lines": 3}])
+
+    def test_notice_needs_hello_and_version_2(self):
+        for data in (notice("tiny.onnx", "timeout", "", 1),               # before HELLO
+                     hello("sesame", [self.entry], version=1) + notice("tiny.onnx", "timeout", "", 1, version=1)):
+            c = self.connect()
+            c.send(data)
+            kind, payload = c.answer()
+            if kind == 2:
+                kind, payload = c.answer()
+            self.assertEqual((kind, error_code(payload)[1]), (5, 1))
+            self.assertTrue(c.closed())
+        # FIND and FOUND are datagrams: on TCP, malformed
+        c = self.connect()
+        c.send(hello("sesame", [self.entry], version=2) + frame(8, pstr("x"), version=2))
+        self.assertEqual(c.answer()[0], 2)
+        kind, payload = c.answer()
+        self.assertEqual((kind, error_code(payload)[1]), (5, 1))
+
+    def test_find_is_answered_from_the_remote_ip_alone(self):
+        port = self.other_server("--remote-ip", "127.0.0.1")
+        u = Udp()
+        self.addCleanup(u.close)
+        got = u.ask(port, find())
+        self.assertIsNotNone(got)
+        data, sender = got
+        self.assertEqual(sender, ("127.0.0.1", port))
+        magic, version, kind, length = HEADER.unpack_from(data)
+        self.assertEqual((magic, version, kind, length), (b"BFAR", 2, 9, len(data) - 12))
+        (n,) = struct.unpack_from("<H", data, 12)
+        self.assertEqual(14 + n, len(data))  # FOUND: str server, and no port
+        self.assertTrue(data[14:].decode().startswith("BFA Remote Bridge reference server"))
+        # at most one FOUND a second
+        self.assertIsNone(u.ask(port, find(), wait=0.3))
+        time.sleep(1.0)
+        self.assertIsNotNone(u.ask(port, find()))
+        # anything but a well-formed version 2 FIND is ignored
+        time.sleep(1.1)
+        for wrong in (find(version=1), find(kind=9), find(extra=b"x"), find()[:-1], b"BFAR", b"XXXX" + find()[4:]):
+            self.assertIsNone(u.ask(port, wrong, wait=0.3))
+        self.assertIsNotNone(u.ask(port, find()))
+
+    def test_find_from_another_address_or_to_a_version_1_server_goes_unanswered(self):
+        u = Udp()
+        self.addCleanup(u.close)
+        self.assertIsNone(u.ask(self.other_server("--remote-ip", "127.0.0.2"), find()))
+        self.assertIsNone(u.ask(self.other_server("--remote-ip", "127.0.0.1", "--v1-only"), find()))
+        self.assertIsNone(u.ask(self.port, find()))  # no Remote IP: no FIND
+
+    def test_the_sizes_are_filled_in_when_a_hello_lists_none(self):
+        port = self.other_server("--fill-sizes", self.entry[2].hex() + ":batch=2")
+        details = []
+        for overrides in ([], [("batch", 2)]):
+            c = self.connect(port)
+            c.send(hello("sesame", [(self.entry[0], self.entry[1], self.entry[2], overrides)], version=2))
+            kind, payload = c.answer()
+            self.assertEqual(kind, 2)
+            at = 0
+            for _ in range(2):
+                (n,) = struct.unpack_from("<H", payload, at)
+                at += 2 + n
+            at += 2
+            (n,) = struct.unpack_from("<H", payload, at)
+            at += 2 + n
+            status = payload[at]
+            (n,) = struct.unpack_from("<H", payload, at + 1)
+            details.append((status, payload[at + 3:at + 3 + n].decode()))
+            c.send(run(61, "tiny.onnx", tiny_inputs(1), ["y"], version=2))  # batch 2 either way
+            self.assertEqual(c.answer()[0], 4)
+        self.assertEqual(details, [(0, "built with BFA 4.3.2.3's sizes"), (0, "")])
 
 
 if __name__ == "__main__":

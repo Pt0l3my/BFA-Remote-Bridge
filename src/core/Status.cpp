@@ -54,18 +54,15 @@ std::string CantServeText(const std::string& bfaVersion, const std::string& ortV
            (newer ? "Update the bridge." : "Update Better Facial Animations.");
 }
 
-std::string NoServerText(bool skyrimNet) {
-    if (!skyrimNet)
-        return kPrefix + "SkyrimNet wasn't found, so the bridge has no server address and lip sync is the game's own.";
-    return kPrefix +
-           "no server address is set, so lip sync is the game's own. Enter the address of PandorumLLM's PC on SkyrimNet's "
-           "Settings > Plugins page.";
+std::string NoServerText() {
+    return kPrefix + "SkyrimNet wasn't found, so the bridge has no server address and lip sync is the game's own.";
 }
 
-std::string GpuText() {
-    return kPrefix +
-           "BFA is set to GPU, so it keeps a graphics device open on this PC. Tick Force CPU in BFA's menu: its model runs on "
-           "the server either way.";
+std::string NotFoundText(int port) {
+    const std::string p = std::to_string(port);
+    return kPrefix + "no server answered on the local network, so lip sync is the game's own. In PandorumLLM, set the A2F "
+                     "server's Remote IP to this PC and allow port " + p +
+           " (UDP and TCP) through that PC's firewall, or enter its address on SkyrimNet's Settings > Plugins page.";
 }
 
 std::string ModelLine(const std::string& model, const std::string& server, const std::string& device, const std::string& state) {

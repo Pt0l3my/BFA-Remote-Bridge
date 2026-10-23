@@ -684,7 +684,7 @@ void Bridge::OnStates(const std::string& server, const std::string& device, cons
     for (const ModelState& m : models) {
         const bool ready = m.status == static_cast<std::uint8_t>(proto::ModelStatus::Ready);
         std::string state = ready ? "ready" : std::string("not ready (") + proto::ModelStatusName(m.status) + ")";
-        if (!m.detail.empty()) state += " (" + ScrubPaths(m.detail) + ")";  // shown, then a SkyrimNet event: no path
+        if (!m.detail.empty()) state += " (" + ShownServerText(m.detail) + ")";  // shown, then a SkyrimNet event: one line, capped
         monitor_.ModelState(m.name, server, device, state, ready);
     }
 }
@@ -704,6 +704,12 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     std::string why, words;
     Reason reason = Reason::ModelRefused;
     using K = ProbeResult::Kind;
+    if (a.hello.kind == K::NotFound) {
+        // no server address set, and none answered on the local network: the advice once, as for no address in 1.2
+        OrtStatus* status = RefuseWith(real, model, a.detail);  // "no server answered FIND on the local network (...)"
+        monitor_.Once("notfound", NotFoundText(CurrentSettings().serverPort));
+        return status;
+    }
     if (a.hello.kind == K::NoAnswer) {
         reason = Reason::Unreachable;
         why = "the server didn't answer (" + a.detail + ")";
@@ -715,13 +721,13 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     } else {
         reason = Reason::Incompatible;
         why = a.detail;
-        words = "the bridge couldn't send it (" + ScrubPaths(a.detail) + ")";
+        words = "the bridge couldn't send it (" + ShownServerText(a.detail) + ")";
     }
     OrtStatus* status = RefuseWith(real, model, why);
     if (a.hello.kind == K::Answered) {
         // the server's own answer for the model, with its detail, as a monitor line (shown at each change, not again for
         // BFA's retries with the same answer); the detail loses any path first
-        const std::string detail = ScrubPaths(a.detail);
+        const std::string detail = ShownServerText(a.detail);
         monitor_.ModelState(model, a.hello.server, a.hello.device,
                             std::string("not ready (") + proto::ModelStatusName(a.status) + ")" + (detail.empty() ? "" : " (" + detail + ")"),
                             false);
@@ -733,7 +739,7 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
 }
 
 OrtStatus* Bridge::RefuseWith(const OrtApi* real, const std::string& model, const std::string& why) {
-    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + ScrubPaths(why) + "; lines get the game's own lip sync";
+    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + ServerText(why) + "; lines get the game's own lip sync";
     bool fresh = true;
     {
         std::lock_guard lock(sessionsMutex_);
@@ -781,7 +787,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         const std::filesystem::path file(path);
         const std::string name = Utf8Name(file);
 
-        // BFA's GPU route is its own setting: reported, once per session
+        // BFA's GPU route is its own setting, and the hardware is PandorumLLM's choice: logged once, as a fact, at Detailed
         bool gpu = false, tellGpu = false;
         std::vector<proto::Override> overrides;
         {
@@ -790,22 +796,17 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
                 overrides = it->second.overrides;
                 gpu = it->second.gpu;
             }
-            tellGpu = gpu && !gpuLogged_;
+            tellGpu = gpu && !gpuLogged_ && s.logDetail == LogDetail::Detailed;
             if (tellGpu) gpuLogged_ = true;
         }
-        if (tellGpu) {
-            Log(Level::Info,
-                "Better Facial Animations is set to GPU: no lip-sync model runs on this PC's graphics card with the bridge, but BFA "
-                "keeps a device open on it; its Force CPU setting avoids that, and the model runs on the server either way");
-            monitor_.Once("gpu", GpuText());
-        }
+        if (tellGpu)
+            Log(Level::Info, "Better Facial Animations is set to GPU; its model runs on the server either way");
 
         if (!settingsRead_.load() && skyrimNet_.load()) return RefuseWith(real, name, "the bridge's settings weren't read yet");
-        if (!settingsRead_.load() || s.serverAddress.empty()) {
-            const bool skyrimNet = settingsRead_.load() || skyrimNet_.load();  // the settings come from SkyrimNet
-            OrtStatus* status = RefuseWith(real, name,
-                                           skyrimNet ? "no server address is set, so there is no server" : "SkyrimNet isn't loaded, so the bridge has no server address");
-            monitor_.Once("noserver", NoServerText(skyrimNet));
+        if (!settingsRead_.load()) {
+            // the settings come from SkyrimNet; an empty address once they are read means the server is searched for
+            OrtStatus* status = RefuseWith(real, name, "SkyrimNet isn't loaded, so the bridge has no server address");
+            monitor_.Once("noserver", NoServerText());
             return status;
         }
 
@@ -846,10 +847,10 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             PushModelsLocked();
         }
         *out = handle;
-        const std::string detail = ScrubPaths(a.detail);
+        const std::string detail = ServerText(a.detail), shown = ShownServerText(a.detail);
         Log(Level::Info, "Model " + name + " is served by " + a.hello.server + " on " + a.hello.device +
                              (detail.empty() ? std::string() : " (" + detail + ")") + "; nothing of it runs on this PC");
-        monitor_.ModelState(name, a.hello.server, a.hello.device, detail.empty() ? "ready" : "ready (" + detail + ")", true);
+        monitor_.ModelState(name, a.hello.server, a.hello.device, shown.empty() ? "ready" : "ready (" + shown + ")", true);
         return nullptr;
     } catch (...) {
         return real->CreateStatus(ORT_FAIL, "BFA Remote Bridge: the model couldn't be set up; lines get the game's own lip sync");
@@ -915,7 +916,7 @@ void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallba
     try {
         client_.RecordFallback(model, fallback, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
         monitor_.Fallback(reason, model);
-        client_.ReportFallback(reason);
+        client_.ReportFallback(reason, model, fallback.text);  // a line: a NOTICE to a version 2 server
     } catch (...) {
     }
     NanAnswer(real, outputCount, outputs);

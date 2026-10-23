@@ -8,28 +8,62 @@ server does.
 server:
 
 - **BFA stays installed on the gaming PC.** Its game side (catching each line, reading the audio, fitting the face
-  and moving it every frame) and its settings stay there. Tick **Force CPU** in BFA's menu (see below).
+  and moving it every frame) and its settings stay there. You set nothing in BFA's menu for the bridge (see
+  [BFA's mode](#bfas-mode)).
 - **PandorumLLM's PC needs BFA's files too**: the server runs BFA's models there, so it needs the same models and
   runtime as your BFA folder. See [On PandorumLLM's PC](#on-pandorumllms-pc).
 - **What still runs on the gaming PC:** BFA's game side only. The model runs on the server, on the card PandorumLLM
-  is set to use; PandorumLLM chooses the hardware, and the bridge only reports it.
+  is set to use. The hardware the model runs on is chosen in PandorumLLM, and nowhere in Skyrim: the bridge only
+  reports it.
 
 BFA runs NVIDIA's Audio2Face models through ONNX Runtime every time an NPC speaks. When the gaming PC's graphics card
 is already busy drawing the game, each burst of inference pushes frames back and the game stutters. With the bridge,
-the arithmetic happens on the server's PC, and BFA gets the results back. BFA's files are never changed: the bridge
-attaches to BFA in memory when the game starts.
+the arithmetic happens on the server's PC, and BFA gets the results back. BFA's program files are never changed: the
+bridge attaches to BFA in memory when the game starts. The one file of BFA's it writes is BFA's INI, to set its CPU
+mode (see [BFA's mode](#bfas-mode)).
+
+## What's new in 1.3.0
+
+Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1.1:
+
+- **The server is found by itself.** Leave **Server address** empty and the bridge finds PandorumLLM's A2F server on
+  your local network, once its Remote IP is set to the gaming PC (a PandorumLLM that speaks the bridge's protocol
+  version 2: a PandorumLLM release after v3.97 Beta patch7). Allow **UDP as well as TCP** on the port in the server
+  PC's firewall, for private networks only. An older server still works with its address entered.
+- **Protocol version 2, and version 1 still.** The bridge speaks version 2 to a server that does, and version 1 to an
+  older one (PandorumLLM v3.97 Beta patch7 and earlier), by itself. An older PandorumLLM, patch7 included, can't be found
+  on the network: enter its address on SkyrimNet's page.
+- **The server hears of each line that falls back** (a NOTICE, at most one a minute, naming the model, the reason and
+  what happened), so PandorumLLM's panel can show it. An older server is told by the bridge's short status check,
+  with the reason in it.
+- **The monitor** (from 1.2.0): one line per model on screen with the card and the server that run it and its
+  state, and a note when lines fall back to the game's own lip sync, and when they're back. See
+  [The monitor](#the-monitor).
+- **A simpler settings page** (from 1.2.0): the server address and port, Status on load and Log detail. Bridge,
+  Access key, Timeout and Check results are gone, and nothing about hardware is asked on the gaming PC.
+- **No model on the gaming PC, ever** (from 1.2.0): with no server, lip sync is the game's own.
+- **Any BFA version is tried** (from 1.2.0), and what the bridge can't serve is said on screen.
+- **BFA's mode, set by the bridge.** With a PandorumLLM server that speaks protocol version 2, the bridge switches
+  BFA to its CPU mode itself, from the next game start, so BFA opens nothing on this PC's graphics card. Nothing to
+  tick in BFA's menu, and nothing about hardware asked anywhere in Skyrim.
+- **Server texts on one line:** a server's detail (such as ONNX Runtime's message for a model that failed to load)
+  is shown on one line, without folders or memory addresses, and cut at about 160 characters.
+
+[CHANGELOG.md](CHANGELOG.md) has every change.
 
 ## How it works
 
 - At start-up the bridge finds `BetterFacialAnimations.dll` and redirects its one lookup of ONNX Runtime's entry
-  point, so BFA's calls to the runtime pass through the bridge. That is the only thing it changes of BFA's.
+  point, so BFA's calls to the runtime pass through the bridge. That is the only change it makes to BFA's code;
+  besides it, the bridge sets one setting in BFA's INI ([BFA's mode](#bfas-mode)).
 - **With the bridge, no BFA model runs on the gaming PC**, neither on its graphics card nor on its processor. When BFA
   loads a model, the bridge asks the server to load the same file (matched by name, size and SHA-256); every run then
   goes to the server, BFA's warm-up run included.
 - **There is no local fallback.** A late lip sync looks worse than none, and running the model on the processor
   stutters too. The runtime's other ways to make a session (from memory, with prepacked weights, the model editor's)
   are refused with an error naming them, since a model loaded so would run on this PC:
-  - With no server address set, BFA's model isn't loaded and lip sync is the game's own; a note says so once.
+  - With no server address set and no server found on the local network, BFA's model isn't loaded and lip sync is
+    the game's own; a note says so once.
   - If the server can't load the model (it isn't running, it lacks the file or has another copy), BFA's model isn't
     loaded, and lip sync is the game's own. Start the server, then reload the model in BFA's menu or restart the game.
   - If the server doesn't answer a call in time (1000 ms), that one line gets the game's own lip sync, BFA keeps its
@@ -38,6 +72,16 @@ attaches to BFA in memory when the game starts.
   - If the connection fails (the server stops, the network drops, or two calls in a row time out), the bridge pauses:
     lines get the game's own lip sync at once, without waiting, while the bridge reconnects in the background (after
     1, 2, 5, 10 and 30 seconds, then every 30 seconds). Speech goes back to the server the moment it answers again.
+- **Finding the server.** With the address setting empty, the bridge sends a small search (FIND, on UDP) to each of
+  the gaming PC's network adapters' broadcast addresses on the port setting, at start-up and after a lost connection,
+  at most once every 5 seconds while none answers, and connects to the first server that answers. Its address is
+  never logged.
+- **Protocol versions.** The bridge opens each connection in protocol version 2; a server that speaks only version 1
+  says so (or, as v3.97-p6 and earlier can, drops the connection twice without an answer), and the bridge then speaks
+  version 1 to it until the game restarts or the address changes.
+- **BFA's mode.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode
+  itself, from the next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the
+  server. See [BFA's mode](#bfas-mode).
 - The bridge keeps one connection for speech. When BFA loads a model, the server loads it on a short-lived connection
   of its own, so the lines of a model already loaded keep flowing meanwhile. After a minute without speech the bridge
   checks the connection (PING), so it is ready before the next line needs it.
@@ -57,7 +101,8 @@ attaches to BFA in memory when the game starts.
 - SkyrimNet Beta26 or later: the bridge's settings are on its Settings > Plugins page.
 - Better Facial Animations (tested with 4.3.2, which ships ONNX Runtime 1.24.4). Other versions are tried too.
 - PandorumLLM's A2F server on another PC of your local network, holding the same BFA files as your gaming PC (or any
-  server that speaks [the bridge's protocol](docs/PROTOCOL.md)).
+  server that speaks [the bridge's protocol](docs/PROTOCOL.md)). Finding it by itself needs one that speaks protocol
+  version 2; an older one is reached by its address.
 
 ## Install (Mod Organizer 2)
 
@@ -66,12 +111,14 @@ attaches to BFA in memory when the game starts.
    `SKSE/Plugins/SkyrimNet/external/pt0l3my.bfaremotebridge/`.
 2. Enable it, below Better Facial Animations or anywhere: the order doesn't matter. Keep BFA enabled.
 3. Set up PandorumLLM's PC (below).
-4. In the game, open SkyrimNet's **Settings > Plugins** page, find **BFA Remote Bridge**, enter the address of
-   PandorumLLM's PC, save, and restart the game.
+4. That's all for a PandorumLLM that speaks protocol version 2: the bridge finds it. For an older one, open
+   SkyrimNet's **Settings > Plugins** page in the game, find **BFA Remote Bridge**, enter the address of PandorumLLM's
+   PC, save, and restart the game.
 
 By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 
-To run BFA on its own again, disable the bridge in Mod Organizer 2.
+To run BFA on its own again, disable the bridge in Mod Organizer 2. If you remove the bridge, BFA keeps the CPU
+mode the bridge set; BFA's own menu shows it.
 
 ## On PandorumLLM's PC
 
@@ -86,24 +133,32 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 2. In PandorumLLM's panel, point the A2F server's **Model folder** at that folder, and choose the card it runs on.
 3. Set **Remote IP** to the gaming PC's address on your network. Until it is set, the A2F server listens on its own
    PC only (127.0.0.1) and refuses the gaming PC; once set, it listens on the network and admits only that address,
-   its own PC and 127.0.0.1. Allow the port (7871) through that PC's firewall, for private networks only.
+   its own PC and 127.0.0.1; it also answers the bridge's search from that address alone. Allow the port (7871 by
+   default) through that PC's firewall for **UDP as well as TCP**, for private networks only: TCP carries the lines, UDP the
+   search.
 4. **Keep both copies the same version.** After updating BFA on the gaming PC, copy its folder again: a model that
    differs from the server's copy (by size or SHA-256) is refused, and its lines get the game's own lip sync.
 
-## Set BFA to Force CPU
+## BFA's mode
 
-**Tick Force CPU in BFA's menu once.** It costs nothing: with the bridge, the model runs on the server either way.
+The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you set nothing about it on the gaming PC.
 
-- BFA's GPU mode is BFA's own setting, and the bridge doesn't change it. In GPU mode BFA opens a graphics device of
-  its own on the gaming PC's card when it starts (idle afterwards, since the runs go to the server). Force CPU avoids
-  that device.
-- The bridge notices BFA's GPU mode and says so once per session: "BFA Remote Bridge: BFA is set to GPU, so it keeps
-  a graphics device open on this PC. Tick Force CPU in BFA's menu: its model runs on the server either way."
-- In GPU mode BFA also reacts to a refused model load or a failed warm-up as to a failing card: with its independent
-  device it turns its GPU route off until you press "Try GPU again" in its menu. Another reason for Force CPU.
-- BFA's CPU route sets none of the fixed input sizes its GPU route gives the runtime, so the server builds its
-  sessions without them. Both sides measure one session with Force CPU before deciding whether the server should set
-  them ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), "To measure").
+- With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode itself, from the
+  next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the server. It writes
+  `ForceCPU=1` under `[General]` in BFA's own `BetterFacialAnimations.ini` (BFA reads that file once, as the game
+  starts), says so once in its log, and writes it again at each game save, so a change in BFA's menu in the same
+  session doesn't undo it. In Mod Organizer 2 the change goes to BFA's own file, in BFA's mod folder, and the
+  bridge's new file below to Overwrite.
+- When it changes the setting, the bridge notes that it did, in its own `SKSE/Plugins/BFARemoteBridge.ini`. With a
+  server that speaks only protocol version 1 (PandorumLLM v3.97 Beta patch7 and earlier), it puts BFA's value back, from
+  the next game start: it sets BFA's CPU mode only for a server that speaks version 2. When its note is missing or
+  unreadable, it puts nothing back. It never creates BFA's INI: without that file, BFA's mode is left as it is.
+- Only for Better Facial Animations 4.3.2.3, the version whose sizes version 2 servers carry: any other BFA version's
+  mode is left as it is, and a value the bridge set earlier is put back.
+- In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime, and a version 2 server fills
+  in BFA 4.3.2.3's own (part of protocol version 2, agreed with PandorumLLM's side;
+  [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5).
+- No setting and no note on screen: the log line is all.
 
 ## Settings
 
@@ -112,8 +167,8 @@ the bridge: the hardware the model runs on is chosen in PandorumLLM.
 
 | Setting | Default | What it does |
 |---|---|---|
-| Server address | (empty) | The address of PandorumLLM's PC on your local network. Empty means no server: BFA's model isn't loaded, lip sync is the game's own, and a note says so once. Finding PandorumLLM's PC by itself comes with bridge 1.3.0 ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md)). |
-| Port | 7871 | The A2F server's port, as set in PandorumLLM. Used with the address above. |
+| Server address | (empty) | The address of PandorumLLM's PC on your local network. Empty means the bridge finds the server on the local network by itself (a PandorumLLM that speaks protocol version 2, its Remote IP set to the gaming PC). When none answers, BFA's model isn't loaded, lip sync is the game's own, and a note says so once. Enter the address for an older server. |
+| Port | 7871 | The A2F server's port, as set in PandorumLLM: used with the address above, and for finding the server when the address is empty. |
 | Status on load | on | Shows on screen, at each game load and when a model is served, which card and server run each of BFA's models. Notes about lines getting the game's own lip sync show either way. |
 | Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt. |
 
@@ -139,16 +194,20 @@ The bridge tells you on screen what the server does, one line per model, from th
   time.";
 - when lines are back on the server after such a note, at most once a minute: "BFA Remote Bridge: a2f3_fp16.onnx:
   lines are back on the server." (without the model when another model's line came back);
-- once per session: no server address set, BFA set to GPU, the bridge unable to attach, or a runtime it can't serve.
+- once per session: no server found on the local network, SkyrimNet missing, the bridge unable to attach, or a
+  runtime it can't serve.
 
-No path reaches a note: a server's detail loses any folder first.
+A server's detail (such as ONNX Runtime's message for a model that failed to load) is put on one line, loses any
+folder and memory address, and is cut at about 160 characters on screen; the log keeps the whole line.
 
 Every note begins with "BFA Remote Bridge:" and uses plain words (Skyrim's fonts can't draw emoji). The notes are
 Skyrim's own corner notifications, so SkyrimNet sees each one as a `notification` event: a SkyrimNet workflow trigger
 can react to them by that beginning.
 
-The server is told too: when a line falls back, the bridge sends its status check within seconds (at most one every
-30 seconds) with the reason in its client string, so PandorumLLM's log shows it.
+The server is told too, so PandorumLLM's panel can show it: when a line falls back, a server that speaks protocol
+version 2 gets a NOTICE on the speech connection (the model, the reason, what happened and how many lines fell back
+since the last), at most one a minute; an older server gets the bridge's status check within seconds (at most one
+every 30 seconds) with the reason in its client string.
 
 ## The log
 
@@ -157,8 +216,10 @@ The server is told too: when a line falls back, the bridge sends its status chec
 - whether BFA was found, its version, and whether the bridge attached to it, or why not;
 - the ONNX Runtime BFA loaded, and any runtime or API version the bridge can't serve, or any newer entry BFA called;
 - the settings (the server address only as set or not);
+- with the address empty, the server found on the local network, by its name and port (never its address), or that
+  none answered;
 - the server's first answer at start-up (its name and device, such as "PandorumLLM ... A2F" on "DirectML 0: ..." or
-  "CPU: ...");
+  "CPU: ...", and the protocol version it answered in), and, once, that a server speaks protocol version 1 only;
 - each model BFA loads: its size, SHA-256 and overrides, and whether the server serves it ("is served by ...;
   nothing of it runs on this PC") or why not, with the server's note when it runs another model in that role's place;
   a refusal BFA meets again on its retries is logged once;
@@ -175,9 +236,10 @@ The server is told too: when a line falls back, the bridge sends its status chec
 
 With Log detail set to Detailed it also logs one line per run, each connection opened or closed and why, each answer
 to HELLO, each unanswered PING, each late answer discarded, each background reconnection attempt and each status
-check sent for a fallback.
+check sent for a fallback or NOTICE, each search sent and each datagram ignored, and BFA's GPU mode, once, as a
+fact.
 
-The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.2.0
+The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.3.0
 (answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)", and every 5 minutes, when they changed, it sends
 them on a short connection of its own, so PandorumLLM's panel shows them.
 
@@ -186,16 +248,15 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | You see | What to do |
 |---|---|
 | "Better Facial Animations wasn't found, so the bridge is idle." | Install and enable BFA: the bridge works with it, not instead of it. |
-| "no server address is set" | Enter the address of PandorumLLM's PC on SkyrimNet's page, save, and restart. |
+| "no server answered on the local network" | No server was found. In PandorumLLM, start the A2F server and set its Remote IP to the gaming PC's address; allow the port (7871 by default) through the server PC's firewall for UDP as well as TCP, private networks only; and check both PCs are on the same network. A PandorumLLM older than protocol version 2 (v3.97 Beta patch7 and earlier) can't be found: enter its address on SkyrimNet's page instead, save, and restart. The log says what the search sent and whether anything answered. |
 | "SkyrimNet wasn't found" | Install SkyrimNet Beta26 or later: the settings are read from it. |
-| "the server isn't answering" | Start PandorumLLM's A2F server, check the address and port, set its Remote IP to the gaming PC, and allow the port through the server PC's firewall (private networks only). Then reload the model in BFA's menu, or restart. |
+| "the server isn't answering" | Start PandorumLLM's A2F server, check the address (if one is set) and the port, set its Remote IP to the gaming PC, and allow the port through the server PC's firewall for UDP as well as TCP (private networks only). Then reload the model in BFA's menu, or restart. |
 | "the server refused the access key" | The bridge has no access key any more: turn the key off in PandorumLLM's A2F settings. |
 | "the server lacks ... or has a different copy" | Copy the gaming PC's `BetterFacialAnimations` folder to the server's Model folder again: the two must be the same BFA version. |
 | "couldn't attach to Better Facial Animations" | This BFA looks ONNX Runtime up in a way the bridge doesn't know, or another mod loaded it first: the log says which. BFA runs on this PC as usual; update the bridge. |
 | "uses ONNX Runtime ..., which the bridge can't serve" | BFA's model isn't loaded and lip sync is the game's own. For a runtime newer than the bridge knows, update the bridge; for one older than 1.10, update BFA. |
 | "runtime entry ... which the bridge doesn't know" | This BFA's runtime is newer than the bridge knows: update the bridge. |
 | Lips on the game's own animation now and then | The notes and the log's "not answered" lines and summaries say why. |
-| "BFA is set to GPU" | Tick Force CPU in BFA's menu (see above). |
 
 ## Building
 

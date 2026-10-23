@@ -22,9 +22,12 @@
 #include <random>
 #include <thread>
 
+#include "PosixDiscovery.h"
 #include "PosixTransport.h"
 #include "Test.h"
+#include "core/BfaMode.h"
 #include "core/Bridge.h"
+#include "core/Sha256.h"
 #include "core/Scrub.h"
 #include "core/Status.h"
 
@@ -515,7 +518,8 @@ TEST(ForwardFailuresAnswerNanAndPause) {
 // its own answer on the same connection.
 TEST(ForwardLateAnswerIsDiscarded) {
     Need();
-    Server server(Models(), {"--delay-ms", "600", "--fault-count", "1"});
+    const fs::path notices = TempFolder("notices") / "notices.jsonl";
+    Server server(Models(), {"--delay-ms", "600", "--fault-count", "1", "--notice-log", notices.string()});
     Settings s = On(server.Port());
     s.timeoutMs = 300;
     s.logDetail = LogDetail::Detailed;
@@ -542,10 +546,18 @@ TEST(ForwardLateAnswerIsDiscarded) {
     // the monitor: the model's line, the fallback's note, then back on the server
     CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since the server didn't answer in time."), 1);
     CHECK_EQ(h.CountNotes("tiny.onnx: lines are back on the server."), 1);
-    // the server told, by a status check with the reason
+    // the server told, by NOTICE (it answered in version 2): the model, the reason, the detail and one line
     h.bridge.Connection().Tick();
-    CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+    CHECK_EQ(h.bridge.Connection().NoticesSent(), 1);
+    CHECK_EQ(h.bridge.Connection().FallbackReports(), 0);  // the status check's `fallback` is for a version 1 server
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the server writes it
+    std::ifstream file(notices);
+    std::string line;
+    std::getline(file, line);
+    CHECK(line.rfind(R"({"client": "BFARemoteBridge )", 0) == 0);
+    CHECK(line.find(R"(", "model": "tiny.onnx", "reason": "timeout", "detail": "no answer within 300 ms", "lines": 1})") != std::string::npos);
     h.api->ReleaseSession(session);
+    fs::remove_all(notices.parent_path());
 }
 
 // A late ERROR that ends the connection (here 7, the server stopping), then the background thread's reconnect.
@@ -615,26 +627,109 @@ TEST(ForwardServerGoneAfterLoad) {
     h.api->ReleaseSession(session);
 }
 
-// No server address: every model load is refused (nothing runs on this PC), lines get the game's own lip sync, and
-// the note says so once, however often BFA tries again; the same refusal is logged once.
-TEST(ForwardNoServerAddressRefusesEveryLoad) {
+// No server address, and no server answers FIND (one without a Remote IP, one with another Remote IP): every model
+// load is refused (nothing runs on this PC), lines get the game's own lip sync, and the note says so once, however
+// often BFA tries again; the same refusal is logged once, and the search goes at most every 5 s.
+TEST(ForwardNoServerFoundRefusesEveryLoad) {
     Need();
-    Harness h(Settings{});
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    for (const std::vector<std::string>& args : {std::vector<std::string>{}, std::vector<std::string>{"--remote-ip", "127.0.0.2"}}) {
+        Server server(Models(), args);
+        Settings s;
+        s.serverPort = server.Port();
+        Harness h(s);
+        h.bridge.Connection().SetDiscovery(LoopbackSearch());
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            OrtSession* session = nullptr;
+            OrtStatus* st = h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session);
+            CHECK(st != nullptr);
+            const std::string message = h.api->GetErrorMessage(st);
+            h.api->ReleaseStatus(st);
+            CHECK(message.find("tiny.onnx isn't loaded, since no server answered FIND on the local network (port " +
+                               std::to_string(server.Port()) + ", 1 broadcast address); lines get the game's own lip sync") !=
+                  std::string::npos);
+            CHECK(message.find("on the local network (no server") == std::string::npos);  // said once
+            CHECK(session == nullptr);
+        }
+        CHECK_EQ(h.bridge.Connection().Searches(), 1);  // within 5 s of the last search: none
+        CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
+        CHECK_EQ(h.CountNotes("no server answered on the local network, so lip sync is the game's own"), 1);
+        CHECK_EQ(h.CountNotes("allow port " + std::to_string(server.Port()) + " (UDP and TCP)"), 1);
+        CHECK_EQ(h.notes.size(), std::size_t{1});
+        CHECK_EQ(h.CountLogged("tiny.onnx isn't loaded, since no server answered FIND on the local network"), 1);
+        CHECK_EQ(h.CountLogged("no server answered FIND on the local network"), 2);  // the search's line, and the refusal's
+        g_now += std::chrono::seconds(5);  // the next search
         OrtSession* session = nullptr;
         OrtStatus* st = h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session);
-        CHECK(st != nullptr);
-        const std::string message = h.api->GetErrorMessage(st);
-        h.api->ReleaseStatus(st);
-        CHECK(message.find("tiny.onnx isn't loaded, since no server address is set") != std::string::npos);
-        CHECK(session == nullptr);
+        if (st) h.api->ReleaseStatus(st);
+        CHECK_EQ(h.bridge.Connection().Searches(), 2);
+        const Stats stats = h.bridge.Statistics();
+        CHECK_EQ(stats.forwarded + stats.unanswered, 0u);
     }
-    CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
-    CHECK_EQ(h.CountNotes("no server address is set, so lip sync is the game's own"), 1);
-    CHECK_EQ(h.notes.size(), std::size_t{1});
-    CHECK_EQ(h.CountLogged("tiny.onnx isn't loaded, since no server address is set"), 1);
-    const Stats stats = h.bridge.Statistics();
-    CHECK_EQ(stats.forwarded + stats.unanswered, 0u);
+}
+
+// No server address: FIND finds the reference server (its Remote IP this PC), the model loads, and lines go to it on
+// the port FIND reached. No address reaches the log.
+TEST(ForwardFindsTheServerOnTheLocalNetwork) {
+    Need();
+    Server server(Models(), {"--remote-ip", "127.0.0.1"});
+    Settings s;
+    s.serverPort = server.Port();
+    s.timeoutMs = 2000;
+    Harness h(s);
+    h.bridge.Connection().SetDiscovery(LoopbackSearch());
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    CHECK(h.bridge.IsBridgeSession(session));
+    CHECK_EQ(h.CountLogged("Found the server on the local network: BFA Remote Bridge reference server"), 1);
+    CHECK_EQ(h.bridge.Connection().ServerVersion(), 2);
+    TinyInputs in(h.api, h.cpu, 4);
+    for (int i = 0; i < 3; ++i) {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    h.bridge.Connection().Tick();  // the start-up status check: to the server found, no second search
+    CHECK_EQ(h.bridge.Connection().Searches(), 1);
+    CHECK_EQ(h.bridge.Statistics().forwarded, 3u);
+    {
+        std::lock_guard lock(h.mutex);
+        for (const auto& l : h.log) CHECK(l.find("127.0.0.1") == std::string::npos);
+    }
+    h.api->ReleaseSession(session);
+}
+
+// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the version 2 HELLO with ERROR 6 framed in version 1:
+// the bridge connects again in version 1, says so once, and stays on version 1 for it. A fallback is told by the
+// status check (`fallback REASON`), never by NOTICE.
+TEST(ForwardVersionOneServer) {
+    Need();
+    const fs::path notices = TempFolder("notices-v1") / "notices.jsonl";
+    Server server(Models(), {"--v1-only", "--run-error", "4", "--fault-count", "1", "--notice-log", notices.string()});
+    Settings s = On(server.Port());
+    s.logDetail = LogDetail::Detailed;
+    Harness h(s);
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    CHECK(h.bridge.IsBridgeSession(session));
+    CHECK_EQ(h.bridge.Connection().ServerVersion(), 1);
+    CHECK_EQ(h.CountLogged("The server speaks protocol version 1 only"), 1);
+    TinyInputs in(h.api, h.cpu, 5);
+    const auto run = [&] {
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        return !IsNanAnswer(h.api, out.v[0]);
+    };
+    CHECK(!run());  // ERROR 4, the test option's: the line falls back
+    CHECK(run());
+    h.bridge.Connection().Tick();  // the start-up status check, then the one for the fallback
+    CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+    CHECK_EQ(h.bridge.Connection().NoticesSent(), 0);
+    CHECK(!fs::exists(notices) || fs::file_size(notices) == 0);
+    CHECK(run());
+    CHECK_EQ(h.CountLogged("The server speaks protocol version 1 only"), 1);  // once
+    CHECK_EQ(h.bridge.Statistics().forwarded, 2u);
+    h.api->ReleaseSession(session);
+    fs::remove_all(notices.parent_path());
 }
 
 TEST(ForwardHelloAgainWhenSessionsChange) {
@@ -671,10 +766,91 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     fs::remove_all(folder);
 }
 
+// A server that closes as PandorumLLM v3.97-p6 and earlier do, with the version 2 HELLO's payload unread (which can
+// reset the connection before its ERROR 6 is read): either way the bridge ends on version 1, and lines go.
+TEST(ForwardP6ServerEndsOnVersionOne) {
+    Need();
+    for (int i = 0; i < 3; ++i) {
+        Server server(Models(), {"--p6"});
+        Settings s = On(server.Port());
+        s.logDetail = LogDetail::Detailed;
+        Harness h(s);
+        OrtSession* session = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+        CHECK_EQ(h.bridge.Connection().ServerVersion(), 1);
+        CHECK_EQ(h.CountLogged("The server speaks protocol version 1 only"), 1);
+        TinyInputs in(h.api, h.cpu, 7);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+        std::printf("        p6 try %d: %s\n", i,
+                    h.Logged("two version 2 HELLOs got no answer") ? "no frame twice" : "ERROR 6 read");
+        h.api->ReleaseSession(session);
+    }
+}
+
+// BFA's mode follows the version the server answers in, never a detail's words: a version 1 server that fills in
+// BFA's sizes when a HELLO lists none (as PandorumLLM's patch7 does), and says so in the row's detail, still gets BFA's
+// own mode; a version 2 server gets its CPU mode.
+namespace {
+struct MemoryIni final : IniStore {
+    int forceCpu = 0;
+    bool setByBridge = false;
+    bool BfaIniPresent() override { return true; }
+    int ReadForceCpu() override { return forceCpu; }
+    bool WriteForceCpu(int v, std::string&) override {
+        forceCpu = v;
+        return true;
+    }
+    bool ReadSetByBridge() override { return setByBridge; }
+    bool WriteSetByBridge(bool v, std::string&) override {
+        setByBridge = v;
+        return true;
+    }
+};
+}  // namespace
+
+TEST(ForwardBfaModeFollowsTheVersionNotTheDetail) {
+    Need();
+    std::uint64_t size = 0;
+    Sha256::Digest digest{};
+    std::string err;
+    CHECK(HashFile(Models() / "tiny.onnx", size, digest, err));
+    const std::string fill = Sha256::Hex(digest) + ":batch=2";
+    for (const bool v1 : {true, false}) {
+        std::vector<std::string> args = {"--fill-sizes", fill};
+        if (v1) args.push_back("--v1-only");
+        Server server(Models(), args);
+        Harness h(On(server.Port()));
+        auto store = std::make_unique<MemoryIni>();
+        MemoryIni* ini = store.get();
+        BfaCpuMode mode(std::move(store), nullptr);
+        mode.SetBfaVersion(kCpuModeBfaVersion);
+        h.bridge.Connection().OnVersion([&](std::uint16_t version) { mode.OnServerVersion(version); });
+        OrtSession* session = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {}, &session));  // BFA's CPU mode: no sizes listed
+        CHECK(h.Logged("(built with BFA 4.3.2.3's sizes)"));
+        CHECK_EQ(h.CountNotes("tiny.onnx on "), 1);
+        TinyInputs in(h.api, h.cpu, 6);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+        CHECK_EQ(h.bridge.Connection().ServerVersion(), v1 ? 1 : 2);
+        CHECK_EQ(mode.Set(), !v1);
+        CHECK_EQ(ini->forceCpu, v1 ? 0 : 1);
+        h.bridge.Connection().OnVersion(nullptr);
+        h.api->ReleaseSession(session);
+    }
+}
+
+// BFA's GPU mode is its own choice, and the hardware PandorumLLM's: the bridge passes it through, says nothing about
+// it on screen, and logs it once as a fact, at Detailed only.
 TEST(ForwardGpuModeIsLoggedAndPassedThrough) {
     Need();
     Server server(Models());
-    Harness h(On(server.Port()));
+    Settings detailed = On(server.Port());
+    detailed.logDetail = LogDetail::Detailed;
+    Harness h(detailed);
     // the DirectML provider isn't in the Linux runtime: the wrapped calls pass its refusal on unchanged
     const void* dml = nullptr;
     OrtStatus* st = h.api->GetExecutionProviderApi("DML", ORT_API_VERSION, &dml);
@@ -689,25 +865,22 @@ TEST(ForwardGpuModeIsLoggedAndPassedThrough) {
     Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s1, true));
     h.api->ReleaseSession(s1);
     Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s2, true));
-    CHECK_EQ(h.CountLogged("set to GPU"), 1);
+    CHECK_EQ(h.CountLogged("Better Facial Animations is set to GPU; its model runs on the server either way"), 1);
     h.api->ReleaseSession(s2);
-    // the note on screen: once per session, whatever Status on load says (it asks the player to act)
-    CHECK_EQ(h.CountNotes("BFA is set to GPU"), 1);
-    CHECK_EQ(h.CountNotes("Tick Force CPU in BFA's menu"), 1);
+    // nothing on screen about it, and no advice anywhere
+    CHECK_EQ(h.CountNotes("GPU"), 0);
+    CHECK_EQ(h.CountNotes("Force CPU"), 0);
+    CHECK_EQ(h.CountLogged("Force CPU"), 0);
+    // at the normal detail, not logged either
     Settings quiet = On(server.Port());
     quiet.showStatus = false;
     Harness q(quiet);
     OrtSession* s3 = nullptr;
     Ok(q.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s3, true));
-    CHECK_EQ(q.CountNotes("BFA is set to GPU"), 1);
+    CHECK_EQ(q.CountLogged("set to GPU"), 0);
+    CHECK_EQ(q.CountNotes("GPU"), 0);
     CHECK_EQ(q.CountNotes(": ready"), 0);  // the ready line follows Status on load
     q.api->ReleaseSession(s3);
-    // not in CPU mode
-    Harness cpu(On(server.Port()));
-    OrtSession* s4 = nullptr;
-    Ok(cpu.Create(Models() / "tiny.onnx", {{"batch", 2}}, &s4));
-    CHECK_EQ(cpu.CountNotes("BFA is set to GPU"), 0);
-    cpu.api->ReleaseSession(s4);
 }
 
 namespace {

@@ -1,10 +1,11 @@
 #pragma once
 // The plugin's parts (Windows only): the hook in Better Facial Animations' import of GetProcAddress, SkyrimNet's
-// settings, the Winsock transport and the log.
+// settings, the Winsock transport and search, and the log.
 
 #include <string>
 #include <vector>
 
+#include "core/BfaMode.h"
 #include "core/Bridge.h"
 #include "core/Settings.h"
 #include "core/Transport.h"
@@ -38,6 +39,20 @@ bool SkyrimNetLoaded();
 
 TransportFactory WinsockFactory();
 bool WinsockResolve(const std::string& host, std::uint16_t port, std::vector<Endpoint>& out, std::string& err);
+bool WinsockStarted();  // WSAStartup, once
+
+// ---- WinsockDiscovery.cpp
+
+// FIND and FOUND on UDP: FIND to each IPv4 adapter's own broadcast address, from the adapter list Windows reports
+// (GetAdaptersAddresses: adapters that are up, not loopback, prefixes shorter than /31), never to 255.255.255.255.
+DiscoveryFactory WinsockDiscovery();
+
+// ---- BfaIni.cpp
+
+// BFA's INI (Data\SKSE\Plugins\BetterFacialAnimations.ini, the relative path BFA itself uses) and the bridge's own
+// state (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] ForceCPUSetByBridge), through Windows' profile calls, as
+// BFA's. BFA's INI is never created.
+std::unique_ptr<IniStore> BfaIniStore();
 
 // ---- Main.cpp
 

@@ -11,13 +11,7 @@
 namespace bfarb::plugin {
 namespace {
 
-bool Started() {
-    static const bool started = [] {
-        WSADATA data{};
-        return ::WSAStartup(MAKEWORD(2, 2), &data) == 0;
-    }();
-    return started;
-}
+bool Started() { return WinsockStarted(); }
 
 std::string ErrorText(int code) {
     switch (code) {
@@ -164,6 +158,14 @@ private:
 };
 
 }  // namespace
+
+bool WinsockStarted() {
+    static const bool started = [] {
+        WSADATA data{};
+        return ::WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    }();
+    return started;
+}
 
 TransportFactory WinsockFactory() {
     return [] { return std::make_unique<WinsockTransport>(); };

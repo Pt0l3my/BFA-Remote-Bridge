@@ -8,6 +8,7 @@
 
 #include "core/Scrub.h"
 #include "core/Version.h"
+#include "core/Monitor.h"
 
 namespace bfarb {
 namespace {
@@ -29,9 +30,10 @@ std::string Join(const std::vector<std::string>& parts) {
     return s;
 }
 
-// The server's texts lose any path before they are logged or shown (a note becomes a SkyrimNet event).
+// The server's texts go on one line and lose any path or address before they are logged or shown (a note becomes a
+// SkyrimNet event).
 std::string ErrorText(const proto::Error& e) {
-    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + ScrubPaths(e.message));
+    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + ServerText(e.message));
 }
 
 int MillisLeft(Clock::time_point deadline) {
@@ -52,12 +54,14 @@ std::uint32_t U32(const std::uint8_t* p) {
 
 bool IsType(const proto::Header& h, MsgType t) { return h.type == static_cast<std::uint16_t>(t); }
 
-// One request and its answer on t by the deadline. With owed, whole frames answering a request that timed out earlier
-// on this connection (RUN_OK or ERROR with an owed request id other than `awaited`) are read and discarded first; a
-// discarded ERROR that ends the connection fails the exchange. False with failure and reason otherwise.
-bool Transact(Transport& t, MsgType type, const std::vector<std::uint8_t>& payload, Clock::time_point deadline,
+// One request and its answer on t by the deadline, framed in `version`; the answer must be framed in it too (with
+// olderError, an ERROR framed in an older version also passes: a version 1 server's answer to a version 2 HELLO). With
+// owed, whole frames answering a request that timed out earlier on this connection (RUN_OK or ERROR with an owed
+// request id other than `awaited`) are read and discarded first; a discarded ERROR that ends the connection fails the
+// exchange. False with failure and reason otherwise.
+bool Transact(Transport& t, MsgType type, const std::vector<std::uint8_t>& payload, std::uint16_t version, Clock::time_point deadline,
               std::vector<std::uint32_t>* owed, std::uint32_t awaited, proto::Header& header, std::vector<std::uint8_t>& answer,
-              Failure& failure, std::string& reason, const Note& note) {
+              Failure& failure, std::string& reason, const Note& note, bool olderError = false) {
     const auto fail = [&](Failure f, std::string why) {
         failure = f;
         reason = std::move(why);
@@ -65,7 +69,7 @@ bool Transact(Transport& t, MsgType type, const std::vector<std::uint8_t>& paylo
     };
     std::vector<std::uint8_t> frame;
     std::string err;
-    if (!proto::EncodeFrame(type, payload, frame, err)) return fail(Failure::Encode, "couldn't encode the request (" + err + ")");
+    if (!proto::EncodeFrame(type, payload, frame, err, version)) return fail(Failure::Encode, "couldn't encode the request (" + err + ")");
     Transport::Result r = t.SendAll(frame.data(), frame.size(), deadline, err);
     if (r != Transport::Result::Ok) {
         const Failure f = r == Transport::Result::TimedOut ? Failure::MidFrame
@@ -90,6 +94,10 @@ bool Transact(Transport& t, MsgType type, const std::vector<std::uint8_t>& paylo
         if (r != Transport::Result::Ok)
             return fail(r == Transport::Result::TimedOut ? Failure::MidFrame : Failure::Lost, "the server's answer was cut short (" + err + ")");
         if (!proto::DecodeHeader(head, header, err)) return fail(Failure::Malformed, "the server's answer is malformed (" + err + ")");
+        // each side answers in the version the other opened with
+        if (header.version != version && !(olderError && header.version < version && IsType(header, MsgType::Error)))
+            return fail(Failure::Malformed, "the server answered in protocol version " + std::to_string(header.version) + ", not " +
+                                                std::to_string(version));
         answer.resize(header.length);
         if (header.length > 0) {
             r = t.ReceiveAll(answer.data(), answer.size(), deadline, err);
@@ -123,9 +131,10 @@ struct HelloAnswer {
     std::vector<proto::ModelReply> models;
 };
 
-// HELLO on t and its answer, checked against the models it listed (the same, in the same order).
-bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadline, std::vector<std::uint32_t>* owed, HelloAnswer& out,
-              Failure& failure, std::string& reason, const Note& note) {
+// HELLO on t in `version` and its answer, checked against the models it listed (the same, in the same order). A
+// version 2 HELLO answered with ERROR 6 framed in version 1 fails with OlderVersion: a version 1 server.
+bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Clock::time_point deadline, std::vector<std::uint32_t>* owed,
+              HelloAnswer& out, Failure& failure, std::string& reason, const Note& note) {
     out = HelloAnswer{};
     std::vector<std::uint8_t> payload, answer;
     std::string err;
@@ -136,7 +145,7 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
         return false;
     }
     proto::Header header;
-    if (!Transact(t, MsgType::Hello, payload, deadline, owed, 0, header, answer, failure, reason, note)) {
+    if (!Transact(t, MsgType::Hello, payload, version, deadline, owed, 0, header, answer, failure, reason, note, version > proto::kVersion1)) {
         out.result.kind = failure == Failure::Malformed ? ProbeResult::Kind::Refused : ProbeResult::Kind::NoAnswer;
         out.result.detail = reason;
         return false;
@@ -150,6 +159,13 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
             return false;
         }
         failure = Failure::Refused;
+        if (header.version < version && e.code == static_cast<std::uint16_t>(proto::ErrorCode::VersionNotSupported)) {
+            failure = Failure::OlderVersion;
+            out.result.detail = "the server speaks protocol version " + std::to_string(header.version) + " only";
+            reason = "the server answered the version " + std::to_string(version) + " HELLO with " + ErrorText(e) + ", framed in version " +
+                     std::to_string(header.version);
+            return false;
+        }
         if (e.code == static_cast<std::uint16_t>(proto::ErrorCode::WrongKey)) out.result.kind = ProbeResult::Kind::WrongKey;
         out.result.detail = ErrorText(e);
         reason = "the server refused HELLO: " + ErrorText(e);
@@ -171,7 +187,8 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
             reason = out.result.detail = "the server's answer to HELLO names its models out of order";
             return false;
         }
-    for (auto& m : ok.models) m.detail = ScrubPaths(m.detail);  // a server's detail may name its Model folder
+    // a server's detail on one line, without paths (it may name its Model folder) or addresses: logged in full, shown capped
+    for (auto& m : ok.models) m.detail = ServerText(m.detail);
     failure = Failure::None;
     out.result.kind = ProbeResult::Kind::Answered;
     out.result.server = ok.server;
@@ -181,6 +198,23 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
 }
 
 bool Early(Failure f) { return f == Failure::SendFailed || f == Failure::Closed || f == Failure::Reset; }
+// No frame came back: the connection was reset, or closed before any answer.
+bool NoFrame(Failure f) { return f == Failure::Closed || f == Failure::Reset; }
+constexpr const char* kNoFrameTwice = "two version 2 HELLOs got no answer: the connection was reset or closed before any";
+
+// The version rule's identity of a server: the address setting's, or the address found, with the port. Never logged.
+std::string HostKey(const std::string& host, int port) { return "address " + host + " port " + std::to_string(port); }
+std::string FoundKey(const std::vector<Endpoint>& endpoints, int port) {
+    static const char* hex = "0123456789abcdef";
+    std::string key = "found";
+    for (const auto& e : endpoints) {
+        key += " " + std::to_string(e.family) + ":";
+        for (const std::uint8_t b : e.address) key += {hex[b >> 4], hex[b & 15]};
+    }
+    return key + " port " + std::to_string(port);
+}
+
+static_assert(kNoticeEvery == Monitor::kFallbackEvery, "NOTICE goes at most as often as the fallback note on screen");
 
 }  // namespace
 
@@ -268,6 +302,18 @@ struct Client::Snapshot {
     Settings settings;
 };
 
+// A connection of its own, opened with HELLO (OpenWithHello).
+struct Client::Opened {
+    std::unique_ptr<Transport> transport;  // open after HELLO_OK; null otherwise
+    std::uint16_t version = proto::kVersion2;
+    bool connected = false;  // the last connect tried succeeded
+    std::string connectError;
+    HelloAnswer answer;
+    ExchangeFailure failure = ExchangeFailure::None;
+    std::string reason;
+    bool Ok() const { return transport != nullptr; }
+};
+
 // A side load in flight, for H: the background thread holds its HELLOs meanwhile, and looks again when it ends. It
 // begins once no HELLO is in flight on the main connection, so that HELLO is never caught waiting for this load.
 class Client::SideLoad {
@@ -340,20 +386,89 @@ void Client::Detail(const std::string& line) const {
 }
 
 void Client::Configure(const Settings& settings) {
+    bool moved = false;
     {
         std::lock_guard lock(configMutex_);
-        if (settings.serverAddress != pending_.serverAddress || settings.serverPort != pending_.serverPort) lookupFailureLogged_.store(false);
+        moved = settings.serverAddress != pending_.serverAddress || settings.serverPort != pending_.serverPort;
+        if (moved) {
+            // another address (or the search's, or another port): searched again at once, and spoken to in version 2 first
+            lookupFailureLogged_.store(false);
+            found_ = Found{};
+            anyFind_ = false;
+            lastFindError_.clear();
+            notFoundLogged_ = false;
+            versionKey_.clear();
+            serverVersion_ = 0;
+        }
+        configured_ = true;
         pending_ = settings;
         ++pendingGeneration_;
         pendingGen_.store(pendingGeneration_);
         timeoutMs_.store(settings.timeoutMs);
         detailed_.store(settings.logDetail == LogDetail::Detailed);
     }
+    if (moved) {
+        std::lock_guard lock(noticeMutex_);  // a NOTICE about the last server isn't for the next
+        noticePending_ = false;
+        noticeLines_ = 0;
+    }
     std::lock_guard lock(bgMutex_);
-    active_ = !settings.serverAddress.empty();
+    active_ = true;  // a server address, or the search for one
     MaybeStartLocked();
     wake_ = true;
     wakeCv_.notify_all();
+}
+
+void Client::SetDiscovery(DiscoveryFactory discovery) {
+    std::lock_guard lock(configMutex_);
+    discovery_ = std::move(discovery);
+}
+
+void Client::OnVersion(std::function<void(std::uint16_t)> sink) {
+    std::lock_guard lock(configMutex_);
+    versionSink_ = std::move(sink);
+}
+
+std::uint16_t Client::ServerVersion() const {
+    std::lock_guard lock(configMutex_);
+    return serverVersion_;
+}
+
+int Client::NoticesSent() const {
+    std::lock_guard lock(noticeMutex_);
+    return noticesSent_;
+}
+
+int Client::Searches() const { return searches_.load(); }
+
+std::uint16_t Client::VersionFor(const std::string& key) const {
+    std::lock_guard lock(configMutex_);
+    return versionKey_ == key && serverVersion_ == proto::kVersion1 ? proto::kVersion1 : proto::kVersion2;
+}
+
+// What the server at key answered in: a version 1 server is spoken to in version 1 from now on, logged once.
+void Client::LearnVersion(const std::string& key, std::uint16_t version, const char* why) {
+    bool first = false, changed = false;
+    std::function<void(std::uint16_t)> sink;
+    {
+        std::lock_guard lock(configMutex_);
+        changed = !(versionKey_ == key && serverVersion_ == version);
+        first = version == proto::kVersion1 && changed;
+        versionKey_ = key;
+        serverVersion_ = version;
+        if (changed) sink = versionSink_;
+    }
+    if (sink) {
+        try {
+            sink(version);
+        } catch (...) {
+        }
+    }
+    if (first)
+        Log(Level::Info, std::string("The server speaks protocol version 1 only (") +
+                             (why ? why : "it answered the bridge's version 2 HELLO with ERROR 6") +
+                             "): the bridge speaks version 1 to it until the game restarts or the address changes, and tells it of "
+                             "fallbacks by its status checks, not by NOTICE");
 }
 
 void Client::SetOrtVersion(const std::string& version) {
@@ -443,9 +558,11 @@ void Client::ApplyPendingLocked() {
     }
 }
 
-bool Client::Endpoints(const std::string& host, int port, std::vector<Endpoint>& out, std::string& reason, bool lookUpNow) {
+bool Client::Endpoints(const std::string& host, int port, Target& out, std::string& reason, bool lookUpNow, bool mayFind, bool* notFound) {
+    if (notFound) *notFound = false;
     if (host.empty()) {
-        reason = "no server address is set";
+        if (Discover(port, out, reason, mayFind)) return true;
+        if (notFound) *notFound = true;
         return false;
     }
     const auto matches = [&] { return lookup_.done && lookup_.host == host && lookup_.port == port; };
@@ -464,12 +581,183 @@ bool Client::Endpoints(const std::string& host, int port, std::vector<Endpoint>&
         reason = "the server's address couldn't be looked up (" + lookup_.error + ")";
         return false;
     }
-    out = lookup_.endpoints;
+    out.endpoints = lookup_.endpoints;
+    out.key = HostKey(host, port);
+    out.found = false;
     return true;
 }
 
-bool Client::EndpointsLocked(std::vector<Endpoint>& out, std::string& reason, bool lookUpNow) {
-    return Endpoints(settings_.serverAddress, settings_.serverPort, out, reason, lookUpNow);
+bool Client::EndpointsLocked(Target& out, std::string& reason, bool lookUpNow) {
+    return Endpoints(settings_.serverAddress, settings_.serverPort, out, reason, lookUpNow, false);
+}
+
+// The server found on the local network; with mayFind, a search now when there is none (or it went stale), at most one
+// every kFindEvery. A search in progress makes another caller wait for its result. Never called with mutex_ held when
+// mayFind is set.
+bool Client::Discover(int port, Target& out, std::string& reason, bool mayFind) {
+    const auto fromFound = [&] {  // under configMutex_
+        if (!found_.valid || found_.stale || found_.port != port) return false;
+        out.endpoints = found_.endpoints;
+        out.key = FoundKey(found_.endpoints, port);
+        out.found = true;
+        return true;
+    };
+    const auto moved = [&] { return !pending_.serverAddress.empty() || pending_.serverPort != port; };  // under configMutex_
+    {
+        std::lock_guard lock(configMutex_);
+        if (fromFound()) return true;
+        if (!mayFind) {
+            reason = found_.valid ? "the server found on the local network stopped answering, and the bridge is searching again"
+                                  : "no server has been found on the local network yet";
+            return false;
+        }
+    }
+    std::lock_guard round(findMutex_);
+    DiscoveryFactory factory;
+    {
+        std::lock_guard lock(configMutex_);
+        if (fromFound()) return true;  // found by the search this caller waited for
+        if (moved()) {
+            reason = "the settings changed";
+            return false;
+        }
+        if (anyFind_ && now_() < lastFind_ + kFindEvery) {
+            reason = lastFindError_.empty() ? std::string("no server answered on the local network yet") : lastFindError_;
+            return false;
+        }
+        anyFind_ = true;
+        lastFind_ = now_();
+        factory = discovery_;
+    }
+    std::vector<Endpoint> endpoints;
+    std::string server, why;
+    const bool ok = Search(factory, port, endpoints, server, why);
+    bool fresh = false, tellNotFound = false;
+    {
+        std::lock_guard lock(configMutex_);
+        if (moved()) {
+            reason = "the settings changed";
+            return false;
+        }
+        if (!ok) {
+            reason = lastFindError_ = why;
+            tellNotFound = !notFoundLogged_;
+            notFoundLogged_ = true;
+        } else {
+            fresh = !found_.valid || found_.stale || found_.endpoints != endpoints || found_.port != port;
+            if (!found_.valid || found_.endpoints != endpoints || found_.port != port) {
+                // another address: spoken to in version 2 first
+                versionKey_.clear();
+                serverVersion_ = 0;
+            }
+            found_ = Found{true, false, port, endpoints, server};
+            notFoundLogged_ = false;
+            fromFound();
+        }
+    }
+    if (tellNotFound) Log(Level::Warn, why + "; the bridge searches again at most every " + std::to_string(kFindEvery.count()) + " s");
+    // the server's own name only: an address says where someone's PC is
+    if (fresh) Log(Level::Info, "Found the server on the local network: " + ServerText(server) + ", port " + std::to_string(port));
+    return ok;
+}
+
+// One search: FIND to each IPv4 adapter's broadcast address, then the first FOUND within kFindWait.
+bool Client::Search(const DiscoveryFactory& factory, int port, std::vector<Endpoint>& found, std::string& server, std::string& why) {
+    auto d = factory ? factory() : nullptr;
+    if (!d) {
+        why = "no server address is set, and the bridge can't search the local network here";
+        return false;
+    }
+    std::vector<std::uint8_t> payload, datagram;
+    std::string err;
+    if (!proto::EncodeFind(ClientString(Totals(), CurrentVersions()), payload, err) ||
+        !proto::EncodeDatagram(MsgType::Find, payload, datagram, err)) {
+        why = "FIND couldn't be encoded (" + err + ")";
+        return false;
+    }
+    ++searches_;
+    const int sent = d->Broadcast(datagram, static_cast<std::uint16_t>(port), err);
+    if (sent <= 0) {
+        d->Close();
+        why = "no server was found on the local network: FIND couldn't be sent on any network adapter (" + err + ")";
+        return false;
+    }
+    Detail("FIND sent to " + std::to_string(sent) + " broadcast address" + (sent == 1 ? "" : "es") + " on port " + std::to_string(port));
+    const Clock::time_point deadline = Clock::now() + kFindWait;
+    for (;;) {
+        std::vector<std::uint8_t> bytes;
+        Endpoint sender;
+        const Transport::Result r = d->Receive(bytes, static_cast<std::uint16_t>(port), sender, deadline, err);
+        if (r == Transport::Result::TimedOut) {
+            why = "no server answered FIND on the local network (port " + std::to_string(port) + ", " + std::to_string(sent) +
+                  " broadcast address" + (sent == 1 ? "" : "es") + ")";
+            break;
+        }
+        if (r != Transport::Result::Ok) {
+            why = "no server was found on the local network: the search failed (" + err + ")";
+            break;
+        }
+        proto::Header h;
+        std::vector<std::uint8_t> p;
+        std::string name;
+        if (proto::DecodeDatagram(bytes.data(), bytes.size(), h, p, err) && h.type == static_cast<std::uint16_t>(MsgType::Found) &&
+            proto::DecodeFound(p.data(), p.size(), name, err)) {
+            d->Close();
+            found = {sender};
+            server = name;
+            return true;
+        }
+        Detail("Ignored a datagram that isn't FOUND (" + (h.type == static_cast<std::uint16_t>(MsgType::Find) ? std::string("a FIND") : err) + ")");
+    }
+    d->Close();
+    return false;
+}
+
+// The address found was lost (a connection failed): the next attempt searches again.
+void Client::MarkFoundStale() {
+    std::lock_guard lock(configMutex_);
+    if (found_.valid) found_.stale = true;
+}
+
+// A connection of its own: connected within kConnectTimeout, then HELLO in the server's version, within helloTimeout.
+// A version 1 server's ERROR 6 to a version 2 HELLO is learnt, and HELLO goes again on a new connection, in version 1.
+Client::Opened Client::OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes) {
+    Opened o;
+    const Note note = [this, notes](const std::string& l) {
+        if (notes) Detail(l);
+    };
+    int noFrame = 0;  // version 2 HELLOs that got no frame back
+    for (int round = 0; round < 3; ++round) {
+        o.version = VersionFor(target.key);
+        auto t = factory_ ? factory_() : nullptr;
+        o.connectError = "no network";
+        o.connected = t && t->Connect(target.endpoints, static_cast<int>(kConnectTimeout.count()), o.connectError);
+        if (!o.connected) {
+            if (target.found) MarkFoundStale();
+            return o;
+        }
+        if (SayHello(*t, hello, o.version, Clock::now() + helloTimeout, nullptr, o.answer, o.failure, o.reason, note)) {
+            LearnVersion(target.key, o.version);
+            o.transport = std::move(t);
+            return o;
+        }
+        t->Close();
+        if (o.failure == Failure::OlderVersion) {
+            LearnVersion(target.key, proto::kVersion1);
+            if (notes) Detail("Connecting again in protocol version 1");
+            continue;
+        }
+        // no frame back (PandorumLLM v3.97-p6 and earlier close with the payload unread, which can reset the
+        // connection on Windows): once more in version 2, then as a version 1 server
+        if (o.version == proto::kVersion2 && NoFrame(o.failure)) {
+            Detail(std::string("The connection was ") + (o.failure == Failure::Reset ? "reset" : "closed") +
+                   " before any answer to a version 2 HELLO");
+            if (++noFrame == 2) LearnVersion(target.key, proto::kVersion1, kNoFrameTwice);
+            continue;
+        }
+        return o;
+    }
+    return o;
 }
 
 std::vector<Client::Listed> Client::Newest(const std::vector<proto::ModelEntry>& models) {
@@ -533,11 +821,13 @@ void Client::CloseLocked(const std::string& why) noexcept {
     }
     answered_.clear();
     helloCurrent_ = false;
+    mainAnswered_ = false;
     owed_.clear();
 }
 
 void Client::StartPauseLocked(const std::string& reason) {
     CloseLocked(reason);
+    if (settings_.serverAddress.empty()) MarkFoundStale();  // a lost connection: the server is searched for again
     timeoutsInARow_ = 0;
     ++pauses_;
     const bool already = paused_.exchange(true);
@@ -623,17 +913,22 @@ std::string Client::StatusLine(const std::string& server, const std::string& dev
 
 bool Client::ConnectMainLocked(int timeoutMs, std::string& reason, bool& timedOut) {
     timedOut = false;
-    std::vector<Endpoint> endpoints;
-    if (!EndpointsLocked(endpoints, reason, false)) return false;
+    Target target;
+    if (!EndpointsLocked(target, reason, false)) return false;
     auto t = factory_ ? factory_() : nullptr;
     std::string err = "no network";
     const Clock::time_point start = Clock::now();
-    if (!t || !t->Connect(endpoints, timeoutMs, err)) {
+    if (!t || !t->Connect(target.endpoints, timeoutMs, err)) {
         timedOut = Clock::now() >= start + std::chrono::milliseconds(timeoutMs);
         reason = "couldn't connect to the server (" + err + ")";
+        if (target.found) MarkFoundStale();
         return false;
     }
     transport_ = std::move(t);
+    mainVersion_ = VersionFor(target.key);
+    mainKey_ = target.key;
+    mainFound_ = target.found;
+    mainAnswered_ = false;
     answered_.clear();
     helloCurrent_ = false;
     owed_.clear();
@@ -653,12 +948,18 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
     for (const auto& l : listed_) hello.models.push_back(l.entry);
     ++hellosSent_;
     HelloAnswer ans;
-    const bool ok = SayHello(*transport_, hello, deadline, &owed_, ans, failure, reason, [this](const std::string& l) { Detail(l); });
+    const bool ok = SayHello(*transport_, hello, mainVersion_, deadline, &owed_, ans, failure, reason, [this](const std::string& l) { Detail(l); });
     lastActivity_ = now_();
     if (!ok) {
         Detail("HELLO on the main connection: " + reason);
+        if (mainVersion_ == proto::kVersion2 && !mainAnswered_ && NoFrame(failure))
+            Detail(std::string("The connection was ") + (failure == Failure::Reset ? "reset" : "closed") +
+                   " before any answer to a version 2 HELLO");
+        if (failure == Failure::OlderVersion) LearnVersion(mainKey_, proto::kVersion1);
         return false;
     }
+    mainAnswered_ = true;
+    LearnVersion(mainKey_, mainVersion_);
     std::vector<Answered> fresh;
     for (std::size_t i = 0; i < hello.models.size(); ++i) fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
     AnsweredLocked(std::move(fresh));
@@ -683,44 +984,37 @@ Admission Client::Admit(const proto::ModelEntry& model) {
         s = pending_;
         versions = versions_;
     }
-    if (s.serverAddress.empty()) {
-        a.hello.kind = ProbeResult::Kind::NoAddress;
-        a.detail = "no server address is set";
-        return a;
-    }
-    std::vector<Endpoint> endpoints;
+    // the address set, or the server found on the local network (searched for now, when none is)
+    Target target;
     std::string reason;
-    if (!Endpoints(s.serverAddress, s.serverPort, endpoints, reason, true)) {
-        a.hello.kind = ProbeResult::Kind::NoAnswer;
+    bool notFound = false;
+    if (!Endpoints(s.serverAddress, s.serverPort, target, reason, true, true, &notFound)) {
+        a.hello.kind = notFound ? ProbeResult::Kind::NotFound : ProbeResult::Kind::NoAnswer;
         a.detail = reason;
         return a;
     }
     SideLoad inFlight(*this);
-    auto t = factory_ ? factory_() : nullptr;
-    std::string err = "no network";
-    if (!t || !t->Connect(endpoints, static_cast<int>(kConnectTimeout.count()), err)) {
-        a.hello.kind = ProbeResult::Kind::NoAnswer;
-        a.detail = "couldn't connect to the server (" + err + ")";
-        Detail("Side connection for " + model.name + ": " + a.detail);
-        return a;
-    }
-    Detail("Side connection for " + model.name + ": connected");
     proto::Hello hello;
     hello.client = ClientString(Totals(), versions);
     hello.key = s.accessKey;
     hello.ortVersion = versions.ort;
     hello.models = {model};
     ++sideHellos_;
-    HelloAnswer ans;
-    Failure f = Failure::None;
-    const bool ok = SayHello(*t, hello, Clock::now() + kHelloTimeout, nullptr, ans, f, reason, [this](const std::string& l) { Detail(l); });
-    t->Close();
-    Detail("Side connection for " + model.name + ": closed " + (ok ? std::string("after HELLO_OK") : "(" + reason + ")"));
-    a.hello = ans.result;
-    if (!ok) {
-        a.detail = reason;
+    Opened o = OpenWithHello(target, hello, kHelloTimeout, true);
+    if (!o.connected) {
+        a.hello.kind = ProbeResult::Kind::NoAnswer;
+        a.detail = "couldn't connect to the server (" + o.connectError + ")";
+        Detail("Side connection for " + model.name + ": " + a.detail);
         return a;
     }
+    if (o.Ok()) o.transport->Close();
+    Detail("Side connection for " + model.name + ": closed " + (o.Ok() ? std::string("after HELLO_OK") : "(" + o.reason + ")"));
+    a.hello = o.answer.result;
+    if (!o.Ok()) {
+        a.detail = o.reason;
+        return a;
+    }
+    const HelloAnswer& ans = o.answer;
     a.status = ans.models[0].status;
     a.detail = ans.models[0].detail;
     Detail("HELLO on the side connection: " +
@@ -762,7 +1056,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         return answer(Outcome::Skipped, Why::Other, "a newer session of " + model.name + " replaced this one", true);
     std::string reason;
     if (!transport_) {
-        std::vector<Endpoint> unused;
+        Target unused;
         if (!EndpointsLocked(unused, reason, false)) {
             // no address, or none looked up: only the first of a series is logged
             bool quiet = reason == toldNoConnection_;
@@ -797,6 +1091,8 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     const Note note = [this](const std::string& l) { Detail(l); };
     proto::Header header;
     bool reused = transport_ != nullptr;
+    bool downgraded = false;  // connected again in version 1, for a version 1 server's answer to the version 2 HELLO
+    int noFrame = 0;          // version 2 HELLOs on a new connection that got no frame back
     for (int attempt = 0;; ++attempt) {
         if (!transport_) {
             bool timedOut = false;
@@ -828,10 +1124,28 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         }
         if (ok) {
             inHello = false;
-            ok = Transact(*transport_, MsgType::Run, payload, deadline, &owed_, request.requestId, header, reply.payload, f, reason, note);
+            ok = Transact(*transport_, MsgType::Run, payload, mainVersion_, deadline, &owed_, request.requestId, header, reply.payload, f, reason,
+                          note);
             lastActivity_ = now_();
         }
         if (ok) break;
+        // a version 1 server: connect again in version 1 and say HELLO, once, within the same deadline
+        if (f == Failure::OlderVersion && !downgraded && Clock::now() < deadline) {
+            CloseLocked("the server speaks protocol version 1 only");
+            downgraded = true;
+            reused = false;
+            continue;
+        }
+        // a new connection's version 2 HELLO with no frame back: once more in version 2, then in version 1 (an older
+        // server that closed with the HELLO unread), within the same deadline
+        if (inHello && !reused && mainVersion_ == proto::kVersion2 && NoFrame(f) && !downgraded && Clock::now() < deadline) {
+            if (++noFrame == 2) {
+                LearnVersion(mainKey_, proto::kVersion1, kNoFrameTwice);
+                downgraded = true;
+            }
+            CloseLocked("no answer to the version 2 HELLO");
+            continue;
+        }
         // a connection the server had closed or reset, or a send that failed: open it again and send again, once,
         // within the same deadline
         if (attempt == 0 && reused && Early(f) && Clock::now() < deadline) {
@@ -880,6 +1194,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         timeoutsInARow_ = 0;
         reason = ErrorText(e);
         if (proto::ErrorEndsConnection(e.code)) StartPauseLocked("The server answered " + reason);
+        SignalNoticeLocked();
         return answer(Outcome::Failed, Why::ServerError, reason);
     }
     if (!IsType(header, MsgType::RunOk) || !proto::DecodeRunOk(reply.payload.data(), reply.payload.size(), reply.ok, err)) {
@@ -893,6 +1208,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         return answer(Outcome::Failed, Why::Other, reason);
     }
     timeoutsInARow_ = 0;
+    SignalNoticeLocked();
     return Outcome::Forwarded;
 }
 
@@ -963,22 +1279,14 @@ ProbeResult Client::Probe(const Reason* fallback) {
         versions = versions_;
     }
     ProbeResult r;
-    if (s.serverAddress.empty()) {
-        r.kind = ProbeResult::Kind::NoAddress;
-        return r;
-    }
-    std::vector<Endpoint> endpoints;
+    // the address set, or the server found on the local network (searched for now, when none is: at start-up, the
+    // first status check's)
+    Target target;
     std::string reason;
-    if (!Endpoints(s.serverAddress, s.serverPort, endpoints, reason, true)) {
-        r.kind = ProbeResult::Kind::NoAnswer;
+    bool notFound = false;
+    if (!Endpoints(s.serverAddress, s.serverPort, target, reason, true, true, &notFound)) {
+        r.kind = notFound ? ProbeResult::Kind::NotFound : ProbeResult::Kind::NoAnswer;
         r.detail = reason;
-        return r;
-    }
-    auto t = factory_ ? factory_() : nullptr;
-    std::string err = "no network";
-    if (!t || !t->Connect(endpoints, static_cast<int>(kConnectTimeout.count()), err)) {
-        r.kind = ProbeResult::Kind::NoAnswer;
-        r.detail = "couldn't connect (" + err + ")";
         return r;
     }
     const Counters sent = Totals();
@@ -986,11 +1294,14 @@ ProbeResult Client::Probe(const Reason* fallback) {
     hello.client = ClientString(sent, versions, fallback);
     hello.key = s.accessKey;
     hello.ortVersion = versions.ort;
-    HelloAnswer ans;
-    Failure f = Failure::None;
-    SayHello(*t, hello, Clock::now() + kConnectTimeout, nullptr, ans, f, reason, nullptr);
-    t->Close();
-    r = ans.result;
+    Opened o = OpenWithHello(target, hello, kConnectTimeout, false);
+    if (!o.connected) {
+        r.kind = ProbeResult::Kind::NoAnswer;
+        r.detail = "couldn't connect (" + o.connectError + ")";
+        return r;
+    }
+    if (o.Ok()) o.transport->Close();
+    r = o.answer.result;
     if (r.kind == ProbeResult::Kind::Answered) {
         std::lock_guard lock(bgMutex_);
         reported_ = sent;
@@ -1052,18 +1363,18 @@ Clock::time_point Client::Tick() {
     Clock::time_point next = now + std::chrono::hours(1);
     const auto soon = [&](Clock::time_point t) { next = std::min(next, t); };
     Settings s;
-    bool looked = false;
+    bool looked = false, on = false;
     {
         std::lock_guard lock(configMutex_);
         s = pending_;
         looked = lookup_.done && lookup_.host == s.serverAddress && lookup_.port == s.serverPort;
+        on = configured_;  // a server address, or the search for one
     }
-    const bool on = !s.serverAddress.empty();
 
     // the name lookup, once per change of the address or port
     if (!s.serverAddress.empty() && !looked && !Resolve()) {
         std::string reason;
-        std::vector<Endpoint> unused;
+        Target unused;
         Endpoints(s.serverAddress, s.serverPort, unused, reason, false);
         if (!lookupFailureLogged_.exchange(true)) Log(Level::Warn, reason + "; lines get the game's own lip sync until the settings change");
     }
@@ -1097,7 +1408,7 @@ Clock::time_point Client::Tick() {
     }
     if (!got) {
         soon(now + kBusyRetry);
-    } else if (!snap.settings.serverAddress.empty() && !snap.models.empty()) {
+    } else if (on && !snap.models.empty()) {
         Clock::time_point due;
         {
             std::lock_guard lock(bgMutex_);
@@ -1126,9 +1437,25 @@ Clock::time_point Client::Tick() {
     if (on) {
         StatusCheck();
         FallbackReport();
-        std::lock_guard lock(bgMutex_);
-        soon(nextStatus_);
-        if (fallbackPending_) soon(fallbackDue_);
+        {
+            std::lock_guard lock(bgMutex_);
+            soon(nextStatus_);
+            if (fallbackPending_) soon(fallbackDue_);
+        }
+        // a NOTICE due, on the main connection
+        bool pending = false;
+        Clock::time_point due = now;
+        {
+            std::lock_guard lock(noticeMutex_);
+            pending = noticePending_;
+            if (anyNotice_) due = std::max(now, lastNotice_ + kNoticeEvery);
+        }
+        if (pending && due > now) {
+            soon(due);
+        } else if (pending) {
+            const Clock::duration again = NoticeMain();
+            if (again > Clock::duration::zero()) soon(now + again);
+        }
     }
     Summary(true);
     {
@@ -1141,17 +1468,11 @@ Clock::time_point Client::Tick() {
 // A new connection and HELLO with every live model, outside the connection's lock; swapped in under it. False when
 // held, untried, for a side load in flight (H): its end wakes the thread.
 bool Client::Recover(const Snapshot& snap) {
-    const MainHello inFlight(*this, true);
-    if (inFlight.Held()) {
-        Detail("The background HELLO waits for the model load in progress");
-        return false;
-    }
     int attempt = 0;
     {
         std::lock_guard lock(bgMutex_);
         attempt = failedTries_ + 1;
     }
-    Detail("Background attempt " + std::to_string(attempt) + ": connecting to the server and saying HELLO");
     std::string reason;
     const auto failed = [&](const std::string& why) {
         Detail("Background attempt " + std::to_string(attempt) + " failed: " + why);
@@ -1160,23 +1481,26 @@ bool Client::Recover(const Snapshot& snap) {
         nextTry_ = now_() + BackoffDelay(failedTries_);
         return true;
     };
-    std::vector<Endpoint> endpoints;
-    if (!Endpoints(snap.settings.serverAddress, snap.settings.serverPort, endpoints, reason, false)) return failed(reason);
-    auto t = factory_ ? factory_() : nullptr;
-    std::string err = "no network";
-    if (!t || !t->Connect(endpoints, static_cast<int>(kConnectTimeout.count()), err)) return failed("couldn't connect (" + err + ")");
+    // the address set, or the server found on the local network: after a lost connection, searched for again
+    Target target;
+    if (!Endpoints(snap.settings.serverAddress, snap.settings.serverPort, target, reason, false, true)) return failed(reason);
+    const MainHello inFlight(*this, true);
+    if (inFlight.Held()) {
+        Detail("The background HELLO waits for the model load in progress");
+        return false;
+    }
+    Detail("Background attempt " + std::to_string(attempt) + ": connecting to the server and saying HELLO");
     proto::Hello hello;
     const Versions versions = CurrentVersions();
     hello.client = ClientString(Totals(), versions);
     hello.key = snap.settings.accessKey;
     hello.ortVersion = versions.ort;
     hello.models = snap.models;
-    HelloAnswer ans;
-    Failure f = Failure::None;
-    if (!SayHello(*t, hello, Clock::now() + kHelloTimeout, nullptr, ans, f, reason, nullptr)) {
-        t->Close();
-        return failed(reason);
-    }
+    Opened o = OpenWithHello(target, hello, kHelloTimeout, false);
+    if (!o.connected) return failed("couldn't connect (" + o.connectError + ")");
+    if (!o.Ok()) return failed(o.reason);
+    std::unique_ptr<Transport> t = std::move(o.transport);
+    const HelloAnswer& ans = o.answer;
     Lock lock(mutex_);
     ApplyPendingLocked();
     if (settings_.serverAddress != snap.settings.serverAddress || settings_.serverPort != snap.settings.serverPort ||
@@ -1195,6 +1519,10 @@ bool Client::Recover(const Snapshot& snap) {
     }
     CloseLocked("the background thread's new connection replaces it");
     transport_ = std::move(t);
+    mainVersion_ = o.version;
+    mainKey_ = target.key;
+    mainFound_ = target.found;
+    mainAnswered_ = true;
     ++connects_;
     ++hellosSent_;
     // at the normal level only when it ends a pause: a model the server keeps not ready reconnects every 30 s
@@ -1251,7 +1579,7 @@ void Client::PingMain() {
     std::vector<std::uint8_t> answer;
     Failure f = Failure::None;
     std::string reason;
-    bool ok = Transact(*transport_, MsgType::Ping, {}, Clock::now() + std::chrono::milliseconds(settings_.timeoutMs), &owed_, 0, header,
+    bool ok = Transact(*transport_, MsgType::Ping, {}, mainVersion_, Clock::now() + std::chrono::milliseconds(settings_.timeoutMs), &owed_, 0, header,
                        answer, f, reason, [this](const std::string& l) { Detail(l); });
     lastActivity_ = now_();
     if (ok && !IsType(header, MsgType::Pong)) {
@@ -1263,7 +1591,7 @@ void Client::PingMain() {
     StartPauseLocked("The server didn't answer PING (" + reason + ")");
 }
 
-// The first status check, once a server address is set: logged.
+// The first status check, once the settings are given (with an empty address, the start-up search's): logged.
 void Client::FirstProbe() {
     {
         std::lock_guard lock(bgMutex_);
@@ -1273,10 +1601,12 @@ void Client::FirstProbe() {
     }
     const ProbeResult r = Probe();
     switch (r.kind) {
-        case ProbeResult::Kind::Answered: Log(Level::Info, "The server answered: " + r.server + " on " + r.device); break;
+        case ProbeResult::Kind::Answered:
+            Log(Level::Info, "The server answered: " + r.server + " on " + r.device + ", in protocol version " + std::to_string(ServerVersion()));
+            break;
         case ProbeResult::Kind::NoAnswer: Log(Level::Warn, "The server didn't answer: " + r.detail); break;
         case ProbeResult::Kind::WrongKey: Log(Level::Warn, "The server refused the access key"); break;
-        case ProbeResult::Kind::NoAddress: break;
+        case ProbeResult::Kind::NotFound: break;  // the search logged it
         default: Log(Level::Warn, "The server refused the bridge: " + r.detail); break;
     }
 }
@@ -1296,9 +1626,24 @@ void Client::StatusCheck() {
                                                  : "Status check: no answer" + (r.detail.empty() ? std::string() : " (" + r.detail + ")"));
 }
 
-// A line fell back: a status check with its reason, within seconds, at most one per kFallbackReportEvery.
-void Client::ReportFallback(Reason reason) {
+// A line fell back: to a server that answered in version 2, a NOTICE (the background thread's, NoticeMain). Anything
+// else (a line to any other server; a model load's refusal or a runtime entry to every server): a status check with
+// its reason, within seconds, at most one per kFallbackReportEvery.
+void Client::ReportFallback(Reason reason, const std::string& model, const std::string& detail) {
     if (reason == Reason::NoServer) return;
+    if (!model.empty()) {
+        std::lock_guard lock(noticeMutex_);
+        if (noticeLines_ < UINT32_MAX) ++noticeLines_;
+        // the detail as the player reads it: one line, no path or address, capped
+        notice_ = proto::Notice{model, ReasonKey(reason), ShownServerText(detail), 0};
+        noticePending_ = true;
+    }
+    if (ServerVersion() == proto::kVersion2 && !model.empty()) {
+        // a line goes to a version 2 server by NOTICE alone; a model load's refusal or a runtime entry (no line) keeps
+        // 1.2.0's status check, sent in the version the server speaks
+        Wake();
+        return;
+    }
     {
         std::lock_guard lock(bgMutex_);
         const Clock::time_point now = now_();
@@ -1310,6 +1655,75 @@ void Client::ReportFallback(Reason reason) {
         wake_ = true;  // the thread sends it now, or sets its timer for it
         wakeCv_.notify_all();
     }
+}
+
+// The NOTICE due, on the open main connection: only in version 2, and only while no request there awaits an answer
+// (after a RUN's answer, before the next request). How soon to look again: zero when there is nothing to retry.
+Clock::duration Client::NoticeMain() {
+    TryLock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || runsWaiting_.load() > 0) return kBusyRetry;  // a run goes first
+    ApplyPendingLocked();
+    proto::Notice n;
+    {
+        std::lock_guard nl(noticeMutex_);
+        if (!noticePending_ || (anyNotice_ && now_() < lastNotice_ + kNoticeEvery)) return Clock::duration::zero();
+        // nothing of version 2 to a server that hasn't answered in it; and none without a model left to run
+        if ((transport_ && mainVersion_ != proto::kVersion2) || ServerVersion() == proto::kVersion1 || (!transport_ && listed_.empty())) {
+            noticePending_ = false;
+            noticeLines_ = 0;
+            return Clock::duration::zero();
+        }
+        // the connection back, its HELLO answered and current, and no answer owed first: the run that clears the way
+        // wakes the thread (SignalNoticeLocked), and a reconnect of its own sends it in the same round
+        if (!transport_ || !mainAnswered_ || !helloCurrent_ || !owed_.empty() || paused_.load()) {
+            noticeWaiting_ = true;
+            return Clock::duration::zero();
+        }
+        // only a model the connection's last HELLO listed
+        if (std::none_of(answered_.begin(), answered_.end(), [&](const Answered& a) { return a.entry.name == notice_.model; })) {
+            noticePending_ = false;
+            noticeLines_ = 0;
+            return Clock::duration::zero();
+        }
+        noticeWaiting_ = false;
+        n = notice_;
+        n.lines = noticeLines_;
+    }
+    std::vector<std::uint8_t> payload, frame;
+    std::string err;
+    if (!proto::EncodeNotice(n, payload, err) || !proto::EncodeFrame(MsgType::Notice, payload, frame, err, mainVersion_)) {
+        Log(Level::Warn, "NOTICE couldn't be encoded (" + err + ")");
+        std::lock_guard nl(noticeMutex_);
+        noticePending_ = false;
+        noticeLines_ = 0;
+        return Clock::duration::zero();
+    }
+    const Transport::Result r = transport_->SendAll(frame.data(), frame.size(), Clock::now() + std::chrono::milliseconds(settings_.timeoutMs), err);
+    if (r != Transport::Result::Ok) {
+        // the stream's state is unknown: a new connection is made by the next run or the background thread
+        Log(Level::Info, "Sending NOTICE failed (" + err + "); reconnecting");
+        CloseLocked("sending NOTICE failed");
+        noticeWaiting_ = true;  // for the next connection
+        return Clock::duration::zero();
+    }
+    {
+        std::lock_guard nl(noticeMutex_);
+        noticeLines_ -= std::min(noticeLines_, n.lines);  // lines that fell back meanwhile wait for the next one
+        noticePending_ = noticeLines_ > 0;
+        anyNotice_ = true;
+        lastNotice_ = now_();
+        ++noticesSent_;
+    }
+    Detail("NOTICE: " + n.model + ", " + n.reason + ", " + std::to_string(n.lines) + " line" + (n.lines == 1 ? "" : "s") + " since the last (" +
+           n.detail + ")");
+    return Clock::duration::zero();
+}
+
+// After a RUN's answer: a NOTICE that waited for the connection (owed answers, a reconnect, a HELLO) may go now.
+void Client::SignalNoticeLocked() {
+    if (!noticeWaiting_ || !transport_ || !mainAnswered_ || !helloCurrent_ || !owed_.empty()) return;
+    noticeWaiting_ = false;
+    Wake();
 }
 
 int Client::FallbackReports() const {

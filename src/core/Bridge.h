@@ -1,7 +1,8 @@
 #pragma once
 // The forwarding logic over ONNX Runtime's C API (README.md, "How it works"). BFA gets the runtime's entry point,
 // OrtGetApiBase, through the bridge's replacement (src/plugin/Hook.cpp patches BFA's import of GetProcAddress for
-// that one lookup). That is the bridge's only attach: it changes nothing else of BFA's.
+// that one lookup). That is the bridge's only attach; its one other effect on BFA is [General] ForceCPU in BFA's INI
+// (core/BfaMode.h).
 //
 // The API version BFA asks for is served from the real table (GetApi below):
 //   - an older or the same version: a copy of the real table's entries, only as many as the runtime's own API
@@ -18,7 +19,7 @@
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
 //                   taken, and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
-//                   bridge's own. Not, or no server address set, or the settings not read yet: BFA gets an error
+//                   bridge's own. Not, or no server found, or the settings not read yet: BFA gets an error
 //                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
 //                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
@@ -32,7 +33,8 @@
 // AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;
 // GetExecutionProviderApi ("DML" at API version 24: a copy of the real OrtDmlApi table with its three
 // SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
-// to see that BFA is set to use the graphics card, which the bridge reports. Every one of these passes the call
+// to see that BFA is set to use the graphics card, which the bridge logs at Detailed, as a fact: the hardware is
+// PandorumLLM's choice, and the bridge advises nothing about it. Every one of these passes the call
 // through unchanged. Every other entry that takes a session answers a bridge session with an error status. The
 // runtime's other session makers (CreateSessionFromArray, the two with prepacked weights, the model editor's three)
 // answer with an error status naming them, since a model loaded so would run on this PC. Everything else is the real
