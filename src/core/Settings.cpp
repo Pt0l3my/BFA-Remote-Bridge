@@ -136,7 +136,8 @@ Settings ReadSettings(const ConfigGetter& get, std::vector<std::string>* warning
 }
 
 std::string Describe(const Settings& s) {
-    return std::string("server address ") + (s.serverAddress.empty() ? "not set" : "set") + ", port " + std::to_string(s.serverPort) +
+    return std::string("server address ") + (s.serverAddress.empty() ? "not set (searched for on the local network)" : "set") + ", port " +
+           std::to_string(s.serverPort) +
            ", timeout " + std::to_string(s.timeoutMs) + " ms, status on load " +
            (s.showStatus ? "on" : "off") + ", log detail " + (s.logDetail == LogDetail::Detailed ? "Detailed" : "Normal");
 }

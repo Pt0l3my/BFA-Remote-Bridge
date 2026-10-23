@@ -3,6 +3,18 @@
 // mutex (BFA may run its sentiment model from another thread while its lip-sync model runs), short-lived connections
 // of their own for model loads and status checks, and one background thread of the bridge's own.
 //
+// - The protocol's version: every connection opens with a version 2 HELLO. A version 1 server answers it with ERROR 6
+//   framed in version 1: the client then connects again at once in version 1, and stays on version 1 for that server
+//   (the address setting and port, or the address found) until the game restarts or the address changes, logged once.
+//   Nothing of version 2 goes to a server that hasn't answered in version 2.
+// - The server's address: the setting's, looked up (Resolve); or, when the setting is empty, found on the local network
+//   (FIND to each IPv4 adapter's broadcast address, the first FOUND taken) at start-up and after a lost connection, at
+//   most one search every kFindEvery while none answers. A search runs off the game's threads and off the speech path:
+//   in a model load, a status check or the background thread, never in a run.
+// - NOTICE (version 2): a line that fell back is told to the server on the main connection, at most one a minute, by the
+//   background thread, only while no request there awaits an answer; a version 1 server is told by the status check's
+//   `fallback REASON` instead, as by 1.2.0.
+//
 // - Configure never waits: the settings go to a small mutex of their own with a generation count, and the next Run or
 //   the background thread (which take the connection's lock) applies them: a change to the address, port, key or
 //   timeout closes the connection and ends a pause. The game's main thread calls it.
@@ -60,12 +72,15 @@ constexpr std::chrono::minutes kSummaryEvery{10};
 constexpr std::uint64_t kSummaryRuns = 250;
 constexpr std::size_t kClientStringMax = 120;  // PandorumLLM's log lines keep 120 characters since its patch4
 constexpr std::chrono::seconds kFallbackReportEvery{30};  // the prompt status check after a fallback, at most this often
+constexpr std::chrono::seconds kNoticeEvery{60};          // NOTICE at most this often: as the fallback note on screen
+constexpr std::chrono::seconds kFindEvery{5};             // one search of the local network at most this often
+constexpr std::chrono::milliseconds kFindWait{1000};      // a search waits this long for FOUND
 
 // The background thread's wait before its next try, after `failures` failed tries since the pause began (or the last
 // success): 1, 2, 5, 10, 30 s, then 30 s.
 std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-std::string ClientName();  // "BFARemoteBridge 1.2.0"
+std::string ClientName();  // "BFARemoteBridge 1.3.0"
 
 // Why a run got no answer from the server.
 enum class Why : std::uint8_t {
@@ -97,9 +112,10 @@ enum class ExchangeFailure {
     NoByte,       // the deadline passed with no byte of the answer arrived: the stream is still at a frame's start
     MidFrame,     // the deadline passed in the middle of a frame, or of the send
     Lost,         // the connection closed or failed after some bytes
-    Malformed,    // not a frame of protocol version 1, or not the answer expected
+    Malformed,    // not a frame of the connection's protocol version, or not the answer expected
     Refused,      // the server answered ERROR
     LateClosing,  // a discarded late answer was an ERROR that ends the connection
+    OlderVersion, // a version 2 HELLO answered with ERROR 6 framed in version 1: a version 1 server
 };
 
 struct Fallback {
@@ -124,7 +140,7 @@ struct Versions {
     std::string ort;  // "1.24.4"; empty until BFA loads its runtime
 };
 
-// The HELLO's client string: "BFARemoteBridge 1.2.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
+// The HELLO's client string: "BFARemoteBridge 1.3.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
 // ORT V)", keys in that order, each of the last three only when known (fallback only in a status check sent for a
 // fallback), new keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name
 // alone when none fits.
@@ -146,11 +162,11 @@ std::string SummaryLine(const Period& period);
 struct ProbeResult {
     enum class Kind {
         NotTried,  // the probe hasn't finished, or nothing asked it
-        NoAddress,
+        NotFound,  // no server address is set, and no server answered FIND on the local network
         Answered,  // HELLO_OK
         NoAnswer,  // no lookup, no connection, a timeout, the connection closed
         WrongKey,  // ERROR 2
-        Refused,   // any other ERROR, or an answer that isn't protocol version 1
+        Refused,   // any other ERROR, or an answer that isn't in the version the HELLO opened with
     };
     Kind kind = Kind::NotTried;
     std::string server;
@@ -183,8 +199,12 @@ public:
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // Never waits for the connection: applied by the next Run or the background thread.
+    // Never waits for the connection: applied by the next Run or the background thread. An empty server address means
+    // the server is found on the local network.
     void Configure(const Settings& settings);
+    // The search for the server on the local network (the plugin's: Winsock and the adapter list Windows reports).
+    // Without one, an empty address finds nothing.
+    void SetDiscovery(DiscoveryFactory discovery);
     void SetOrtVersion(const std::string& version);
     void SetBfaVersion(const std::string& version);
     Versions CurrentVersions() const;
@@ -231,13 +251,20 @@ public:
     // and never waits for a side load.
     ProbeResult Probe(const Reason* fallback = nullptr);
 
-    // A line fell back: the background thread sends a status check with the reason, at once or, within
-    // kFallbackReportEvery of the last, when that has passed. NoServer has nowhere to go and is ignored.
-    void ReportFallback(Reason reason);
+    // A line fell back (`model` names it; empty for a model load or a runtime entry, which are no line). To a server
+    // that answered in version 2, a line is told by NOTICE on the main connection (its model, reason, detail and the
+    // lines since the last), at most one every kNoticeEvery. To any other server, the background thread sends a status
+    // check with the reason, at once or, within kFallbackReportEvery of the last, when that has passed. NoServer has
+    // nowhere to go and is ignored.
+    void ReportFallback(Reason reason, const std::string& model = {}, const std::string& detail = {});
     int FallbackReports() const;  // status checks sent for a fallback, for the tests
+    int NoticesSent() const;      // for the tests
+    int Searches() const;         // FIND rounds sent, for the tests
+    // The protocol version the server answered in (1 or 2), 0 while unknown; it applies to the current address.
+    std::uint16_t ServerVersion() const;
 
-    // The background thread: allowed by StartBackground, it starts once a server address is set
-    // (now, or at a later Configure). StopBackground ends and joins it.
+    // The background thread: allowed by StartBackground, it starts once the settings are given (now, or at a later
+    // Configure): with a server address, or to search for one. StopBackground ends and joins it.
     void StartBackground();
     void StopBackground();
     // One round of the background work, due by the client's clock: the time of the next one.
@@ -263,10 +290,17 @@ private:
     struct Snapshot;
     class SideLoad;
     class MainHello;
+    struct Opened;
+    // Where a connection goes: the addresses, and the server's identity for the version rule.
+    struct Target {
+        std::vector<Endpoint> endpoints;
+        std::string key;     // the address setting and port, or the address found and port
+        bool found = false;  // found on the local network
+    };
 
     // Under mutex_.
     void ApplyPendingLocked();
-    bool EndpointsLocked(std::vector<Endpoint>& out, std::string& reason, bool lookUpNow);
+    bool EndpointsLocked(Target& out, std::string& reason, bool lookUpNow);
     bool ConnectMainLocked(int timeoutMs, std::string& reason, bool& timedOut);
     bool HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failure, std::string& reason);
     void StartPauseLocked(const std::string& reason);
@@ -277,7 +311,18 @@ private:
     bool ToldNotReadyLocked(const Answered& a);
     void AnsweredLocked(std::vector<Answered> fresh);
 
-    bool Endpoints(const std::string& host, int port, std::vector<Endpoint>& out, std::string& reason, bool lookUpNow);
+    // The addresses of host (looked up now when lookUpNow and not yet), or, for an empty host, the server found on the
+    // local network (searched now when mayFind, within kFindEvery of the last search; notFound says so on failure).
+    bool Endpoints(const std::string& host, int port, Target& out, std::string& reason, bool lookUpNow, bool mayFind = false,
+                   bool* notFound = nullptr);
+    bool Discover(int port, Target& out, std::string& reason, bool mayFind);
+    bool Search(const DiscoveryFactory& factory, int port, std::vector<Endpoint>& found, std::string& server, std::string& why);
+    void MarkFoundStale();
+    std::uint16_t VersionFor(const std::string& key) const;
+    void LearnVersion(const std::string& key, std::uint16_t version);
+    // A connection of its own to target, opened with HELLO in the server's version; on a version 1 server's ERROR 6 to
+    // a version 2 HELLO, once more in version 1.
+    Opened OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes);
     bool SettingsPending() const;
     bool Detailed() const noexcept { return detailed_.load(); }
     void Log(Level level, const std::string& line) const;
@@ -291,6 +336,7 @@ private:
     void FirstProbe();
     void StatusCheck();
     void FallbackReport();
+    Clock::duration NoticeMain();
     void TellStatesLocked(const std::string& server, const std::string& device);
     void Summary(bool timed);
     std::string StatusLine(const std::string& server, const std::string& device, const std::vector<Answered>& models) const;
@@ -307,6 +353,23 @@ private:
     std::uint64_t pendingGeneration_ = 0;
     Versions versions_;
     StatesSink states_;
+    DiscoveryFactory discovery_;
+    bool configured_ = false;  // Configure was called: the settings were read
+    // what the last search found: kept until a lost connection makes it stale, or the address or port setting changes
+    struct Found {
+        bool valid = false;
+        bool stale = false;
+        int port = 0;
+        std::vector<Endpoint> endpoints;
+        std::string server;
+    } found_;
+    bool anyFind_ = false;
+    Clock::time_point lastFind_{};
+    std::string lastFindError_;
+    bool notFoundLogged_ = false;
+    // the version rule: the protocol version the server at versionKey_ answered in (0 while unknown)
+    std::string versionKey_;
+    std::uint16_t serverVersion_ = 0;
     struct Lookup {
         bool done = false;
         bool ok = false;
@@ -320,12 +383,18 @@ private:
     std::atomic<int> timeoutMs_{1000};
     std::atomic<bool> detailed_{false};
     std::atomic<bool> lookupFailureLogged_{false};
+    std::mutex findMutex_;  // one search at a time; taken before configMutex_, never with mutex_ held
+    std::atomic<int> searches_{0};
 
     // the main connection
     mutable std::timed_mutex mutex_;
     Settings settings_;
     std::uint64_t appliedGeneration_ = 0;
     std::unique_ptr<Transport> transport_;
+    std::uint16_t mainVersion_ = proto::kVersion2;  // the main connection's protocol version
+    std::string mainKey_;                            // its server's, for the version rule
+    bool mainFound_ = false;                         // its address was found on the local network
+    bool mainAnswered_ = false;                      // its HELLO was answered, in mainVersion_
     std::vector<Listed> listed_;
     std::uint64_t modelsGeneration_ = 0;
     std::vector<Answered> answered_;    // the connection's last HELLO_OK
@@ -374,6 +443,16 @@ private:
     Clock::time_point lastFallbackReport_{};
     bool fallbackReported_ = false;
     int fallbackReports_ = 0;
+
+    // NOTICE: the latest line that fell back, and the lines since the last NOTICE; never held across the network, and
+    // taken after mutex_ when both are
+    mutable std::mutex noticeMutex_;
+    bool noticePending_ = false;
+    proto::Notice notice_;
+    std::uint32_t noticeLines_ = 0;
+    bool anyNotice_ = false;
+    Clock::time_point lastNotice_{};
+    int noticesSent_ = 0;
 
     // the counters
     mutable std::mutex statsMutex_;

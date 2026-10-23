@@ -227,9 +227,10 @@ TEST(StatusTexts) {
     CHECK_EQ(CantServeText("4.5.0", "1.31.0", true), std::string("BFA Remote Bridge: Better Facial Animations 4.5.0 uses ONNX Runtime 1.31.0, "
                                                                "which the bridge can't serve, so lip sync is the game's own. Update the bridge."));
     CHECK(CantServeText("3.0.0", "1.9.0", false).find("Update Better Facial Animations.") != std::string::npos);
-    CHECK(NoServerText(true).find("no server address is set, so lip sync is the game's own") != std::string::npos);
-    CHECK(NoServerText(false).find("SkyrimNet wasn't found") != std::string::npos);
-    CHECK(GpuText().find("Tick Force CPU in BFA's menu") != std::string::npos);
+    CHECK(NoServerText().find("SkyrimNet wasn't found") != std::string::npos);
+    CHECK_EQ(NotFoundText(7871), std::string("BFA Remote Bridge: no server answered on the local network, so lip sync is the game's own. In "
+                                             "PandorumLLM, set the A2F server's Remote IP to this PC and allow port 7871 (UDP and TCP) through "
+                                             "that PC's firewall, or enter its address on SkyrimNet's Settings > Plugins page."));
     CHECK_EQ(DeviceText("DirectML 3: NVIDIA GeForce RTX 5090"), std::string("NVIDIA GeForce RTX 5090 (DirectML 3)"));
     CHECK_EQ(DeviceText("CPU"), std::string("CPU"));
     CHECK_EQ(DeviceText("CPU: "), std::string("CPU: "));
@@ -244,7 +245,7 @@ TEST(StatusTexts) {
         CHECK(!w.empty());
         for (unsigned char c : FallbackLine("", w)) CHECK(c < 0x80);
     }
-    for (const std::string& t : {NoServerText(true), NoServerText(false), GpuText(), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
+    for (const std::string& t : {NoServerText(), NotFoundText(7871), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
         CHECK(t.rfind("BFA Remote Bridge: ", 0) == 0);
         for (unsigned char c : t) CHECK(c < 0x80);
     }

@@ -1,6 +1,7 @@
 #pragma once
-// Protocol version 1 between the bridge and an A2F server (docs/PROTOCOL.md): framing, every message's
-// encoding and decoding, and every limit. Platform-neutral, no I/O. All integers little-endian.
+// Protocol versions 1 and 2 between the bridge and an A2F server (docs/PROTOCOL.md): framing, every message's
+// encoding and decoding, and every limit. Platform-neutral, no I/O. All integers little-endian. Version 2 is version
+// 1 with NOTICE (one-way, on TCP) and FIND and FOUND (UDP datagrams) added; every other payload is the same in both.
 //
 // Decoders never trust a length: each read is bounds-checked, each payload must be consumed exactly, and a
 // tensor's byte length must equal its element count times its type's size. Encoders refuse what the decoder
@@ -16,10 +17,13 @@
 namespace bfarb::proto {
 
 constexpr std::uint8_t kMagic[4] = {'B', 'F', 'A', 'R'};
-constexpr std::uint16_t kVersion = 1;
+constexpr std::uint16_t kVersion1 = 1;
+constexpr std::uint16_t kVersion2 = 2;  // version 1 with NOTICE, FIND and FOUND
+constexpr std::uint16_t kNewestVersion = kVersion2;
 constexpr std::size_t kHeaderSize = 12;
 constexpr std::uint32_t kMaxPayload = 64u * 1024u * 1024u;  // 64 MiB; larger is refused
 constexpr std::size_t kMaxRank = 255;                       // a u8
+constexpr std::size_t kMaxDatagram = 1472;                  // FIND or FOUND, header included: one Ethernet frame's UDP payload
 
 enum class MsgType : std::uint16_t {
     Hello = 1,
@@ -29,7 +33,14 @@ enum class MsgType : std::uint16_t {
     Error = 5,
     Ping = 6,
     Pong = 7,
+    Find = 8,     // version 2, UDP only
+    Found = 9,    // version 2, UDP only
+    Notice = 10,  // version 2, one-way
 };
+
+// Whether a frame of `type` exists in `version` on TCP (1 to 7; 2 adds NOTICE), or as a datagram (FIND and FOUND,
+// version 2).
+bool KnownType(std::uint16_t version, std::uint16_t type, bool datagram = false) noexcept;
 
 enum class ModelStatus : std::uint8_t {
     Ready = 0,
@@ -79,7 +90,7 @@ bool ElementCount(const std::vector<std::int64_t>& dims, std::uint64_t& count) n
 bool ByteLength(std::uint8_t dtype, const std::vector<std::int64_t>& dims, std::uint64_t& bytes) noexcept;
 
 struct Header {
-    std::uint16_t version = kVersion;
+    std::uint16_t version = kVersion1;
     std::uint16_t type = 0;
     std::uint32_t length = 0;
 };
@@ -167,17 +178,32 @@ struct Error {
     std::string message;
 };
 
+// NOTICE (version 2): a line that fell back, told to the server. One-way: nothing answers it.
+struct Notice {
+    std::string model;   // a base name, as in HELLO
+    std::string reason;  // one word of core/Reasons.h's ReasonKey
+    std::string detail;  // one line
+    std::uint32_t lines = 0;  // the lines that fell back since the previous NOTICE, the latest included
+};
+
 // ---- frames
 
-// A whole frame (header and payload). False, with err, when the payload would be refused.
-bool EncodeFrame(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& frame, std::string& err);
-// The 12 header bytes: false, with err, on a wrong magic, an unsupported version (versionRefused set), an unknown
-// type or a payload above kMaxPayload (tooLarge set).
+// A whole TCP frame (header and payload) of `version`. False, with err, when the payload would be refused, or the type
+// isn't one of that version's on TCP (NOTICE in version 1, FIND or FOUND in any).
+bool EncodeFrame(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& frame, std::string& err,
+                 std::uint16_t version = kVersion1);
+// The 12 header bytes of a TCP frame: false, with err, on a wrong magic, a version other than 1 or 2 (versionRefused
+// set), a type that isn't one of its version's on TCP, or a payload above kMaxPayload (tooLarge set).
 struct HeaderCheck {
     bool versionRefused = false;
     bool tooLarge = false;
 };
 bool DecodeHeader(const std::uint8_t* bytes, Header& header, std::string& err, HeaderCheck* check = nullptr);
+
+// A FIND or FOUND datagram (version 2): the header, then the payload, nothing after it, at most kMaxDatagram bytes.
+bool EncodeDatagram(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& datagram, std::string& err);
+// A datagram's header and payload: false, with err, unless it is exactly one version 2 frame of FIND or FOUND.
+bool DecodeDatagram(const std::uint8_t* p, std::size_t n, Header& header, std::vector<std::uint8_t>& payload, std::string& err);
 
 // ---- payloads (each encoder returns the payload only; EncodeFrame wraps it)
 
@@ -195,6 +221,15 @@ bool DecodeRunOk(const std::uint8_t* p, std::size_t n, DecodedRunOk& m, std::str
 
 bool EncodeError(const Error& m, std::vector<std::uint8_t>& out, std::string& err);
 bool DecodeError(const std::uint8_t* p, std::size_t n, Error& m, std::string& err);
+
+bool EncodeNotice(const Notice& m, std::vector<std::uint8_t>& out, std::string& err);
+bool DecodeNotice(const std::uint8_t* p, std::size_t n, Notice& m, std::string& err);
+
+// FIND's payload, str client; FOUND's, str server (it carries no port: the client connects on the port FIND reached).
+bool EncodeFind(const std::string& client, std::vector<std::uint8_t>& out, std::string& err);
+bool DecodeFind(const std::uint8_t* p, std::size_t n, std::string& client, std::string& err);
+bool EncodeFound(const std::string& server, std::vector<std::uint8_t>& out, std::string& err);
+bool DecodeFound(const std::uint8_t* p, std::size_t n, std::string& server, std::string& err);
 
 // The size of the RUN payload EncodeRun would make, without making it (for the 64 MiB check before copying).
 std::uint64_t RunPayloadSize(const RunRequest& m) noexcept;

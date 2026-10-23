@@ -10,7 +10,7 @@
 
 plugin:
   name: "BFARemoteBridge"
-  version: "1.2.0"
+  version: "1.3.0"
   description: "Sends Better Facial Animations' lip-sync model runs to PandorumLLM's A2F server on another PC of your network, and shows what the server does."
 
 schema:
@@ -19,13 +19,13 @@ schema:
     - name: "Server address"
       path: "serverAddress"
       type: "string"
-      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Empty means no server: BFA's model isn't loaded and lip sync is the game's own. Finding PandorumLLM's PC by itself comes with bridge 1.3.0."
+      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Empty means the bridge finds the server on the local network by itself: PandorumLLM's A2F server answers once its Remote IP is set to this PC, in a version that speaks the bridge's protocol version 2. Enter the address for an older server."
       defaultValue: ""
       category: "Server"
     - name: "Port"
       path: "serverPort"
       type: "int"
-      description: "The A2F server's port, as set in PandorumLLM. Used with the address above."
+      description: "The A2F server's port, as set in PandorumLLM: used with the address above, and for finding the server when the address is empty."
       defaultValue: 7871
       min: 1
       max: 65535

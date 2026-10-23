@@ -26,12 +26,11 @@ std::string CantAttachText(const std::string& bfaVersion, const std::string& why
 // newer: the advice is to update the bridge, else BFA.
 std::string CantServeText(const std::string& bfaVersion, const std::string& ortVersion, bool newer);
 
-// No server address: lines get the game's own lip sync. skyrimNet: whether SkyrimNet, which holds the address, is
-// loaded.
-std::string NoServerText(bool skyrimNet);
+// SkyrimNet, which holds the settings, isn't loaded: no server address, and lip sync is the game's own.
+std::string NoServerText();
 
-// BFA's GPU route: once per session.
-std::string GpuText();
+// No server address is set and none answered on the local network: lip sync is the game's own, and what to do.
+std::string NotFoundText(int port);
 
 // "a2f3_fp16.onnx on NVIDIA GeForce RTX 5090 (DirectML 3), PandorumLLM v3.97-p6 Beta A2F: ready"
 std::string ModelLine(const std::string& model, const std::string& server, const std::string& device, const std::string& state);

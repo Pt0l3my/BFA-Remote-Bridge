@@ -18,7 +18,7 @@
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
 //                   taken, and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
-//                   bridge's own. Not, or no server address set, or the settings not read yet: BFA gets an error
+//                   bridge's own. Not, or no server found, or the settings not read yet: BFA gets an error
 //                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
 //                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
@@ -32,7 +32,8 @@
 // AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;
 // GetExecutionProviderApi ("DML" at API version 24: a copy of the real OrtDmlApi table with its three
 // SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
-// to see that BFA is set to use the graphics card, which the bridge reports. Every one of these passes the call
+// to see that BFA is set to use the graphics card, which the bridge logs at Detailed, as a fact: the hardware is
+// PandorumLLM's choice, and the bridge advises nothing about it. Every one of these passes the call
 // through unchanged. Every other entry that takes a session answers a bridge session with an error status. The
 // runtime's other session makers (CreateSessionFromArray, the two with prepacked weights, the model editor's three)
 // answer with an error status naming them, since a model loaded so would run on this PC. Everything else is the real

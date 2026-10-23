@@ -212,6 +212,13 @@ bool ValidModelName(std::string_view name) noexcept {
     return true;
 }
 
+bool KnownType(std::uint16_t version, std::uint16_t type, bool datagram) noexcept {
+    if (version != kVersion1 && version != kVersion2) return false;
+    if (datagram) return version == kVersion2 && (type == static_cast<std::uint16_t>(MsgType::Find) || type == static_cast<std::uint16_t>(MsgType::Found));
+    if (type >= static_cast<std::uint16_t>(MsgType::Hello) && type <= static_cast<std::uint16_t>(MsgType::Pong)) return true;
+    return version == kVersion2 && type == static_cast<std::uint16_t>(MsgType::Notice);
+}
+
 bool ElementCount(const std::vector<std::int64_t>& dims, std::uint64_t& count) noexcept {
     std::uint64_t n = 1;
     for (const std::int64_t d : dims) {
@@ -235,13 +242,17 @@ bool ByteLength(std::uint8_t dtype, const std::vector<std::int64_t>& dims, std::
 
 // ---- frames
 
-bool EncodeFrame(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& frame, std::string& err) {
+bool EncodeFrame(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& frame, std::string& err,
+                 std::uint16_t version) {
     if (payload.size() > kMaxPayload) return Fail(err, "payload above 64 MiB");
+    if (!KnownType(version, static_cast<std::uint16_t>(type)))
+        return Fail(err, "message type " + std::to_string(static_cast<int>(type)) + " isn't one of protocol version " + std::to_string(version) +
+                             "'s on TCP");
     frame.clear();
     frame.reserve(kHeaderSize + payload.size());
     Writer w(frame);
     w.Bytes(kMagic, 4);
-    w.U16(kVersion);
+    w.U16(version);
     w.U16(static_cast<std::uint16_t>(type));
     w.U32(static_cast<std::uint32_t>(payload.size()));
     w.Bytes(payload.data(), payload.size());
@@ -255,16 +266,44 @@ bool DecodeHeader(const std::uint8_t* bytes, Header& header, std::string& err, H
     r.U16(header.version);
     r.U16(header.type);
     r.U32(header.length);
-    if (header.version != kVersion) {
+    if (header.version != kVersion1 && header.version != kVersion2) {
         if (check) check->versionRefused = true;
         return Fail(err, "protocol version " + std::to_string(header.version) + " not supported");
     }
-    if (header.type < static_cast<std::uint16_t>(MsgType::Hello) || header.type > static_cast<std::uint16_t>(MsgType::Pong))
-        return Fail(err, "unknown message type " + std::to_string(header.type));
+    if (!KnownType(header.version, header.type))
+        return Fail(err, "unknown message type " + std::to_string(header.type) + " in protocol version " + std::to_string(header.version));
     if (header.length > kMaxPayload) {
         if (check) check->tooLarge = true;
         return Fail(err, "payload above 64 MiB");
     }
+    return true;
+}
+
+bool EncodeDatagram(MsgType type, const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& datagram, std::string& err) {
+    if (!KnownType(kVersion2, static_cast<std::uint16_t>(type), true)) return Fail(err, "only FIND and FOUND are datagrams");
+    if (kHeaderSize + payload.size() > kMaxDatagram) return Fail(err, "datagram above " + std::to_string(kMaxDatagram) + " bytes");
+    datagram.clear();
+    Writer w(datagram);
+    w.Bytes(kMagic, 4);
+    w.U16(kVersion2);
+    w.U16(static_cast<std::uint16_t>(type));
+    w.U32(static_cast<std::uint32_t>(payload.size()));
+    w.Bytes(payload.data(), payload.size());
+    return true;
+}
+
+bool DecodeDatagram(const std::uint8_t* p, std::size_t n, Header& header, std::vector<std::uint8_t>& payload, std::string& err) {
+    if (n < kHeaderSize) return Fail(err, "shorter than a header");
+    if (n > kMaxDatagram) return Fail(err, "datagram above " + std::to_string(kMaxDatagram) + " bytes");
+    if (std::memcmp(p, kMagic, 4) != 0) return Fail(err, "bad magic");
+    Reader r(p + 4, kHeaderSize - 4);
+    r.U16(header.version);
+    r.U16(header.type);
+    r.U32(header.length);
+    if (header.version != kVersion2) return Fail(err, "protocol version " + std::to_string(header.version) + ", not 2");
+    if (!KnownType(header.version, header.type, true)) return Fail(err, "message type " + std::to_string(header.type) + " isn't FIND or FOUND");
+    if (header.length != n - kHeaderSize) return Fail(err, "the length doesn't match the datagram");
+    payload.assign(p + kHeaderSize, p + n);
     return true;
 }
 
@@ -438,6 +477,54 @@ bool DecodeError(const std::uint8_t* p, std::size_t n, Error& m, std::string& er
     if (!r.U32(m.requestId) || !r.U16(m.code) || !r.Str(m.message)) return Fail(err, "truncated ERROR");
     if (!r.Done()) return Fail(err, "trailing bytes after ERROR");
     return true;
+}
+
+// ---- NOTICE
+
+bool EncodeNotice(const Notice& m, std::vector<std::uint8_t>& out, std::string& err) {
+    out.clear();
+    if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
+    Writer w(out);
+    if (!w.Str(m.model) || !w.Str(m.reason) || !w.Str(m.detail)) return Fail(err, "string longer than 65,535 bytes");
+    w.U32(m.lines);
+    return Finish(out, err);
+}
+
+bool DecodeNotice(const std::uint8_t* p, std::size_t n, Notice& m, std::string& err) {
+    Reader r(p, n);
+    if (!r.Str(m.model) || !r.Str(m.reason) || !r.Str(m.detail) || !r.U32(m.lines)) return Fail(err, "truncated NOTICE");
+    if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
+    if (!r.Done()) return Fail(err, "trailing bytes after NOTICE");
+    return true;
+}
+
+// ---- FIND and FOUND
+
+namespace {
+
+bool EncodeOneString(const std::string& s, std::vector<std::uint8_t>& out, std::string& err) {
+    out.clear();
+    Writer w(out);
+    if (!w.Str(s)) return Fail(err, "string longer than 65,535 bytes");
+    return true;
+}
+
+bool DecodeOneString(const std::uint8_t* p, std::size_t n, std::string& s, const char* what, std::string& err) {
+    Reader r(p, n);
+    if (!r.Str(s)) return Fail(err, std::string("truncated ") + what);
+    if (!r.Done()) return Fail(err, std::string("trailing bytes after ") + what);
+    return true;
+}
+
+}  // namespace
+
+bool EncodeFind(const std::string& client, std::vector<std::uint8_t>& out, std::string& err) { return EncodeOneString(client, out, err); }
+bool DecodeFind(const std::uint8_t* p, std::size_t n, std::string& client, std::string& err) {
+    return DecodeOneString(p, n, client, "FIND", err);
+}
+bool EncodeFound(const std::string& server, std::vector<std::uint8_t>& out, std::string& err) { return EncodeOneString(server, out, err); }
+bool DecodeFound(const std::uint8_t* p, std::size_t n, std::string& server, std::string& err) {
+    return DecodeOneString(p, n, server, "FOUND", err);
 }
 
 }  // namespace bfarb::proto

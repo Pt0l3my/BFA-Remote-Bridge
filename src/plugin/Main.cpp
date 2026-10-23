@@ -5,9 +5,10 @@
 //                   ONNX Runtime (Hook.cpp), whatever its version; note whether SkyrimNet is loaded, so a model load
 //                   waits for its settings; and, once attached, allow the client's background thread (src/core/Client.h)
 //   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
-//   main menu,      registered them; also whenever that page is saved. The first read with a server address set
-//   pre-load game   starts the background thread, which looks the server's name up (again after each change
-//                   of the address or port), says HELLO with no models and logs the answer
+//   main menu,      registered them; also whenever that page is saved. The first read starts the background
+//   pre-load game   thread, which looks the server's name up (again after each change of the address or port),
+//                   or, with the address empty, searches the local network for it (FIND), says HELLO with no
+//                   models and logs the answer
 //   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
 //                   the monitor's lines (src/core/Monitor.h; setting showStatus)
 //
@@ -79,7 +80,7 @@ void ApplySettings(const char* when) {
     g_settingsRead = true;
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
-    g_bridge->Apply(s);  // starts the background thread once a server address is set
+    g_bridge->Apply(s);  // starts the background thread, which looks the server up or searches for it
 }
 
 class ConfigSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent> {
@@ -127,8 +128,8 @@ void OnGameLoaded() {
         // BFA missing is a status (Status on load); the bridge unable to attach is said either way
         const std::string status = LoadStatusText(f);
         if (!status.empty() && (!g_bfa.found ? ShowStatus() : true)) ShowNote(status);
-        if (g_bfa.hooked && g_bridge->CurrentSettings().serverAddress.empty())
-            g_bridge->Notes().Once("noserver", NoServerText(g_skyrimNet));
+        // an empty address is searched for on the local network: only no SkyrimNet means no server at all
+        if (g_bfa.hooked && !g_skyrimNet) g_bridge->Notes().Once("noserver", NoServerText());
     }
     for (const auto& text : pending) CornerNote(text);  // each came through ShowNote already, held until now
     if (g_bfa.hooked) g_bridge->Notes().Loaded();  // every model's line, while Status on load allows it
@@ -210,6 +211,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
         return false;
     }
     g_bridge = new Bridge(WinsockFactory(), &WinsockResolve, [](Level level, const std::string& line) { Log(level, line); });
+    g_bridge->Connection().SetDiscovery(WinsockDiscovery());  // an empty address: FIND on each adapter's broadcast address
     Bridge::SetCurrent(g_bridge);
     g_bridge->Notes().SetSink([](const std::string& text) { ShowNote(text); });
     const auto* messaging = SKSE::GetMessagingInterface();

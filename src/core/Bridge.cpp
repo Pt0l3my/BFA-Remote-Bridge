@@ -704,6 +704,12 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     std::string why, words;
     Reason reason = Reason::ModelRefused;
     using K = ProbeResult::Kind;
+    if (a.hello.kind == K::NotFound) {
+        // no server address set, and none answered on the local network: the advice once, as for no address in 1.2
+        OrtStatus* status = RefuseWith(real, model, "no server was found on the local network (" + a.detail + ")");
+        monitor_.Once("notfound", NotFoundText(CurrentSettings().serverPort));
+        return status;
+    }
     if (a.hello.kind == K::NoAnswer) {
         reason = Reason::Unreachable;
         why = "the server didn't answer (" + a.detail + ")";
@@ -781,7 +787,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         const std::filesystem::path file(path);
         const std::string name = Utf8Name(file);
 
-        // BFA's GPU route is its own setting: reported, once per session
+        // BFA's GPU route is its own setting, and the hardware is PandorumLLM's choice: logged once, as a fact, at Detailed
         bool gpu = false, tellGpu = false;
         std::vector<proto::Override> overrides;
         {
@@ -790,22 +796,17 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
                 overrides = it->second.overrides;
                 gpu = it->second.gpu;
             }
-            tellGpu = gpu && !gpuLogged_;
+            tellGpu = gpu && !gpuLogged_ && s.logDetail == LogDetail::Detailed;
             if (tellGpu) gpuLogged_ = true;
         }
-        if (tellGpu) {
-            Log(Level::Info,
-                "Better Facial Animations is set to GPU: no lip-sync model runs on this PC's graphics card with the bridge, but BFA "
-                "keeps a device open on it; its Force CPU setting avoids that, and the model runs on the server either way");
-            monitor_.Once("gpu", GpuText());
-        }
+        if (tellGpu)
+            Log(Level::Info, "Better Facial Animations is set to GPU; its model runs on the server either way");
 
         if (!settingsRead_.load() && skyrimNet_.load()) return RefuseWith(real, name, "the bridge's settings weren't read yet");
-        if (!settingsRead_.load() || s.serverAddress.empty()) {
-            const bool skyrimNet = settingsRead_.load() || skyrimNet_.load();  // the settings come from SkyrimNet
-            OrtStatus* status = RefuseWith(real, name,
-                                           skyrimNet ? "no server address is set, so there is no server" : "SkyrimNet isn't loaded, so the bridge has no server address");
-            monitor_.Once("noserver", NoServerText(skyrimNet));
+        if (!settingsRead_.load()) {
+            // the settings come from SkyrimNet; an empty address once they are read means the server is searched for
+            OrtStatus* status = RefuseWith(real, name, "SkyrimNet isn't loaded, so the bridge has no server address");
+            monitor_.Once("noserver", NoServerText());
             return status;
         }
 
@@ -915,7 +916,7 @@ void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallba
     try {
         client_.RecordFallback(model, fallback, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
         monitor_.Fallback(reason, model);
-        client_.ReportFallback(reason);
+        client_.ReportFallback(reason, model, fallback.text);  // a line: a NOTICE to a version 2 server
     } catch (...) {
     }
     NanAnswer(real, outputCount, outputs);
