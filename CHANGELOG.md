@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.0
+
+Protocol version 1 is unchanged; it works with PandorumLLM v3.97-p6. What would need the server's side is proposed to
+it first.
+
+- **Not an alternative to BFA: a bridge to PandorumLLM's A2F server.** The README says so at the top, says that BFA
+  stays installed (with Force CPU ticked) and how to give PandorumLLM's PC the same BFA files.
+- **The settings page keeps only what the server can't tell the bridge:** the server address and port (for a server
+  that doesn't answer discovery yet, as today's), Status on load and Log detail. **Bridge**, **Access key**,
+  **Timeout** (now fixed at 1000 ms) and **Check results** are gone, with the code that loaded and ran the model on
+  this PC for the check. Values saved for them are ignored. With the bridge installed it takes over; to run BFA on its
+  own, disable the bridge in Mod Organizer 2.
+- **No server address: no model on this PC.** Every model load is refused, lines get the game's own lip sync, and a
+  note says so once. Before, BFA then ran its model on this PC.
+- **The monitor.** One line per model with the card and the server that run it and its state, at each load (Status
+  on load) and whenever they change; a note when lines fall back to the game's own lip sync, naming the reason, at
+  most one a minute while it lasts; one when lines are back on the server. The reasons are one list
+  (`src/core/Reasons.h`). Every note begins with "BFA Remote Bridge:" and goes through one function, Skyrim's corner
+  note today (which SkyrimNet sees as a `notification` event), ready for SkyrimNet's own notification call.
+- **The server is told of fallbacks:** within seconds of one, at most every 30 seconds, a status check carries its
+  reason in the client string ("fallback timeout"). The client string also names BFA's version and the runtime's
+  ("BFA 4.3.2.3, ORT 1.24.4"), within its 120 characters.
+- **Any BFA is tried.** The 4.3.x gate is gone. The ONNX Runtime API version BFA asks for is served from the real
+  table: for an older runtime, only as many entries as its version has (a count per API version, checked against the
+  header), never reading past its table; for a newer version, 1.24.4's entries wrapped as before and every entry
+  past them answered with an error status naming it. A runtime the bridge can't serve (older than API version 10,
+  or an API version past 30) gets the real table, and a note says to update the bridge.
+- **BFA's GPU mode is reported, not changed:** once per session, on screen whatever Status on load says, with "Tick
+  Force CPU in BFA's menu". The bridge changes nothing else of BFA's.
+- A model load BFA retries after a refusal is logged once until the refusal changes.
+
 ## 1.1.1
 
 Protocol version 1 is unchanged. Made for PandorumLLM v3.97 Beta patch4.
