@@ -11,24 +11,34 @@ namespace {
 constexpr char kBfaIni[] = "Data\\SKSE\\Plugins\\BetterFacialAnimations.ini";
 constexpr char kStateIni[] = "Data\\SKSE\\Plugins\\BFARemoteBridge.ini";
 constexpr char kStateSection[] = "BfaMode";
-constexpr char kStateKey[] = "FoundForceCPU";
+constexpr char kStateKey[] = "ForceCPUSetByBridge";  // "1": the bridge set ForceCPU=1 over a 0
 
 class ProfileIniStore final : public IniStore {
 public:
+    bool BfaIniPresent() override {
+        const DWORD attributes = ::GetFileAttributesA(kBfaIni);
+        return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+    }
     int ReadForceCpu() override {
         // as BFA's LoadIni: the legacy GPU=0 is the default, ForceCPU overrides it
         const bool legacy = ::GetPrivateProfileIntA("General", "GPU", 1, kBfaIni) == 0;
         return ::GetPrivateProfileIntA("General", "ForceCPU", legacy ? 1 : 0, kBfaIni) != 0 ? 1 : 0;
     }
     bool WriteForceCpu(int value, std::string& err) override {
+        if (!BfaIniPresent()) {  // never created: the profile call would make a file BFA didn't write
+            err = "BFA's INI isn't there";
+            return false;
+        }
         return Write("General", "ForceCPU", value ? "1" : "0", kBfaIni, err);
     }
-    int ReadRecorded() override {
-        const int v = static_cast<int>(::GetPrivateProfileIntA(kStateSection, kStateKey, -1, kStateIni));
-        return v == 0 || v == 1 ? v : -1;
+    bool ReadSetByBridge() override {
+        // exactly as written, or nothing: a damaged or lost record puts nothing back
+        char value[8] = {};
+        ::GetPrivateProfileStringA(kStateSection, kStateKey, "", value, sizeof value, kStateIni);
+        return std::string_view(value) == "1";
     }
-    bool WriteRecorded(int value, std::string& err) override {
-        return Write(kStateSection, kStateKey, value < 0 ? nullptr : value ? "1" : "0", kStateIni, err);
+    bool WriteSetByBridge(bool set, std::string& err) override {
+        return Write(kStateSection, kStateKey, set ? "1" : nullptr, kStateIni, err);
     }
 
 private:

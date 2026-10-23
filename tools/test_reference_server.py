@@ -428,6 +428,26 @@ class ReferenceServerTests(unittest.TestCase):
         self.assertEqual((kind, error_code(payload)[1]), (5, 1))
         self.assertTrue(c.closed())
 
+    def test_a_p6_server_closes_with_the_hello_unread(self):
+        # p6 and earlier read only the header of a version 2 HELLO, answer ERROR 6 framed in version 1 and close with
+        # the payload unread: the client may read the ERROR, or find the connection reset (the race the bridge's
+        # no-frame rule covers). Either way the connection ends, and version 1 is then answered.
+        port = self.other_server("--p6")
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=2))
+        time.sleep(0.2)
+        try:
+            got = c.answer()
+        except ConnectionError:
+            got = "reset"
+        if got not in ("reset", None):
+            kind, payload = got
+            self.assertEqual((kind, error_code(payload), c.last_version), (5, (0, 6), 1))
+            self.assertTrue(c.closed())
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=1))
+        self.assertEqual((c.answer()[0], c.last_version), (2, 1))
+
     def test_notice_is_one_way_and_logged(self):
         before = len(self.logged_notices())
         c = self.connect()

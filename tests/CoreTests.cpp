@@ -602,8 +602,9 @@ namespace {
 
 // BFA's INI and the bridge's state, in memory, with every write counted.
 struct FakeIni {
+    bool present = true;
     int forceCpu = 0;
-    int recorded = -1;
+    bool setByBridge = false;
     int iniWrites = 0;
     int recordWrites = 0;
     bool failRecord = false;
@@ -612,19 +613,21 @@ struct FakeIni {
 class FakeIniStore final : public IniStore {
 public:
     explicit FakeIniStore(std::shared_ptr<FakeIni> ini) : ini_(std::move(ini)) {}
+    bool BfaIniPresent() override { return ini_->present; }
     int ReadForceCpu() override { return ini_->forceCpu; }
     bool WriteForceCpu(int value, std::string&) override {
+        CHECK(ini_->present);  // never created
         ini_->forceCpu = value;
         ++ini_->iniWrites;
         return true;
     }
-    int ReadRecorded() override { return ini_->recorded; }
-    bool WriteRecorded(int value, std::string& err) override {
+    bool ReadSetByBridge() override { return ini_->setByBridge; }
+    bool WriteSetByBridge(bool set, std::string& err) override {
         if (ini_->failRecord) {
             err = "read-only";
             return false;
         }
-        ini_->recorded = value;
+        ini_->setByBridge = set;
         ++ini_->recordWrites;
         return true;
     }
@@ -637,6 +640,7 @@ struct ModeRig {
     std::shared_ptr<FakeIni> ini = std::make_shared<FakeIni>();
     std::vector<std::string> log;
     BfaCpuMode mode{std::make_unique<FakeIniStore>(ini), [this](Level, const std::string& l) { log.push_back(l); }};
+    explicit ModeRig(const char* bfa = kCpuModeBfaVersion) { mode.SetBfaVersion(bfa); }
     int Logged(const std::string& part) const {
         int n = 0;
         for (const auto& l : log) n += l.find(part) != std::string::npos;
@@ -646,7 +650,8 @@ struct ModeRig {
 
 }  // namespace
 
-// Nothing while no server has answered; version 2 sets ForceCPU=1, recording the value found; logged once.
+// Nothing while no server has answered; version 2 sets ForceCPU=1, recording that the bridge set it; logged once.
+// Each game save writes it again.
 TEST(BfaModeSetOnVersionTwo) {
     ModeRig r;
     r.mode.OnGameSave();
@@ -656,7 +661,7 @@ TEST(BfaModeSetOnVersionTwo) {
     r.mode.OnServerVersion(2);
     CHECK(r.mode.Set());
     CHECK_EQ(r.ini->forceCpu, 1);
-    CHECK_EQ(r.ini->recorded, 0);
+    CHECK(r.ini->setByBridge);
     CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0)"), 1);
     CHECK_EQ(r.Logged("from the next game start"), 1);
     // BFA's menu saves its file with ForceCPU=0 in this session: the next game save writes 1 again, silently
@@ -671,7 +676,8 @@ TEST(BfaModeSetOnVersionTwo) {
     CHECK_EQ(r.ini->iniWrites, 2);
 }
 
-// The value found is recorded once: not overwritten by the bridge's own 1, nor at a later start.
+// The record is written once, and only when the bridge changes a 0: a 1 it finds (the player's, or its own whose record
+// was lost) is never recorded, so nothing is put back for it.
 TEST(BfaModeRecordsTheValueFoundOnce) {
     ModeRig r;
     r.mode.OnServerVersion(2);
@@ -679,19 +685,31 @@ TEST(BfaModeRecordsTheValueFoundOnce) {
     r.mode.OnGameSave();
     r.mode.OnServerVersion(2);
     CHECK_EQ(r.ini->recordWrites, 1);
-    CHECK_EQ(r.ini->recorded, 0);
-    // the next start: the file says 1 (the bridge's), the record still 0
+    CHECK(r.ini->setByBridge);
+    // the next start: the file says 1 (the bridge's), the record stays
     BfaCpuMode again(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    again.SetBfaVersion(kCpuModeBfaVersion);
     again.OnServerVersion(2);
-    CHECK_EQ(r.ini->recorded, 0);
     CHECK_EQ(r.ini->recordWrites, 1);
-    // BFA already in its CPU mode: recorded as 1, nothing written to BFA's file
+    // BFA already in its CPU mode: nothing recorded, nothing written, nothing put back at version 1
     ModeRig cpu;
     cpu.ini->forceCpu = 1;
     cpu.mode.OnServerVersion(2);
-    CHECK_EQ(cpu.ini->recorded, 1);
+    CHECK(!cpu.ini->setByBridge);
+    CHECK_EQ(cpu.ini->iniWrites + cpu.ini->recordWrites, 0);
+    cpu.mode.OnServerVersion(1);
+    CHECK_EQ(cpu.ini->forceCpu, 1);
     CHECK_EQ(cpu.ini->iniWrites, 0);
-    CHECK(cpu.log.empty());
+    // the bridge's record lost after it set 1: its own 1 isn't taken for the player's, and nothing is put back
+    ModeRig lost;
+    lost.mode.OnServerVersion(2);
+    lost.ini->setByBridge = false;
+    BfaCpuMode later(std::make_unique<FakeIniStore>(lost.ini), nullptr);
+    later.SetBfaVersion(kCpuModeBfaVersion);
+    later.OnServerVersion(2);
+    CHECK(!lost.ini->setByBridge);
+    later.OnServerVersion(1);
+    CHECK_EQ(lost.ini->forceCpu, 1);
     // the record can't be written: BFA's file is left as it is
     ModeRig ro;
     ro.ini->failRecord = true;
@@ -701,7 +719,7 @@ TEST(BfaModeRecordsTheValueFoundOnce) {
     CHECK_EQ(ro.Logged("BFA's mode is left as it is"), 1);
 }
 
-// A version 1 server: the recorded value goes back and the record is cleared; saves then leave BFA's file alone.
+// A version 1 server: the value the bridge set goes back and the record is cleared; saves then leave BFA's file alone.
 TEST(BfaModeRestoredOnVersionOne) {
     ModeRig r;
     r.mode.OnServerVersion(1);  // nothing recorded: nothing to put back
@@ -711,12 +729,58 @@ TEST(BfaModeRestoredOnVersionOne) {
     r.mode.OnServerVersion(1);
     CHECK(!r.mode.Set());
     CHECK_EQ(r.ini->forceCpu, 0);
-    CHECK_EQ(r.ini->recorded, -1);
-    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was"), 1);
+    CHECK(!r.ini->setByBridge);
+    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
+                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from "
+                      "the next game start."),
+             1);
     r.mode.OnGameSave();
     CHECK_EQ(r.ini->forceCpu, 0);
-    // a later start with a version 1 server and the record cleared: nothing
     const int writes = r.ini->iniWrites;
     r.mode.OnServerVersion(1);
     CHECK_EQ(r.ini->iniWrites, writes);
+}
+
+// BFA's INI missing: never created. Nothing recorded or written at version 2, at saves or at version 1, one log
+// line; a record left with nothing to put back is cleared.
+TEST(BfaModeNeverCreatesBfasIni) {
+    ModeRig r;
+    r.ini->present = false;
+    r.mode.OnServerVersion(2);
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(1);
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    CHECK_EQ(r.Logged("BFA's mode is left as it is: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini isn't there, and the bridge never "
+                      "creates it"),
+             1);
+    // set earlier, then the file went: the record is cleared, and the file isn't made again
+    ModeRig gone;
+    gone.mode.OnServerVersion(2);
+    CHECK(gone.ini->setByBridge);
+    gone.ini->present = false;
+    gone.mode.OnServerVersion(1);
+    CHECK(!gone.ini->setByBridge);
+    CHECK_EQ(gone.ini->iniWrites, 1);
+}
+
+// Another BFA version (or one unknown): its mode is left as it is, and a value the bridge set earlier is put back.
+TEST(BfaModeOnlyForBfa4323) {
+    for (const char* other : {"4.3.2.2", "4.4.0", ""}) {
+        ModeRig r(other);
+        r.mode.OnServerVersion(2);
+        r.mode.OnGameSave();
+        CHECK_EQ(r.ini->forceCpu, 0);
+        CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+        CHECK_EQ(r.Logged("BFA's mode is left as it is: this is Better Facial Animations"), 1);
+    }
+    // set under 4.3.2.3, then BFA updated: put back
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 1);
+    BfaCpuMode updated(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    updated.SetBfaVersion("4.4.0");
+    updated.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 0);
+    CHECK(!r.ini->setByBridge);
 }

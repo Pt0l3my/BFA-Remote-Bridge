@@ -53,6 +53,8 @@ struct Script {
     std::atomic<bool> resetBeforeAnswer{false};  // the next frame finds the connection reset
     std::atomic<bool> failSend{false};           // the next send fails outright
     std::atomic<int> speaks{2};                  // the newest protocol version the server speaks
+    std::atomic<bool> p6{false};                 // as PandorumLLM v3.97-p6: a newer version's HELLO reset, no frame back
+    std::atomic<int> resetHellos{0};             // the next this many connections reset at their first frame
     std::atomic<int> connects{0};
     std::atomic<int> closes{0};
 
@@ -153,6 +155,11 @@ public:
                 }
             }
             if (closing_) continue;  // after a closing ERROR: the server reads no more
+            if (version_ == 0 && (script_->resetHellos.load() > 0 || (script_->p6 && version > script_->speaks.load()))) {
+                if (script_->resetHellos.load() > 0) --script_->resetHellos;
+                closed_ = Result::Reset;  // no frame back: the connection was reset
+                continue;
+            }
             if (version_ == 0) {
                 if (version > script_->speaks.load()) {
                     // a version this server doesn't speak: ERROR 6 framed in the newest it does, then closed

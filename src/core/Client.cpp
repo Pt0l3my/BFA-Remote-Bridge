@@ -198,6 +198,9 @@ bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Cl
 }
 
 bool Early(Failure f) { return f == Failure::SendFailed || f == Failure::Closed || f == Failure::Reset; }
+// No frame came back: the connection was reset, or closed before any answer.
+bool NoFrame(Failure f) { return f == Failure::Closed || f == Failure::Reset; }
+constexpr const char* kNoFrameTwice = "two version 2 HELLOs got no answer: the connection was reset or closed before any";
 
 // The version rule's identity of a server: the address setting's, or the address found, with the port. Never logged.
 std::string HostKey(const std::string& host, int port) { return "address " + host + " port " + std::to_string(port); }
@@ -444,7 +447,7 @@ std::uint16_t Client::VersionFor(const std::string& key) const {
 }
 
 // What the server at key answered in: a version 1 server is spoken to in version 1 from now on, logged once.
-void Client::LearnVersion(const std::string& key, std::uint16_t version) {
+void Client::LearnVersion(const std::string& key, std::uint16_t version, const char* why) {
     bool first = false, changed = false;
     std::function<void(std::uint16_t)> sink;
     {
@@ -462,10 +465,10 @@ void Client::LearnVersion(const std::string& key, std::uint16_t version) {
         }
     }
     if (first)
-        Log(Level::Info,
-            "The server speaks protocol version 1 only (it answered the bridge's version 2 HELLO with ERROR 6): the bridge speaks "
-            "version 1 to it until the game restarts or the address changes, and tells it of fallbacks by its status checks, "
-            "not by NOTICE");
+        Log(Level::Info, std::string("The server speaks protocol version 1 only (") +
+                             (why ? why : "it answered the bridge's version 2 HELLO with ERROR 6") +
+                             "): the bridge speaks version 1 to it until the game restarts or the address changes, and tells it of "
+                             "fallbacks by its status checks, not by NOTICE");
 }
 
 void Client::SetOrtVersion(const std::string& version) {
@@ -723,7 +726,8 @@ Client::Opened Client::OpenWithHello(const Target& target, const proto::Hello& h
     const Note note = [this, notes](const std::string& l) {
         if (notes) Detail(l);
     };
-    for (int round = 0; round < 2; ++round) {
+    int noFrame = 0;  // version 2 HELLOs that got no frame back
+    for (int round = 0; round < 3; ++round) {
         o.version = VersionFor(target.key);
         auto t = factory_ ? factory_() : nullptr;
         o.connectError = "no network";
@@ -738,9 +742,20 @@ Client::Opened Client::OpenWithHello(const Target& target, const proto::Hello& h
             return o;
         }
         t->Close();
-        if (o.failure != Failure::OlderVersion) return o;
-        LearnVersion(target.key, proto::kVersion1);
-        if (notes) Detail("Connecting again in protocol version 1");
+        if (o.failure == Failure::OlderVersion) {
+            LearnVersion(target.key, proto::kVersion1);
+            if (notes) Detail("Connecting again in protocol version 1");
+            continue;
+        }
+        // no frame back (PandorumLLM v3.97-p6 and earlier close with the payload unread, which can reset the
+        // connection on Windows): once more in version 2, then as a version 1 server
+        if (o.version == proto::kVersion2 && NoFrame(o.failure)) {
+            Detail(std::string("The connection was ") + (o.failure == Failure::Reset ? "reset" : "closed") +
+                   " before any answer to a version 2 HELLO");
+            if (++noFrame == 2) LearnVersion(target.key, proto::kVersion1, kNoFrameTwice);
+            continue;
+        }
+        return o;
     }
     return o;
 }
@@ -937,6 +952,9 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
     lastActivity_ = now_();
     if (!ok) {
         Detail("HELLO on the main connection: " + reason);
+        if (mainVersion_ == proto::kVersion2 && !mainAnswered_ && NoFrame(failure))
+            Detail(std::string("The connection was ") + (failure == Failure::Reset ? "reset" : "closed") +
+                   " before any answer to a version 2 HELLO");
         if (failure == Failure::OlderVersion) LearnVersion(mainKey_, proto::kVersion1);
         return false;
     }
@@ -1074,6 +1092,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     proto::Header header;
     bool reused = transport_ != nullptr;
     bool downgraded = false;  // connected again in version 1, for a version 1 server's answer to the version 2 HELLO
+    int noFrame = 0;          // version 2 HELLOs on a new connection that got no frame back
     for (int attempt = 0;; ++attempt) {
         if (!transport_) {
             bool timedOut = false;
@@ -1115,6 +1134,16 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
             CloseLocked("the server speaks protocol version 1 only");
             downgraded = true;
             reused = false;
+            continue;
+        }
+        // a new connection's version 2 HELLO with no frame back: once more in version 2, then in version 1 (an older
+        // server that closed with the HELLO unread), within the same deadline
+        if (inHello && !reused && mainVersion_ == proto::kVersion2 && NoFrame(f) && !downgraded && Clock::now() < deadline) {
+            if (++noFrame == 2) {
+                LearnVersion(mainKey_, proto::kVersion1, kNoFrameTwice);
+                downgraded = true;
+            }
+            CloseLocked("no answer to the version 2 HELLO");
             continue;
         }
         // a connection the server had closed or reset, or a send that failed: open it again and send again, once,
@@ -1165,6 +1194,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         timeoutsInARow_ = 0;
         reason = ErrorText(e);
         if (proto::ErrorEndsConnection(e.code)) StartPauseLocked("The server answered " + reason);
+        SignalNoticeLocked();
         return answer(Outcome::Failed, Why::ServerError, reason);
     }
     if (!IsType(header, MsgType::RunOk) || !proto::DecodeRunOk(reply.payload.data(), reply.payload.size(), reply.ok, err)) {
@@ -1178,6 +1208,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         return answer(Outcome::Failed, Why::Other, reason);
     }
     timeoutsInARow_ = 0;
+    SignalNoticeLocked();
     return Outcome::Forwarded;
 }
 
@@ -1595,8 +1626,9 @@ void Client::StatusCheck() {
                                                  : "Status check: no answer" + (r.detail.empty() ? std::string() : " (" + r.detail + ")"));
 }
 
-// A line fell back: to a server that answered in version 2, a NOTICE (the background thread's, NoticeMain); to any
-// other, a status check with its reason, within seconds, at most one per kFallbackReportEvery.
+// A line fell back: to a server that answered in version 2, a NOTICE (the background thread's, NoticeMain). Anything
+// else (a line to any other server; a model load's refusal or a runtime entry to every server): a status check with
+// its reason, within seconds, at most one per kFallbackReportEvery.
 void Client::ReportFallback(Reason reason, const std::string& model, const std::string& detail) {
     if (reason == Reason::NoServer) return;
     if (!model.empty()) {
@@ -1606,9 +1638,10 @@ void Client::ReportFallback(Reason reason, const std::string& model, const std::
         notice_ = proto::Notice{model, ReasonKey(reason), ShownServerText(detail), 0};
         noticePending_ = true;
     }
-    if (ServerVersion() == proto::kVersion2) {
-        // the status check's `fallback REASON` is for a version 1 server; a line goes by NOTICE
-        if (!model.empty()) Wake();
+    if (ServerVersion() == proto::kVersion2 && !model.empty()) {
+        // a line goes to a version 2 server by NOTICE alone; a model load's refusal or a runtime entry (no line) keeps
+        // 1.2.0's status check, sent in the version the server speaks
+        Wake();
         return;
     }
     {
@@ -1640,8 +1673,19 @@ Clock::duration Client::NoticeMain() {
             noticeLines_ = 0;
             return Clock::duration::zero();
         }
-        // the connection back, its HELLO answered, and no answer owed first
-        if (!transport_ || !mainAnswered_ || !owed_.empty() || paused_.load()) return std::chrono::seconds(1);
+        // the connection back, its HELLO answered and current, and no answer owed first: the run that clears the way
+        // wakes the thread (SignalNoticeLocked), and a reconnect of its own sends it in the same round
+        if (!transport_ || !mainAnswered_ || !helloCurrent_ || !owed_.empty() || paused_.load()) {
+            noticeWaiting_ = true;
+            return Clock::duration::zero();
+        }
+        // only a model the connection's last HELLO listed
+        if (std::none_of(answered_.begin(), answered_.end(), [&](const Answered& a) { return a.entry.name == notice_.model; })) {
+            noticePending_ = false;
+            noticeLines_ = 0;
+            return Clock::duration::zero();
+        }
+        noticeWaiting_ = false;
         n = notice_;
         n.lines = noticeLines_;
     }
@@ -1659,7 +1703,8 @@ Clock::duration Client::NoticeMain() {
         // the stream's state is unknown: a new connection is made by the next run or the background thread
         Log(Level::Info, "Sending NOTICE failed (" + err + "); reconnecting");
         CloseLocked("sending NOTICE failed");
-        return std::chrono::seconds(1);
+        noticeWaiting_ = true;  // for the next connection
+        return Clock::duration::zero();
     }
     {
         std::lock_guard nl(noticeMutex_);
@@ -1672,6 +1717,13 @@ Clock::duration Client::NoticeMain() {
     Detail("NOTICE: " + n.model + ", " + n.reason + ", " + std::to_string(n.lines) + " line" + (n.lines == 1 ? "" : "s") + " since the last (" +
            n.detail + ")");
     return Clock::duration::zero();
+}
+
+// After a RUN's answer: a NOTICE that waited for the connection (owed answers, a reconnect, a HELLO) may go now.
+void Client::SignalNoticeLocked() {
+    if (!noticeWaiting_ || !transport_ || !mainAnswered_ || !helloCurrent_ || !owed_.empty()) return;
+    noticeWaiting_ = false;
+    Wake();
 }
 
 int Client::FallbackReports() const {

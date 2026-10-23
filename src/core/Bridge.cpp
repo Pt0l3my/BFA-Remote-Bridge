@@ -706,7 +706,7 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     using K = ProbeResult::Kind;
     if (a.hello.kind == K::NotFound) {
         // no server address set, and none answered on the local network: the advice once, as for no address in 1.2
-        OrtStatus* status = RefuseWith(real, model, "no server was found on the local network (" + a.detail + ")");
+        OrtStatus* status = RefuseWith(real, model, a.detail);  // "no server answered FIND on the local network (...)"
         monitor_.Once("notfound", NotFoundText(CurrentSettings().serverPort));
         return status;
     }

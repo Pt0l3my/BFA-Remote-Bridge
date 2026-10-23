@@ -256,10 +256,11 @@ public:
     ProbeResult Probe(const Reason* fallback = nullptr);
 
     // A line fell back (`model` names it; empty for a model load or a runtime entry, which are no line). To a server
-    // that answered in version 2, a line is told by NOTICE on the main connection (its model, reason, detail and the
-    // lines since the last), at most one every kNoticeEvery. To any other server, the background thread sends a status
-    // check with the reason, at once or, within kFallbackReportEvery of the last, when that has passed. NoServer has
-    // nowhere to go and is ignored.
+    // that answered in version 2, a line is told by NOTICE on the main connection alone (its model, reason, detail and
+    // the lines since the last), at most one every kNoticeEvery. Anything else, a line to any other server, or a model
+    // load's refusal or a runtime entry to every server, goes by the background thread's status check with the reason,
+    // at once or, within kFallbackReportEvery of the last, when that has passed. NoServer has nowhere to go and is
+    // ignored.
     void ReportFallback(Reason reason, const std::string& model = {}, const std::string& detail = {});
     int FallbackReports() const;  // status checks sent for a fallback, for the tests
     int NoticesSent() const;      // for the tests
@@ -323,7 +324,7 @@ private:
     bool Search(const DiscoveryFactory& factory, int port, std::vector<Endpoint>& found, std::string& server, std::string& why);
     void MarkFoundStale();
     std::uint16_t VersionFor(const std::string& key) const;
-    void LearnVersion(const std::string& key, std::uint16_t version);
+    void LearnVersion(const std::string& key, std::uint16_t version, const char* why = nullptr);
     // A connection of its own to target, opened with HELLO in the server's version; on a version 1 server's ERROR 6 to
     // a version 2 HELLO, once more in version 1.
     Opened OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes);
@@ -341,6 +342,7 @@ private:
     void StatusCheck();
     void FallbackReport();
     Clock::duration NoticeMain();
+    void SignalNoticeLocked();
     void TellStatesLocked(const std::string& server, const std::string& device);
     void Summary(bool timed);
     std::string StatusLine(const std::string& server, const std::string& device, const std::vector<Answered>& models) const;
@@ -458,6 +460,7 @@ private:
     bool anyNotice_ = false;
     Clock::time_point lastNotice_{};
     int noticesSent_ = 0;
+    bool noticeWaiting_ = false;  // under mutex_: a NOTICE due waits for the connection; a run's answer wakes the thread
 
     // the counters
     mutable std::mutex statsMutex_;

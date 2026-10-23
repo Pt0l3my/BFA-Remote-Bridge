@@ -50,7 +50,8 @@ DiscoveryFactory WinsockDiscovery();
 // ---- BfaIni.cpp
 
 // BFA's INI (Data\SKSE\Plugins\BetterFacialAnimations.ini, the relative path BFA itself uses) and the bridge's own
-// state (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] FoundForceCPU), through Windows' profile calls, as BFA's.
+// state (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] ForceCPUSetByBridge), through Windows' profile calls, as
+// BFA's. BFA's INI is never created.
 std::unique_ptr<IniStore> BfaIniStore();
 
 // ---- Main.cpp

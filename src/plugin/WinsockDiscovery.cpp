@@ -31,6 +31,10 @@ std::vector<std::uint32_t> BroadcastAddresses(std::string& err) {
         rc = ::GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
                                     reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
     }
+    if (rc == ERROR_NO_DATA) {  // no adapter at all
+        err = "no network adapter with an IPv4 address is up";
+        return out;
+    }
     if (rc != NO_ERROR) {
         err = "the adapter list couldn't be read (error " + std::to_string(rc) + ")";
         return out;

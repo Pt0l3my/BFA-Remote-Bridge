@@ -148,6 +148,7 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 g_skyrimNet = SkyrimNetLoaded();
                 g_bridge->ExpectSettings(g_skyrimNet);
                 g_bridge->Connection().SetBfaVersion(g_bfa.version);
+                if (g_mode) g_mode->SetBfaVersion(g_bfa.version);  // its CPU mode is set for BFA 4.3.2.3 alone
                 if (g_bfa.hooked) g_bridge->Connection().StartBackground();
                 break;
             case SKSE::MessagingInterface::kDataLoaded: {

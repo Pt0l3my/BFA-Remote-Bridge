@@ -644,8 +644,10 @@ TEST(ForwardNoServerFoundRefusesEveryLoad) {
             CHECK(st != nullptr);
             const std::string message = h.api->GetErrorMessage(st);
             h.api->ReleaseStatus(st);
-            CHECK(message.find("tiny.onnx isn't loaded, since no server was found on the local network (no server answered FIND") !=
+            CHECK(message.find("tiny.onnx isn't loaded, since no server answered FIND on the local network (port " +
+                               std::to_string(server.Port()) + ", 1 broadcast address); lines get the game's own lip sync") !=
                   std::string::npos);
+            CHECK(message.find("on the local network (no server") == std::string::npos);  // said once
             CHECK(session == nullptr);
         }
         CHECK_EQ(h.bridge.Connection().Searches(), 1);  // within 5 s of the last search: none
@@ -653,7 +655,7 @@ TEST(ForwardNoServerFoundRefusesEveryLoad) {
         CHECK_EQ(h.CountNotes("no server answered on the local network, so lip sync is the game's own"), 1);
         CHECK_EQ(h.CountNotes("allow port " + std::to_string(server.Port()) + " (UDP and TCP)"), 1);
         CHECK_EQ(h.notes.size(), std::size_t{1});
-        CHECK_EQ(h.CountLogged("tiny.onnx isn't loaded, since no server was found on the local network"), 1);
+        CHECK_EQ(h.CountLogged("tiny.onnx isn't loaded, since no server answered FIND on the local network"), 1);
         CHECK_EQ(h.CountLogged("no server answered FIND on the local network"), 2);  // the search's line, and the refusal's
         g_now += std::chrono::seconds(5);  // the next search
         OrtSession* session = nullptr;
@@ -696,7 +698,7 @@ TEST(ForwardFindsTheServerOnTheLocalNetwork) {
     h.api->ReleaseSession(session);
 }
 
-// A version 1 server (PandorumLLM v3.97-p6 and earlier) answers the version 2 HELLO with ERROR 6 framed in version 1:
+// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the version 2 HELLO with ERROR 6 framed in version 1:
 // the bridge connects again in version 1, says so once, and stays on version 1 for it. A fallback is told by the
 // status check (`fallback REASON`), never by NOTICE.
 TEST(ForwardVersionOneServer) {
@@ -764,20 +766,45 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     fs::remove_all(folder);
 }
 
+// A server that closes as PandorumLLM v3.97-p6 and earlier do, with the version 2 HELLO's payload unread (which can
+// reset the connection before its ERROR 6 is read): either way the bridge ends on version 1, and lines go.
+TEST(ForwardP6ServerEndsOnVersionOne) {
+    Need();
+    for (int i = 0; i < 3; ++i) {
+        Server server(Models(), {"--p6"});
+        Settings s = On(server.Port());
+        s.logDetail = LogDetail::Detailed;
+        Harness h(s);
+        OrtSession* session = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+        CHECK_EQ(h.bridge.Connection().ServerVersion(), 1);
+        CHECK_EQ(h.CountLogged("The server speaks protocol version 1 only"), 1);
+        TinyInputs in(h.api, h.cpu, 7);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+        std::printf("        p6 try %d: %s\n", i,
+                    h.Logged("two version 2 HELLOs got no answer") ? "no frame twice" : "ERROR 6 read");
+        h.api->ReleaseSession(session);
+    }
+}
+
 // BFA's mode follows the version the server answers in, never a detail's words: a version 1 server that fills in
 // BFA's sizes when a HELLO lists none (as PandorumLLM's patch7 does), and says so in the row's detail, still gets BFA's
 // own mode; a version 2 server gets its CPU mode.
 namespace {
 struct MemoryIni final : IniStore {
-    int forceCpu = 0, recorded = -1;
+    int forceCpu = 0;
+    bool setByBridge = false;
+    bool BfaIniPresent() override { return true; }
     int ReadForceCpu() override { return forceCpu; }
     bool WriteForceCpu(int v, std::string&) override {
         forceCpu = v;
         return true;
     }
-    int ReadRecorded() override { return recorded; }
-    bool WriteRecorded(int v, std::string&) override {
-        recorded = v;
+    bool ReadSetByBridge() override { return setByBridge; }
+    bool WriteSetByBridge(bool v, std::string&) override {
+        setByBridge = v;
         return true;
     }
 };
@@ -798,6 +825,7 @@ TEST(ForwardBfaModeFollowsTheVersionNotTheDetail) {
         auto store = std::make_unique<MemoryIni>();
         MemoryIni* ini = store.get();
         BfaCpuMode mode(std::move(store), nullptr);
+        mode.SetBfaVersion(kCpuModeBfaVersion);
         h.bridge.Connection().OnVersion([&](std::uint16_t version) { mode.OnServerVersion(version); });
         OrtSession* session = nullptr;
         Ok(h.Create(Models() / "tiny.onnx", {}, &session));  // BFA's CPU mode: no sizes listed

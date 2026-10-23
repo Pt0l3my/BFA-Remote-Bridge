@@ -368,10 +368,12 @@ TEST(ClientAnAttemptBeforeAFailureDoesntEndItsPause) {
     r.c.SetModels({m});
     Joined attempt{&release, std::thread([&] { r.c.Tick(); })};  // the start-up status check, then the main connection
     WaitFor([&] { return holding.load(); });
-    r.script->closeBeforeAnswer = true;  // a run's own connection fails meanwhile
+    r.script->closeBeforeAnswer = true;  // a run's own connection fails meanwhile (its retry in version 2 can't connect)
+    r.script->refuseConnect = true;
     Fallback fb;
     CHECK(r.Run(m, fb) == Client::Outcome::Failed);
     CHECK(r.c.Paused());
+    r.script->refuseConnect = false;
     release = true;
     attempt.t.join();
     CHECK(r.c.Paused());
@@ -1465,12 +1467,26 @@ TEST(ClientNoticeToAVersionTwoServer) {
     CHECK_EQ(notices.size(), std::size_t{2});
     CHECK_EQ(notices[1].reason, std::string("notready"));
     CHECK_EQ(notices[1].lines, 2u);
-    // no line, no NOTICE
+    // no line, no NOTICE: a model load's refusal (or a runtime entry) keeps 1.2.0's status check, in version 2
+    std::string checked;
+    r.script->answer = [&](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 1 && DecodedHello(p).models.empty()) checked = DecodedHello(p).client;
+        return Serve(type, p);
+    };
     r.c.ReportFallback(Reason::ModelRefused);
     g_now += std::chrono::seconds(61);
     r.c.Tick();
     CHECK_EQ(r.script->Notices().size(), std::size_t{2});
     CHECK_EQ(r.c.NoticesSent(), 2);
+    CHECK_EQ(r.c.FallbackReports(), 1);
+    CHECK(checked.find("fallback refused") != std::string::npos);
+    const auto versions = r.script->Versions();
+    CHECK_EQ(versions.back(), 2);
+    r.c.ReportFallback(Reason::Incompatible);
+    g_now += kFallbackReportEvery;
+    r.c.Tick();
+    CHECK_EQ(r.c.FallbackReports(), 2);
+    CHECK(checked.find("fallback incompatible") != std::string::npos);
     CHECK_EQ(r.Logged("NOTICE: a.onnx, notready, 2 lines since the last"), 1);
 }
 
@@ -1485,7 +1501,7 @@ TEST(ClientNoticeWaitsForALateAnswer) {
     CHECK(r.Run(m, fb) == Client::Outcome::Failed);
     CHECK(fb.why == Why::RunTimedOut);
     r.c.ReportFallback(ReasonOf(fb), m.name, fb.text);
-    r.c.Tick();
+    CHECK(r.c.Tick() > g_now + std::chrono::seconds(1));  // no polling: the run that reads the late answer wakes it
     CHECK_EQ(r.script->Notices().size(), std::size_t{0});  // an answer is owed
     CHECK(r.Run(m) == Client::Outcome::Forwarded);        // reads the late answer, then its own
     r.c.Tick();
@@ -1494,6 +1510,27 @@ TEST(ClientNoticeWaitsForALateAnswer) {
     CHECK_EQ(notices[0].reason, std::string("timeout"));
     const auto main = r.script->ByConnection()[1];
     CHECK((std::vector<std::uint16_t>(main.end() - 3, main.end())) == (std::vector<std::uint16_t>{3, 3, 10}));
+}
+
+// NOTICE names only a model the connection's last HELLO listed: one released meanwhile is dropped, not told.
+TEST(ClientNoticeOnlyForAModelTheHelloListed) {
+    Rig r;
+    const auto a = Model("a.onnx"), b = Model("b.onnx");
+    r.Serving(a);
+    r.c.ReportFallback(Reason::TimedOut, "a.onnx", "no answer within 300 ms");
+    CHECK(r.c.Admit(b).Ready());
+    r.c.SetModels({b});  // a released: the HELLO with b alone comes first
+    r.c.Tick();          // waits for the HELLO
+    CHECK_EQ(r.script->Notices().size(), std::size_t{0});
+    r.c.Tick();  // the HELLO again, listing b
+    r.c.Tick();
+    CHECK_EQ(r.script->Notices().size(), std::size_t{0});
+    CHECK_EQ(r.c.NoticesSent(), 0);
+    r.c.ReportFallback(Reason::TimedOut, "b.onnx", "no answer within 300 ms");
+    r.c.Tick();
+    const auto notices = r.script->Notices();
+    CHECK_EQ(notices.size(), std::size_t{1});
+    CHECK_EQ(notices[0].model, std::string("b.onnx"));
 }
 
 // A version 1 server gets no NOTICE: the status check's `fallback REASON`, as from 1.2.0.
@@ -1647,4 +1684,52 @@ TEST(ClientTellsTheServersVersion) {
     CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
     CHECK(told == (std::vector<std::uint16_t>{2, 1}));
     r.c.OnVersion(nullptr);
+}
+
+// A version 2 HELLO that gets no frame back (the connection reset, as PandorumLLM v3.97-p6 and earlier can on Windows,
+// closing with the payload unread) is said once more in version 2; no frame again, and the server is taken as a
+// version 1 server, logged once. No frame once, then HELLO_OK in version 2, stays on version 2. ERROR 6 at once goes
+// straight to version 1 (ClientVersionOneServerIsSpokenToInVersionOne).
+TEST(ClientNoFrameTwiceIsVersionOne) {
+    {
+        Rig r;
+        r.script->speaks = 1;
+        r.script->p6 = true;
+        CHECK(r.c.Admit(Model("a.onnx")).Ready());
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{3});
+        CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1}));
+        CHECK_EQ(r.c.ServerVersion(), 1);
+        CHECK_EQ(r.Logged("The server speaks protocol version 1 only (two version 2 HELLOs got no answer"), 1);
+        CHECK_EQ(r.Logged("The connection was reset before any answer to a version 2 HELLO"), 2);
+        CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);  // version 1 at once from now on
+        CHECK(VersionsOf(r.script->Connections().back()) == (std::vector<std::uint16_t>{1}));
+    }
+    {
+        Rig r;
+        r.script->resetHellos = 1;  // a lost connection, once
+        CHECK(r.c.Admit(Model("a.onnx")).Ready());
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{2});
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+        CHECK_EQ(r.c.ServerVersion(), 2);
+        CHECK_EQ(r.Logged("speaks protocol version 1 only"), 0);
+    }
+    // a run that makes the main connection to such a server: all within its own call
+    {
+        Rig r;
+        r.script->speaks = 1;
+        r.script->p6 = true;
+        const auto m = Model("a.onnx");
+        CHECK(r.c.Resolve());
+        r.c.SetModels({m});
+        CHECK(r.Run(m) == Client::Outcome::Forwarded);
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{3});
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1, 1}));
+        CHECK_EQ(r.c.ServerVersion(), 1);
+        CHECK(!r.c.Paused());
+    }
 }

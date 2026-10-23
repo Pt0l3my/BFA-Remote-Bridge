@@ -1,7 +1,8 @@
 #pragma once
 // The forwarding logic over ONNX Runtime's C API (README.md, "How it works"). BFA gets the runtime's entry point,
 // OrtGetApiBase, through the bridge's replacement (src/plugin/Hook.cpp patches BFA's import of GetProcAddress for
-// that one lookup). That is the bridge's only attach: it changes nothing else of BFA's.
+// that one lookup). That is the bridge's only attach; its one other effect on BFA is [General] ForceCPU in BFA's INI
+// (core/BfaMode.h).
 //
 // The API version BFA asks for is served from the real table (GetApi below):
 //   - an older or the same version: a copy of the real table's entries, only as many as the runtime's own API

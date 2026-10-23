@@ -17,7 +17,8 @@ As PandorumLLM's server does: each connection's requests are answered in order, 
 PONG only after HELLO (before it, ERROR 1); after ERROR 1, 2, 5, 6 or 7 the connection is closed.
 
 The versions: each connection is answered in the version its first frame opened it with, 1 or 2 (--v1-only: 1
-alone, as PandorumLLM v3.97-p6 and earlier). A first frame of a version it doesn't speak gets ERROR 6, framed in the
+alone, as PandorumLLM v3.97 Beta patch7 and earlier; --p6: the same, closing as p6 and earlier do, with a refused frame's
+payload unread). A first frame of a version it doesn't speak gets ERROR 6, framed in the
 newest version it speaks, and the connection closes; so does a later frame of another version. Version 2 adds
 NOTICE (one-way, logged; --notice-log FILE appends each as a JSON line) and, with --remote-ip ADDRESS, FIND and FOUND
 on UDP on the same port: a FIND from that address alone is answered with FOUND, at most one a second.
@@ -320,6 +321,10 @@ class Handler(socketserver.StreamRequestHandler):
                     if magic != MAGIC:
                         raise Refusal(E_MALFORMED, "bad magic")
                     if version != self.version:  # a version it doesn't speak, or not the connection's
+                        # patch7 reads the whole frame first and closes cleanly; p6 (--p6) closes with the payload
+                        # unread, which can reset the connection before its ERROR 6 is read
+                        if not cfg.p6 and length <= MAX_PAYLOAD and length:
+                            self.read_exact(length)
                         raise Refusal(E_VERSION, "protocol version %d not supported" % version)
                     if length > MAX_PAYLOAD:
                         # answered and closed: the oversize payload is never read
@@ -527,7 +532,11 @@ def main(argv=None):
     p.add_argument("--fault-count", type=int, default=0,
                    help="test option: --delay-ms, --fault and --run-error apply to the first this many RUNs only (0: all)")
     p.add_argument("--v1-only", action="store_true",
-                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a version 2 HELLO gets ERROR 6")
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a version 2 HELLO gets ERROR 6, "
+                        "read whole first and closed cleanly, as patch7 does")
+    p.add_argument("--p6", action="store_true",
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a version 2 HELLO's header alone is "
+                        "read, ERROR 6 sent, and the connection closed with the payload unread (which can reset it)")
     p.add_argument("--remote-ip", default="",
                    help="answer FIND (UDP, on the same port) from this address alone, as PandorumLLM's Remote IP (empty: no FIND)")
     p.add_argument("--notice-log", default="", help="append each NOTICE to this file, one JSON object a line")
@@ -540,7 +549,9 @@ def main(argv=None):
     allowed = set(cfg.allow.split(",")) if cfg.allow else None
     server = Server((cfg.host, cfg.port), Handler)
     server.cfg = cfg
-    server.versions = (1,) if cfg.v1_only else VERSIONS
+    server.versions = (1,) if cfg.v1_only or cfg.p6 else VERSIONS
+    if cfg.p6:
+        Handler.rbufsize = 0  # reads take only what they ask for: the payload stays unread in the socket
     server.notice_lock = threading.Lock()
     server.key = cfg.key
     server.idle_seconds = cfg.idle_seconds or None
@@ -555,7 +566,7 @@ def main(argv=None):
     server.device = ", ".join(providers)
     server.log = (lambda line: None) if cfg.quiet else (lambda line: print(line, file=sys.stderr, flush=True))
     # FIND and FOUND are version 2's, and only with a Remote IP set, as PandorumLLM's
-    finder = Finder(server, cfg.host, server.server_address[1], cfg.remote_ip) if cfg.remote_ip and not cfg.v1_only else None
+    finder = Finder(server, cfg.host, server.server_address[1], cfg.remote_ip) if cfg.remote_ip and not (cfg.v1_only or cfg.p6) else None
     if finder:
         finder.start()
     print("LISTENING %d" % server.server_address[1], flush=True)
