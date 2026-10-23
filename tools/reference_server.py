@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small reference A2F server: protocol version 1 (docs/PROTOCOL.md), server side.
+"""A small reference A2F server: protocol versions 1 and 2 (docs/PROTOCOL.md), server side.
 
 It is the bridge's test partner and a reference for a real server such as PandorumLLM's A2F server. It runs the
 models with ONNX Runtime's Python package on the processor by default, one thread per connection
@@ -7,6 +7,7 @@ models with ONNX Runtime's Python package on the processor by default, one threa
 of zeros, and one lock per session around its runs.
 
     python3 tools/reference_server.py --models <folder> [--host 127.0.0.1] [--port 7871] [--key KEY]
+                                      [--v1-only] [--remote-ip ADDRESS] [--notice-log FILE]
 
 It prints "LISTENING <port>" once it accepts connections (with --port 0 the system picks the port). The test
 options --delay-ms, --fault and --run-error make it slow or wrong on purpose (--fault-count limits them to the first
@@ -14,11 +15,18 @@ runs). Needs onnxruntime and numpy.
 
 As PandorumLLM's server does: each connection's requests are answered in order, late ones too; PING is answered with
 PONG only after HELLO (before it, ERROR 1); after ERROR 1, 2, 5, 6 or 7 the connection is closed.
+
+The versions: each connection is answered in the version its first frame opened it with, 1 or 2 (--v1-only: 1
+alone, as PandorumLLM v3.97-p6 and earlier). A first frame of a version it doesn't speak gets ERROR 6, framed in the
+newest version it speaks, and the connection closes; so does a later frame of another version. Version 2 adds
+NOTICE (one-way, logged; --notice-log FILE appends each as a JSON line) and, with --remote-ip ADDRESS, FIND and FOUND
+on UDP on the same port: a FIND from that address alone is answered with FOUND, at most one a second.
 """
 
 import argparse
 import hashlib
 import hmac
+import json
 import os
 import socket
 import socketserver
@@ -31,11 +39,13 @@ import numpy as np
 import onnxruntime as ort
 
 MAGIC = b"BFAR"
-VERSION = 1
+VERSIONS = (1, 2)  # the versions this server speaks; --v1-only: (1,)
 HEADER = struct.Struct("<4sHHI")
 MAX_PAYLOAD = 64 * 1024 * 1024
 
 HELLO, HELLO_OK, RUN, RUN_OK, ERROR, PING, PONG = 1, 2, 3, 4, 5, 6, 7
+FIND, FOUND, NOTICE = 8, 9, 10  # version 2: FIND and FOUND on UDP only, NOTICE one-way on TCP
+FOUND_EVERY = 1.0  # at most one FOUND a second
 
 READY, NOT_FOUND, DIFFERENT_FILE, FAILED_TO_LOAD, NOT_ALLOWED = 0, 1, 2, 3, 4
 
@@ -126,8 +136,8 @@ def pack_str(s):
     return struct.pack("<H", len(b)) + b
 
 
-def frame(kind, payload):
-    return HEADER.pack(MAGIC, VERSION, kind, len(payload)) + payload
+def frame(kind, payload, version=1):
+    return HEADER.pack(MAGIC, version, kind, len(payload)) + payload
 
 
 def error_payload(request_id, code, message):
@@ -275,23 +285,29 @@ class Handler(socketserver.StreamRequestHandler):
         return b"".join(chunks)
 
     def send(self, kind, payload):
-        self.wfile.write(frame(kind, payload))
+        self.wfile.write(frame(kind, payload, self.version))
         self.wfile.flush()
 
     def handle(self):
         ready = {}
         hello_done = False
         cfg = self.server.cfg
+        spoken = self.server.versions
+        self.version = None  # the connection's: its first frame's
+        self.client = ""
         try:
             while True:
                 head = self.read_exact(HEADER.size)
                 if head is None:
                     return
                 magic, version, kind, length = HEADER.unpack(head)
+                if self.version is None:
+                    # answered in the version it opened with; one this server doesn't speak, in the newest it does
+                    self.version = version if magic == MAGIC and version in spoken else max(spoken)
                 try:
                     if magic != MAGIC:
                         raise Refusal(E_MALFORMED, "bad magic")
-                    if version != VERSION:
+                    if version != self.version:  # a version it doesn't speak, or not the connection's
                         raise Refusal(E_VERSION, "protocol version %d not supported" % version)
                     if length > MAX_PAYLOAD:
                         # answered and closed: the oversize payload is never read
@@ -311,6 +327,8 @@ class Handler(socketserver.StreamRequestHandler):
                         self.send(PONG, b"")
                     elif kind == RUN:
                         self.run(payload, ready, cfg)
+                    elif kind == NOTICE and self.version >= 2:
+                        self.notice(payload)  # one-way: nothing is sent back
                     else:
                         raise Refusal(E_MALFORMED, "unexpected message type %d" % kind)
                 except Refusal as e:
@@ -333,6 +351,7 @@ class Handler(socketserver.StreamRequestHandler):
                 raise Refusal(E_MALFORMED, "a model name isn't a plain file name")
             models.append((name, size, sha, overrides))
         r.done()
+        self.client = client
         expected = self.server.key
         if expected and not hmac.compare_digest(key.encode("utf-8"), expected.encode("utf-8")):
             raise Refusal(E_WRONG_KEY, "wrong access key")
@@ -343,9 +362,23 @@ class Handler(socketserver.StreamRequestHandler):
             if status == READY:
                 ready[name] = key
             out += pack_str(name) + struct.pack("<B", status) + pack_str(detail)
-        self.server.log("HELLO from %s (runtime %s): %d models" % (client, ort_version, len(models)))
+        self.server.log("HELLO from %s (runtime %s, version %d): %d models" % (client, ort_version, self.version, len(models)))
         self.send(HELLO_OK, out)
         return ready
+
+    def notice(self, payload):
+        """NOTICE: logged, never answered; one it can't read is ignored."""
+        try:
+            r = Reader(payload)
+            model, reason, detail, lines = r.str(), r.str(), r.str(), r.u32()
+            r.done()
+            if not valid_name(model):
+                raise Refusal(E_MALFORMED, "the model name isn't a plain file name")
+        except Refusal as e:
+            self.server.log("NOTICE ignored: %s" % e.message)
+            return
+        self.server.log("NOTICE from %s: %s, %s (%d lines): %s" % (self.client, model, reason, lines, detail))
+        self.server.record_notice({"client": self.client, "model": model, "reason": reason, "detail": detail, "lines": lines})
 
     def run(self, payload, ready, cfg):
         r = Reader(payload)
@@ -399,6 +432,12 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def record_notice(self, notice):
+        if not self.cfg.notice_log:
+            return
+        with self.notice_lock, open(self.cfg.notice_log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(notice) + "\n")
+
     def take_fault(self):
         """Whether this RUN gets the test options' delay, fault or error (all of them, or the first --fault-count)."""
         with self.fault_lock:
@@ -408,6 +447,50 @@ class Server(socketserver.ThreadingTCPServer):
                 self.faults_used += 1
                 return True
             return False
+
+
+class Finder(threading.Thread):
+    """FIND and FOUND on UDP, on the TCP port: a FIND from the Remote IP alone is answered, at most once a second."""
+
+    def __init__(self, server, host, port, remote_ip):
+        super().__init__(daemon=True)
+        self.server = server
+        self.remote_ip = remote_ip
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
+        self.last = None
+
+    def run(self):
+        while True:
+            try:
+                data, sender = self.sock.recvfrom(2048)
+            except OSError:
+                return
+            self.answer(data, sender)
+
+    def answer(self, data, sender):
+        # anything but a well-formed version 2 FIND is ignored, never answered
+        if len(data) < HEADER.size:
+            return
+        magic, version, kind, length = HEADER.unpack_from(data)
+        if magic != MAGIC or version != 2 or kind != FIND or length != len(data) - HEADER.size:
+            return
+        try:
+            r = Reader(data[HEADER.size:])
+            client = r.str()
+            r.done()
+        except Refusal:
+            return
+        if sender[0] != self.remote_ip:
+            self.server.log("FIND ignored: not from the Remote IP")
+            return
+        now = time.monotonic()
+        if self.last is not None and now - self.last < FOUND_EVERY:
+            self.server.log("FIND ignored: one FOUND a second at most")
+            return
+        self.last = now
+        self.sock.sendto(frame(FOUND, pack_str(self.server.name), 2), sender)
+        self.server.log("FIND from %s: answered with FOUND" % client)
 
 
 def main(argv=None):
@@ -431,12 +514,19 @@ def main(argv=None):
     p.add_argument("--run-error", type=int, default=0, help="test option: answer RUN with this ERROR code")
     p.add_argument("--fault-count", type=int, default=0,
                    help="test option: --delay-ms, --fault and --run-error apply to the first this many RUNs only (0: all)")
+    p.add_argument("--v1-only", action="store_true",
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a version 2 HELLO gets ERROR 6")
+    p.add_argument("--remote-ip", default="",
+                   help="answer FIND (UDP, on the same port) from this address alone, as PandorumLLM's Remote IP (empty: no FIND)")
+    p.add_argument("--notice-log", default="", help="append each NOTICE to this file, one JSON object a line")
     cfg = p.parse_args(argv)
 
     providers = [x for x in cfg.providers.split(",") if x]
     allowed = set(cfg.allow.split(",")) if cfg.allow else None
     server = Server((cfg.host, cfg.port), Handler)
     server.cfg = cfg
+    server.versions = (1,) if cfg.v1_only else VERSIONS
+    server.notice_lock = threading.Lock()
     server.key = cfg.key
     server.idle_seconds = cfg.idle_seconds or None
     server.fault_lock = threading.Lock()
@@ -445,6 +535,10 @@ def main(argv=None):
     server.name = "BFA Remote Bridge reference server (onnxruntime %s)" % ort.__version__
     server.device = ", ".join(providers)
     server.log = (lambda line: None) if cfg.quiet else (lambda line: print(line, file=sys.stderr, flush=True))
+    # FIND and FOUND are version 2's, and only with a Remote IP set, as PandorumLLM's
+    finder = Finder(server, cfg.host, server.server_address[1], cfg.remote_ip) if cfg.remote_ip and not cfg.v1_only else None
+    if finder:
+        finder.start()
     print("LISTENING %d" % server.server_address[1], flush=True)
     try:
         server.serve_forever()
@@ -452,6 +546,8 @@ def main(argv=None):
         pass
     finally:
         server.server_close()
+        if finder:
+            finder.sock.close()
 
 
 if __name__ == "__main__":
