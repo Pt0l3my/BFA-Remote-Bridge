@@ -311,8 +311,9 @@ PandorumLLM's choice; the bridge reports it.
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
   game load (ready lines only while Status on load allows them), a model load the server refuses included, with its
   detail; a note when lines fall back, naming the reason, at most one a minute however the lines alternate; one when
-  lines are back on the server after such a note, at most one a minute. Every server text shown or logged loses any
-  path first (`ScrubPaths`). Every note goes through one
+  lines are back on the server after such a note, at most one a minute. Every server text shown or logged goes on one line
+  and loses any path and memory address (`ServerText`), and is cut at about 160 characters on screen
+  (`ShownServerText`); the log keeps the whole line. Every note goes through one
   function (the plugin's `ShowNote`): Skyrim's corner note today, which SkyrimNet sees as a `notification` event.
 - **The log**, `BFARemoteBridge.log` in SKSE's log folder, times in UTC: BFA found or not, its version, the attachment,
   the settings (the address and the key only as set or not), each model's size, SHA-256 and overrides, the server's

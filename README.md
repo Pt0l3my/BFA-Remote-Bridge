@@ -141,7 +141,8 @@ The bridge tells you on screen what the server does, one line per model, from th
   lines are back on the server." (without the model when another model's line came back);
 - once per session: no server address set, BFA set to GPU, the bridge unable to attach, or a runtime it can't serve.
 
-No path reaches a note: a server's detail loses any folder first.
+A server's detail (such as ONNX Runtime's message for a model that failed to load) is put on one line, loses any
+folder and memory address, and is cut at about 160 characters on screen; the log keeps the whole line.
 
 Every note begins with "BFA Remote Bridge:" and uses plain words (Skyrim's fonts can't draw emoji). The notes are
 Skyrim's own corner notifications, so SkyrimNet sees each one as a `notification` event: a SkyrimNet workflow trigger

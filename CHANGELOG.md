@@ -32,8 +32,9 @@ in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
 - **BFA's GPU mode is reported, not changed:** once per session, on screen whatever Status on load says, with "Tick
   Force CPU in BFA's menu". The bridge changes nothing else of BFA's.
 - A model load BFA retries after a refusal is logged once until the refusal changes. A model the server answers as
-  not ready shows on screen with the server's detail, which, like every server text shown or logged, loses any path
-  first.
+  not ready shows on screen with the server's detail. Every server text shown or logged goes on one line (line
+  breaks and control characters become spaces), loses any path and memory address, and is cut at about 160
+  characters on screen; the log keeps the whole line.
 - **The runtime's other session makers are refused:** CreateSessionFromArray, the two with prepacked weights and the
   model editor's three answer with an error status naming them, logged once, since a model loaded so would run on
   this PC.
