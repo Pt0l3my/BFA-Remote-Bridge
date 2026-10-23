@@ -1,16 +1,25 @@
 #pragma once
 // The forwarding logic over ONNX Runtime's C API (README.md, "How it works"). BFA gets the runtime's entry point,
 // OrtGetApiBase, through the bridge's replacement (src/plugin/Hook.cpp patches BFA's import of GetProcAddress for
-// that one lookup). The replacement's GetApi(24) returns a copy of the real OrtApi table with these entries replaced;
-// any other API version gets the real table, untouched, and BFA runs as if the bridge weren't installed.
+// that one lookup). That is the bridge's only attach: it changes nothing else of BFA's.
 //
-// While the bridge is on (setting `enabled` and a server address), it takes BFA's model inference over completely:
-// no model runs on this PC, on its graphics card or its processor.
+// The API version BFA asks for is served from the real table (GetApi below):
+//   - an older or the same version: a copy of the real table's entries, only as many as the runtime's own API
+//     version has (OrtApiEntries: a shorter table is never read past), with these entries replaced;
+//   - a newer version: 1.24.4's entries, wrapped the same way, then every entry past 1.24.4's replaced by one that
+//     returns an error status naming it (NewerEntry). The bridge can't tell which of them could meet its sessions,
+//     so none of them reaches the runtime: a run that needs one fails safely, and the log and the monitor name it;
+//   - a runtime older than API version 10 (whose table length the header can't tell), one whose version can't be
+//     read, or an API version past kNewestOrtApi: the real table, untouched. BFA then runs as it would without the
+//     bridge, and the bridge says so ("Update the bridge").
+//
+// With the bridge, no BFA model runs on this PC: every model load is the server's or is refused.
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
 //                   taken, and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
-//                   bridge's own. Not: BFA gets an error status made by the real CreateStatus ("BFA Remote Bridge: ..."),
-//                   so it has no model, and lines get the game's own lip sync.
+//                   bridge's own. Not, or no server address set, or the settings not read yet: BFA gets an error
+//                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
+//                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
 //                   in full, the call still succeeds, with each requested output a one-element float tensor holding
 //                   NaN: BFA's output check then drops that line only (its own comment: "A failed validation fails the
@@ -19,22 +28,17 @@
 //                   background thread's HELLO is answered. Every run is counted once, answered or by its reason.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.
 //
-// Sessions made while the bridge was off are the runtime's own, and every call on them is the real one; the on/off
-// setting therefore takes effect at BFA's next model load. AddFreeDimensionOverrideByName and ReleaseSessionOptions
-// are wrapped to remember each options object's overrides; GetExecutionProviderApi ("DML": a copy of the real
-// OrtDmlApi table with its three SessionOptionsAppendExecutionProvider_DML entries wrapped) and
-// SessionOptionsAppendExecutionProvider ("DML") only to see that BFA is set to use the graphics card. Every one of
-// these passes the call through unchanged. Everything else is the real runtime.
-//
-// Check mode (setting checkCalls > 0) is a diagnostic that does run the model here: only while it is on, CreateSession
-// also makes the real session, and the first checkCalls runs of each session run both ways and log the largest
-// difference.
+// AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;
+// GetExecutionProviderApi ("DML" at API version 24: a copy of the real OrtDmlApi table with its three
+// SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
+// to see that BFA is set to use the graphics card, which the bridge reports. Every one of these passes the call
+// through unchanged. Every other entry that takes a session answers a bridge session with an error status. Everything
+// else is the real runtime.
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -44,6 +48,7 @@
 
 #include "core/Client.h"
 #include "core/Log.h"
+#include "core/Monitor.h"
 #include "core/Protocol.h"
 #include "core/Settings.h"
 #include "core/Sha256.h"
@@ -54,6 +59,30 @@ namespace bfarb {
 
 using OrtGetApiBaseFn = const OrtApiBase*(ORT_API_CALL*)(void) noexcept;
 
+// ---- the runtime's API versions
+
+// OrtApi is append-only: API version N's table is version N-1's with entries added at its end. The first entry of
+// each version from 1.11 on, by its "\since Version 1.N" in the vendored 1.24.4 header (tests/CoreTests.cpp checks
+// the list against the header); the versions 19 and 21 added none.
+struct OrtApiStart {
+    unsigned version;
+    std::size_t index;
+    const char* name;
+};
+const std::vector<OrtApiStart>& OrtApiStarts();
+
+constexpr std::size_t kKnownOrtEntries = sizeof(OrtApi) / sizeof(void*);  // 1.24.4's: 415
+constexpr unsigned kOldestOrtApi = 10;                                     // the oldest whose table length is known
+constexpr unsigned kNewestOrtApi = 30;                                     // the newest served (24's entries and stubs)
+constexpr std::size_t kNewerOrtSlots = 512;                                // the stubs past 1.24.4's entries
+
+// How many OrtApi entries API version `version` has; 0 when the header can't tell (before 10). 24 and later:
+// 1.24.4's (the entries past them are the stubs').
+std::size_t OrtApiEntries(unsigned version) noexcept;
+
+// The API version of a runtime's version string ("1.24.4" is 24); 0 when it isn't "1.N...".
+unsigned OrtApiVersionOf(const char* versionString) noexcept;
+
 struct Stats {
     std::uint64_t forwarded = 0;   // runs the server answered
     std::uint64_t unanswered = 0;  // runs answered with NaN (the line gets the game's own lip sync)
@@ -61,22 +90,6 @@ struct Stats {
     std::uint64_t serverMicros = 0;
     std::uint64_t bytesUp = 0;
     std::uint64_t bytesDown = 0;
-};
-
-// What the player is told of (src/core/Status.h turns it into text).
-struct Notice {
-    enum class Kind {
-        Served,          // a model is served by the server
-        NoAnswer,        // the server couldn't be reached at a model load
-        WrongKey,
-        Missing,         // the server has no such file, or another copy of it
-        CouldNotLoad,    // the server failed to load it, refused it, or answered wrongly
-        UnknownRuntime,  // BFA asked for an ONNX Runtime API version the bridge doesn't know
-        GpuMode,         // BFA is set to GPU (once per session, while the bridge is on and notices are allowed)
-    };
-    Kind kind = Kind::Served;
-    std::string model;
-    std::string detail;
 };
 
 class Bridge {
@@ -95,35 +108,32 @@ public:
     // Remembers the real OrtGetApiBase and returns the replacement to hand to BFA.
     static OrtGetApiBaseFn Hook(OrtGetApiBaseFn real) noexcept;
 
-    enum class ApiState { NotAsked, Known, Unknown };
+    enum class ApiState { NotAsked, Served, CantServe };
     static ApiState State() noexcept;
+    static unsigned ServedApiVersion() noexcept;  // the last version BFA asked for and got the bridge's table
 
-    // The settings read from SkyrimNet. Until the first, a model load is refused when ExpectSettings(true) said
-    // SkyrimNet is loaded (its config may not be registered yet), and passes through otherwise (the bridge is idle).
+    // The settings read from SkyrimNet. Until the first, a model load is refused: with "the settings weren't read
+    // yet" when ExpectSettings(true) said SkyrimNet is loaded (its config may not be registered yet), else as having
+    // no server address.
     void Apply(const Settings& settings);
-    void ExpectSettings(bool expect);
+    void ExpectSettings(bool skyrimNet);
     Settings CurrentSettings() const;
     Client& Connection() noexcept { return client_; }
+    Monitor& Notes() noexcept { return monitor_; }
     Stats Statistics() const;
-
-    // Called on the thread that made it (BFA's worker) for each model load's outcome and for an unknown runtime;
-    // the plugin queues the notification to the game's main thread.
-    using NoticeSink = std::function<void(const Notice&)>;
-    void OnNotice(NoticeSink sink);
 
     // The live bridge sessions, and whether a handle is one (by the bridge's own registry, never by reading it).
     std::size_t BridgeSessions() const;
     bool IsBridgeSession(const OrtSession* session) const;
-    // Whether a live bridge session also has the real one check mode made.
-    bool HasLocalSession(const OrtSession* session) const;
 
     void LogLine(Level level, const std::string& line) const;
-    void Tell(const Notice& notice);
 
     // ---- the wrappers' work (public for the static wrappers; not for callers)
     void OnOverride(OrtSessionOptions* options, const char* name, std::int64_t value);
     void OnReleaseOptions(const OrtSessionOptions* options);
     void OnGpuOptions(const OrtSessionOptions* options);
+    void OnNewerEntry(std::size_t index);
+    void OnCantServe(const std::string& why);
     OrtStatus* CreateSession(const OrtApi* real, const OrtEnv* env, const ORTCHAR_T* path, const OrtSessionOptions* options,
                              OrtSession** out) noexcept;
     void ReleaseSession(const OrtApi* real, OrtSession* session) noexcept;
@@ -136,8 +146,6 @@ private:
         std::uint64_t magic = kSessionMagic;
         std::uint64_t order = 0;
         proto::ModelEntry entry;
-        OrtSession* local = nullptr;  // check mode's real session, or null
-        int checks = 0;
         bool unsupportedLogged = false;
         bool superseded = false;  // a newer session of the same model replaced it
     };
@@ -152,27 +160,28 @@ private:
     };
 
     OrtStatus* Refuse(const OrtApi* real, const std::string& model, const Admission& a);
-    OrtStatus* RefuseWith(const OrtApi* real, const std::string& model, const std::string& why, const Notice* notice);
+    // The error status BFA gets; logged when it differs from the model's last refusal (BFA retries failed loads).
+    OrtStatus* RefuseWith(const OrtApi* real, const std::string& model, const std::string& why);
     // The model's size and SHA-256, hashed again only when its path, size or modification time changed.
     bool HashCached(const std::filesystem::path& file, std::uint64_t& size, Sha256::Digest& digest, std::string& err);
     void PushModelsLocked();
     std::vector<proto::ModelEntry> LiveModelsLocked() const;
     void Log(Level level, const std::string& line) const;
     void NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** outputs) noexcept;
-    // A run the server didn't answer: counted (and logged unless quiet) by the client, then the NaN answer.
-    void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Clock::time_point start, std::size_t outputCount,
-                  OrtValue** outputs) noexcept;
-    void Check(const OrtApi* real, OrtSession* local, const char* const* inputNames, const OrtValue* const* inputs, std::size_t inputCount,
-               const char* const* outputNames, std::size_t outputCount, const std::string& model, int index, int of,
-               const Client::Reply& reply);
+    // A run the server didn't answer: counted (and logged unless quiet) by the client, told to the monitor and the
+    // server (unless quiet), then the NaN answer.
+    void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
+                  std::size_t outputCount, OrtValue** outputs) noexcept;
+    void OnStates(const std::string& server, const std::string& device, const std::vector<ModelState>& models);
 
     LogSink log_;
     Client client_;
+    Monitor monitor_;
 
     mutable std::mutex settingsMutex_;
     Settings settings_;
     std::atomic<bool> settingsRead_{false};
-    std::atomic<bool> expectSettings_{false};
+    std::atomic<bool> skyrimNet_{false};
 
     std::mutex hashMutex_;
     std::map<std::string, HashEntry> hashes_;
@@ -180,12 +189,10 @@ private:
     mutable std::mutex sessionsMutex_;
     std::unordered_map<const OrtSessionOptions*, OptionsInfo> options_;
     std::map<const OrtSession*, std::unique_ptr<Session>> sessions_;
+    std::map<std::string, std::string> lastRefusal_;  // by model: the last refusal logged
     std::uint64_t nextOrder_ = 1;
     bool gpuLogged_ = false;
-    bool gpuTold_ = false;
-
-    mutable std::mutex noticeMutex_;
-    NoticeSink notice_;
+    std::vector<std::size_t> newerLogged_;
 
     mutable std::mutex statsMutex_;
     Stats stats_;

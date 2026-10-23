@@ -16,14 +16,13 @@ namespace bfarb::plugin {
 struct BfaFacts {
     bool found = false;
     std::string version;  // from its SKSEPlugin_Version, e.g. "4.3.2.3"; empty when unreadable
-    bool knownVersion = false;  // 4.3.x, the only versions the bridge attaches to
     bool hooked = false;
-    std::string problem;  // why it isn't hooked
+    std::string problem;  // why it isn't hooked, in the player's words
 };
 
-// Finds BetterFacialAnimations.dll among the loaded modules, reads its version and, for 4.3.x only, patches its import
-// address table's GetProcAddress, so its lookup of onnxruntime.dll's OrtGetApiBase gets the bridge's. Leaves everything
-// alone when BFA isn't loaded, is another version, its runtime already is loaded, or the patch can't be made.
+// Finds BetterFacialAnimations.dll among the loaded modules, reads its version and, whatever the version, patches its
+// import address table's GetProcAddress, so its lookup of onnxruntime.dll's OrtGetApiBase gets the bridge's. Leaves
+// everything alone when BFA isn't loaded, its runtime already is loaded, or the patch can't be made.
 BfaFacts FindAndHookBfa();
 
 // ---- SkyrimNet.cpp
@@ -43,5 +42,11 @@ bool WinsockResolve(const std::string& host, std::uint16_t port, std::vector<End
 // ---- Main.cpp
 
 void Log(Level level, const std::string& line);
+
+// The bridge's one note function: every text the player reads on screen goes through it. Today Skyrim's own corner
+// note, on the main thread, queued until the first game load; SkyrimNet sees each as a "notification" workflow event
+// (its WORKFLOW_TRIGGERS.md). This is the seam for SkyrimNet's own notification call, once its public API has one
+// (its CppAPI, API version 12 in Beta28, has none).
+void ShowNote(const std::string& text);
 
 }  // namespace bfarb::plugin

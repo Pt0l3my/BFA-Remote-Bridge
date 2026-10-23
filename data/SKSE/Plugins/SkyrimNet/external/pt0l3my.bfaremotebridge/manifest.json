@@ -2,14 +2,14 @@
   "id": "pt0l3my.bfaremotebridge",
   "type": "bundle",
   "title": "BFA Remote Bridge",
-  "tagline": "Better Facial Animations' lip sync, worked out on another PC.",
-  "description": "Runs Better Facial Animations' lip-sync model on another PC on your local network (PandorumLLM's A2F server), so this PC's graphics card is left to the game. Its settings are on this page; the BFARemoteBridge.dll SKSE plugin does the work. Requires Better Facial Animations 4.3.2, SkyrimNet Beta26 or later and Address Library.",
+  "tagline": "Better Facial Animations' lip sync, worked out on PandorumLLM's PC.",
+  "description": "A bridge between Better Facial Animations and PandorumLLM's A2F server on another PC of your local network: BFA's lip-sync model runs there instead of on this PC, and the bridge shows on screen which card and server run it. Not an alternative to BFA, which stays installed. Its settings are on this page; the BFARemoteBridge.dll SKSE plugin does the work. Requires Better Facial Animations, PandorumLLM's A2F server, SkyrimNet Beta26 or later and Address Library.",
   "author": "Pt0l3my",
   "tags": [
     "animation",
     "performance"
   ],
   "nsfw": false,
-  "version": "1.1.1",
+  "version": "1.2.0",
   "min_skyrimnet_version": "0.26.0"
 }

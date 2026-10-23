@@ -4,7 +4,8 @@
 // changed; the patch lives in memory for the session.
 //
 // BFA loads onnxruntime.dll only after a save loads (BFA 4.3.2's LoadApi, on its worker thread), so SKSE's post-load
-// message, when every plugin is loaded, is early enough.
+// message, when every plugin is loaded, is early enough. Any BFA version is tried: what doesn't work shows by what
+// happens (the attach, the runtime API it asks for, the models the server matches), never by a version number.
 
 #include "plugin/Plugin.h"
 
@@ -67,27 +68,22 @@ BfaFacts FindAndHookBfa() {
         facts.version = pe::UnpackVersion(v.pluginVersion);
     }
     Log(Level::Info, "Better Facial Animations " + (facts.version.empty() ? std::string("(version unknown)") : facts.version) + " found");
-    // Only 4.3.x: another BFA may use the runtime in ways the bridge's sessions don't answer
-    facts.knownVersion = facts.version.rfind("4.3.", 0) == 0;
-    if (!facts.knownVersion) {
-        facts.problem = "the bridge attaches only to Better Facial Animations 4.3.x";
-        Log(Level::Warn, "The bridge attaches only to Better Facial Animations 4.3.x, so it passes everything through and BFA runs as usual");
-        return facts;
-    }
 
     // BFA's runtime already loaded: BFA has its OrtGetApiBase already, so the bridge stays out of the way
     std::wstring folder = ModulePath(bfa);
     folder.resize(folder.find_last_of(L"\\/") + 1);
     if (::GetModuleHandleW((folder + L"BetterFacialAnimations\\onnxruntime.dll").c_str())) {
         facts.problem = "its ONNX Runtime was loaded before the bridge could attach";
-        Log(Level::Warn, "Better Facial Animations' ONNX Runtime is already loaded, so the bridge stays out of the way");
+        Log(Level::Warn, "Better Facial Animations' ONNX Runtime is already loaded, so the bridge can't attach: BFA runs on this PC as it "
+                         "would without the bridge");
         return facts;
     }
 
     std::size_t slotRva = 0;
     if (!pe::FindImportSlot(image, size, "KERNEL32.dll", "GetProcAddress", slotRva)) {
-        facts.problem = "it doesn't import GetProcAddress from KERNEL32 by name";
-        Log(Level::Warn, "Better Facial Animations doesn't import GetProcAddress from KERNEL32 by name: the bridge can't attach and stays idle");
+        facts.problem = "it doesn't look ONNX Runtime up the way the bridge knows";
+        Log(Level::Warn, "Better Facial Animations doesn't import GetProcAddress from KERNEL32 by name, so the bridge can't attach: BFA "
+                         "runs on this PC as it would without the bridge. Update the bridge.");
         return facts;
     }
     auto* slot = reinterpret_cast<void**>(const_cast<std::uint8_t*>(image) + slotRva);
@@ -95,7 +91,7 @@ BfaFacts FindAndHookBfa() {
     if (!::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
         facts.problem = "its import table couldn't be written";
         Log(Level::Warn, "Better Facial Animations' import table couldn't be made writable (error " + std::to_string(::GetLastError()) +
-                             "): the bridge stays idle");
+                             "), so the bridge can't attach: BFA runs on this PC as it would without the bridge");
         return facts;
     }
     g_real.store(reinterpret_cast<GetProcAddressFn>(*slot));

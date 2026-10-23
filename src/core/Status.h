@@ -1,27 +1,45 @@
 #pragma once
-// The texts the player reads on screen (setting showStatus): the state at the first game load, and each model load's
-// outcome, which comes later, on BFA's worker (the plugin queues it to the game's main thread). British spelling.
+// Every text the player reads on screen, in one place (British spelling). Each goes out through the bridge's one
+// note function (core/Monitor.h's sink; src/plugin/Main.cpp's ShowNote). Plain words only: Skyrim's fonts can't
+// draw emoji.
 
 #include <string>
 
-#include "core/Bridge.h"
+#include "core/Reasons.h"
 
 namespace bfarb {
 
 struct StatusFacts {
-    bool enabled = true;
-    bool skyrimNet = true;   // SkyrimNet's settings could be read
     bool bfaFound = false;
-    std::string bfaVersion;  // "4.3.2"; empty when unknown
-    bool knownBfa = true;    // a version the bridge attaches to (4.3.x)
+    std::string bfaVersion;  // "4.3.2.3"; empty when unknown
     bool hooked = false;     // the GetProcAddress patch is in place
-    bool addressSet = false;
+    std::string problem;     // why it isn't, in the player's words
 };
 
-// The line at the first game load; empty when the bridge is on and BFA's model loads will tell (NoticeText).
+// The line at the first game load about BFA itself; empty when the bridge is attached (the monitor's lines follow).
 std::string LoadStatusText(const StatusFacts& facts);
 
-// The line for a model load's outcome, or for an ONNX Runtime the bridge doesn't know.
-std::string NoticeText(const Notice& notice, const std::string& bfaVersion);
+// The bridge couldn't attach, or can't serve the runtime BFA asked for: BFA runs as it would without the bridge.
+std::string CantAttachText(const std::string& bfaVersion, const std::string& why);
+
+// No server address: lines get the game's own lip sync. skyrimNet: whether SkyrimNet, which holds the address, is
+// loaded.
+std::string NoServerText(bool skyrimNet);
+
+// BFA's GPU route: once per session.
+std::string GpuText();
+
+// "a2f3_fp16.onnx on NVIDIA GeForce RTX 5090 (DirectML 3), PandorumLLM v3.97-p6 Beta A2F: ready"
+std::string ModelLine(const std::string& model, const std::string& server, const std::string& device, const std::string& state);
+
+// A model's lines fell back: words is a ReasonWords or a more precise phrase. An empty model speaks of every line.
+std::string FallbackLine(const std::string& model, const std::string& words);
+
+// Lines answered by the server again after a fallback.
+std::string BackLine(const std::string& model);
+
+// The server's device as the player reads it: "DirectML 3: NVIDIA GeForce RTX 5090" becomes
+// "NVIDIA GeForce RTX 5090 (DirectML 3)"; a device without "kind: " stays as given.
+std::string DeviceText(const std::string& device);
 
 }  // namespace bfarb
