@@ -684,7 +684,7 @@ void Bridge::OnStates(const std::string& server, const std::string& device, cons
     for (const ModelState& m : models) {
         const bool ready = m.status == static_cast<std::uint8_t>(proto::ModelStatus::Ready);
         std::string state = ready ? "ready" : std::string("not ready (") + proto::ModelStatusName(m.status) + ")";
-        if (!m.detail.empty()) state += " (" + ScrubPaths(m.detail) + ")";  // shown, then a SkyrimNet event: no path
+        if (!m.detail.empty()) state += " (" + ShownServerText(m.detail) + ")";  // shown, then a SkyrimNet event: one line, capped
         monitor_.ModelState(m.name, server, device, state, ready);
     }
 }
@@ -715,13 +715,13 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
     } else {
         reason = Reason::Incompatible;
         why = a.detail;
-        words = "the bridge couldn't send it (" + ScrubPaths(a.detail) + ")";
+        words = "the bridge couldn't send it (" + ShownServerText(a.detail) + ")";
     }
     OrtStatus* status = RefuseWith(real, model, why);
     if (a.hello.kind == K::Answered) {
         // the server's own answer for the model, with its detail, as a monitor line (shown at each change, not again for
         // BFA's retries with the same answer); the detail loses any path first
-        const std::string detail = ScrubPaths(a.detail);
+        const std::string detail = ShownServerText(a.detail);
         monitor_.ModelState(model, a.hello.server, a.hello.device,
                             std::string("not ready (") + proto::ModelStatusName(a.status) + ")" + (detail.empty() ? "" : " (" + detail + ")"),
                             false);
@@ -733,7 +733,7 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
 }
 
 OrtStatus* Bridge::RefuseWith(const OrtApi* real, const std::string& model, const std::string& why) {
-    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + ScrubPaths(why) + "; lines get the game's own lip sync";
+    const std::string message = "BFA Remote Bridge: " + model + " isn't loaded, since " + ServerText(why) + "; lines get the game's own lip sync";
     bool fresh = true;
     {
         std::lock_guard lock(sessionsMutex_);
@@ -846,10 +846,10 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             PushModelsLocked();
         }
         *out = handle;
-        const std::string detail = ScrubPaths(a.detail);
+        const std::string detail = ServerText(a.detail), shown = ShownServerText(a.detail);
         Log(Level::Info, "Model " + name + " is served by " + a.hello.server + " on " + a.hello.device +
                              (detail.empty() ? std::string() : " (" + detail + ")") + "; nothing of it runs on this PC");
-        monitor_.ModelState(name, a.hello.server, a.hello.device, detail.empty() ? "ready" : "ready (" + detail + ")", true);
+        monitor_.ModelState(name, a.hello.server, a.hello.device, shown.empty() ? "ready" : "ready (" + shown + ")", true);
         return nullptr;
     } catch (...) {
         return real->CreateStatus(ORT_FAIL, "BFA Remote Bridge: the model couldn't be set up; lines get the game's own lip sync");

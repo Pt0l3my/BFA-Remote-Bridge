@@ -29,9 +29,10 @@ std::string Join(const std::vector<std::string>& parts) {
     return s;
 }
 
-// The server's texts lose any path before they are logged or shown (a note becomes a SkyrimNet event).
+// The server's texts go on one line and lose any path or address before they are logged or shown (a note becomes a
+// SkyrimNet event).
 std::string ErrorText(const proto::Error& e) {
-    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + ScrubPaths(e.message));
+    return "ERROR " + std::to_string(e.code) + ", " + proto::ErrorCodeName(e.code) + (e.message.empty() ? "" : ": " + ServerText(e.message));
 }
 
 int MillisLeft(Clock::time_point deadline) {
@@ -171,7 +172,8 @@ bool SayHello(Transport& t, const proto::Hello& hello, Clock::time_point deadlin
             reason = out.result.detail = "the server's answer to HELLO names its models out of order";
             return false;
         }
-    for (auto& m : ok.models) m.detail = ScrubPaths(m.detail);  // a server's detail may name its Model folder
+    // a server's detail on one line, without paths (it may name its Model folder) or addresses: logged in full, shown capped
+    for (auto& m : ok.models) m.detail = ServerText(m.detail);
     failure = Failure::None;
     out.result.kind = ProbeResult::Kind::Answered;
     out.result.server = ok.server;

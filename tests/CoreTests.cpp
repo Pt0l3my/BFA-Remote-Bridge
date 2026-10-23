@@ -545,6 +545,41 @@ TEST(PeReadsBetterFacialAnimationsDll) {
 
 // ---- paths out of other programs' messages
 
+// A server's detail as PandorumLLM sent it in the owner's Force CPU test: ONNX Runtime's raw message, with addresses
+// and a line break. Logged on one line, without the addresses; shown capped.
+TEST(ServerTextsGoOnOneLine) {
+    const std::string raw =
+        "Non-zero status code returned while running Concat node. Name:'Concat_7' Status Message: "
+        "MLOperatorAuthorImpl.cpp(2508)onnxruntime.dll!00007FFC19A9F444: (caller: 00007FFC\xE2\x80\xA6\n"
+        "Exception(1) tid(2f40) 80070057 The parameter is incorrect.\r\n";
+    const std::string line = ServerText(raw);
+    CHECK_EQ(line, std::string("Non-zero status code returned while running Concat node. Name:'Concat_7' Status Message: "
+                               "MLOperatorAuthorImpl.cpp(2508)onnxruntime.dll: Exception(1) tid(2f40) 80070057 The parameter is incorrect."));
+    for (unsigned char c : line) CHECK(c >= 0x20 && c != 0x7F);
+    CHECK(line.find("00007FFC") == std::string::npos);
+    CHECK(line.find("  ") == std::string::npos);
+    const std::string shown = ShownServerText(raw);
+    CHECK(shown.size() <= kShownTextMax);
+    CHECK(shown.size() >= kShownTextMax - 30);
+    CHECK(shown.rfind("...") == shown.size() - 3);
+    CHECK(line.rfind(shown.substr(0, shown.size() - 3), 0) == 0);  // the line's own start
+    CHECK(shown.find('\n') == std::string::npos);
+    // short texts are shown whole; other shapes of address go too; a path keeps its base name; UTF-8 isn't cut inside
+    CHECK_EQ(ShownServerText("the file here has another size or SHA-256"), std::string("the file here has another size or SHA-256"));
+    CHECK_EQ(ServerText("at 0x00007ffc19a9f444 and 00007FFC19A9F444 in\tC:\\Users\\someone\\m.onnx"), std::string("at and in m.onnx"));
+    CHECK_EQ(ServerText("\x01\x02 a \x7F  b \n"), std::string("a b"));
+    const std::string accents(200, 'a');
+    std::string utf = accents.substr(0, 156) + "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9";
+    const std::string cut = ShownServerText(utf, 160);
+    CHECK(cut.size() <= 160);
+    CHECK((static_cast<unsigned char>(cut[cut.size() - 4]) & 0xC0) != 0xC0);  // no lead byte left without its tail
+    // the monitor's line for a refused model: one line, capped
+    const std::string note = ModelLine("a2f3_fp16.onnx", "PandorumLLM v3.97-p7 Beta A2F", "DirectML 3: NVIDIA GeForce RTX 5090",
+                                       "not ready (failed to load) (" + ShownServerText(raw) + ")");
+    CHECK(note.find('\n') == std::string::npos);
+    CHECK(note.find("00007FFC") == std::string::npos);
+}
+
 TEST(ScrubPathsKeepsBaseNamesOnly) {
     const std::string win = "C:\\Games\\Skyrim Special Edition\\Data\\SKSE\\Plugins\\BetterFacialAnimations\\a2f3_fp16.onnx";
     CHECK_EQ(ScrubPaths("Load model from " + win + " failed: no such file", win),
