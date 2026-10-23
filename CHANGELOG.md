@@ -7,9 +7,12 @@ Protocol version 2, the agreement's stage 2 ([docs/AGREEMENT-1.2.md](docs/AGREEM
 own: players go from 1.1.1 straight to 1.3.0.
 
 - **The version rule.** Every connection (the speech connection, each model load's and each status check's) opens
-  with a version 2 HELLO. A version 1 server (PandorumLLM v3.97-p6 and earlier) answers ERROR 6 framed in version 1;
+  with a version 2 HELLO. A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers ERROR 6 framed in version 1;
   the bridge then connects again at once in version 1, within a run's own deadline when a run made the connection, and
-  stays on version 1 for that server until the game restarts or the address changes, logged once. Nothing of version
+  stays on version 1 for that server until the game restarts or the address changes, logged once. A version 2 HELLO
+  that gets no frame back (the connection reset or closed before any answer, as p6 and earlier can cause on Windows by
+  closing with the HELLO unread) is said once more in version 2; no frame again, and the server is taken as version
+  1. The first PandorumLLM to speak version 2 is a release after v3.97 Beta patch7. Nothing of version
   2 goes to a server that hasn't answered in version 2, and an answer framed in a version the bridge didn't open with
   is malformed. HELLO and HELLO_OK carry no field beyond version 1's: only the frame's version says 2.
 - **Finding the server: FIND and FOUND on UDP.** With the address setting empty, the bridge sends FIND (the client
@@ -25,15 +28,17 @@ own: players go from 1.1.1 straight to 1.3.0.
   since the last NOTICE; at most one a minute, as the fallback note, and only while no request there awaits an
   answer. A version 1 server is told by 1.2.0's status check with `fallback REASON` instead.
 - **No hardware advice.** Every hardware choice is PandorumLLM's, BFA's own Force CPU included, and neither side
-  advises on BFA's GPU or CPU setting: the on-screen note "BFA is set to GPU ... Tick Force CPU", its code and tests
-  are gone, and BFA's GPU mode is logged once, as a fact, at Log detail Detailed only.
+  advises on BFA's GPU or CPU setting: the on-screen note about BFA's GPU mode, its code and tests are gone, and BFA's GPU mode is logged once, as a fact, at Log detail Detailed only.
 - **BFA's mode, set by the bridge.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA
   to its CPU mode itself, from the next game start, so BFA opens nothing on this PC's graphics card; the model still
   runs on the server. Once a server has answered in version 2 this session, it writes `[General] ForceCPU=1` in
   BFA's `BetterFacialAnimations.ini` (the relative path BFA uses), and again at each game save (SKSE's save message),
-  so a save of BFA's menu in the session can't undo it. The first time, it records the value it found in its own
-  `SKSE/Plugins/BFARemoteBridge.ini`; a server that answers only in version 1 gets that value put back. One log
-  line, no setting, no note. The rule is `src/core/BfaMode.h`, the files `src/plugin/BfaIni.cpp`, behind an IniStore
+  so a save of BFA's menu in the session can't undo it. When it changes a 0, it notes that it did in its own
+  `SKSE/Plugins/BFARemoteBridge.ini`; a server that answers only in version 1 (PandorumLLM v3.97 Beta patch7 and earlier)
+  gets the 0 put back. A note that is missing or unreadable puts nothing back, so the bridge's own 1 is never taken
+  for the player's value. Only for BFA 4.3.2.3, whose sizes version 2 servers carry: another BFA version's mode is
+  left as it is, and a value the bridge set put back. BFA's INI is never created: without it, nothing is written. One
+  log line, no setting, no note. The rule is `src/core/BfaMode.h`, the files `src/plugin/BfaIni.cpp`, behind an IniStore
   seam. If you remove the bridge, BFA keeps the CPU mode the bridge set; BFA's own menu shows it.
 - **The sizes rule** ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5): every version 2 server, given
   a HELLO that lists no overrides for a file of BFA 4.3.2.3's set (by SHA-256), fills in that set's sizes and says so
@@ -56,7 +61,7 @@ Protocol version 1 is unchanged; it works with PandorumLLM v3.97-p6. What needs 
 in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
 
 - **Not an alternative to BFA: a bridge to PandorumLLM's A2F server.** The README says so at the top, says that BFA
-  stays installed (with Force CPU ticked, advice 1.3.0 withdraws) and how to give PandorumLLM's PC the same BFA files.
+  stays installed and how to give PandorumLLM's PC the same BFA files.
 - **The settings page keeps only what the server can't tell the bridge:** the server address and port (for a server
   that doesn't answer discovery yet, as today's), Status on load and Log detail. **Bridge**, **Access key**,
   **Timeout** (now fixed at 1000 ms) and **Check results** are gone, with the code that loaded and ran the model on
@@ -79,9 +84,6 @@ in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
   available"). A runtime the bridge can't serve (older than API version 10, an unreadable version, or an API version
   past 30) is known to be incompatible: BFA gets no table, so it has no model and lip sync is the game's own, and a
   note says to update the bridge (or BFA, for a runtime older than 1.10).
-- **BFA's GPU mode is reported, not changed:** once per session, on screen whatever Status on load says, with "Tick
-  Force CPU in BFA's menu" (gone in 1.3.0: the hardware is PandorumLLM's choice). The bridge changes nothing else of
-  BFA's.
 - A model load BFA retries after a refusal is logged once until the refusal changes. A model the server answers as
   not ready shows on screen with the server's detail. Every server text shown or logged goes on one line (line
   breaks and control characters become spaces), loses any path and memory address, and is cut at about 160

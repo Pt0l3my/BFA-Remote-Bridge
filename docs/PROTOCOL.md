@@ -99,8 +99,9 @@ The bridge's **client string** is its name and version, then its keys in parenth
 
 - The counters are cumulative from Skyrim's start: `answered` counts the runs the server answered, `fallbacks` every
   run it didn't (the line got the game's own lip sync), and `timeouts` the part of those that timed out.
-- `fallback REASON` (since 1.2.0) comes only in a status check the bridge sends because a line fell back, to a
-  server not known to speak version 2 (one that does is told by NOTICE instead): REASON is
+- `fallback REASON` (since 1.2.0) comes only in a status check the bridge sends because something fell back: a line,
+  to a server not known to speak version 2 (one that does is told of a line by NOTICE instead), or a model load the
+  server refused or a runtime entry the bridge can't serve, to every server, in the version it speaks: REASON is
   one word, `unreachable`, `paused`, `timeout`, `error`, `notready`, `refused` or `incompatible`
   (`src/core/Reasons.h`; a word, once released, never changes).
 - `BFA V` and `ORT V` (since 1.2.0) are the gaming PC's BFA version (from its DLL) and the runtime BFA loaded, each
@@ -216,7 +217,7 @@ its `server` string).
 route sets, in section 1's table), and says so in the row's detail: "built with BFA 4.3.2.3's sizes". A file outside
 that set gets no sizes of the server's own, and a HELLO that lists overrides is served exactly as listed. So BFA's CPU
 route, which lists none, is served ([AGREEMENT-1.2.md](AGREEMENT-1.2.md), measurement 5, which names the two files'
-SHA-256). PandorumLLM's v3.97 patch7 does the same in version 1. The bridge never reads a detail as a sign of the
+SHA-256). PandorumLLM's v3.97 Beta patch7 does the same in version 1. The bridge never reads a detail as a sign of the
 server's version or abilities: it knows the version by the frames alone, and sets BFA's CPU mode only for a server
 that answered in version 2 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
 stands in for one with the test files.
@@ -227,13 +228,22 @@ stands in for one with the test files.
   in that version, and every later frame from the client carries it too. A frame of another version on an open
   connection is answered with ERROR 6, framed in the connection's version, and the connection closes.
 - A server answers a first frame of a version it doesn't speak with ERROR 6 (request id 0), framed in the newest
-  version it speaks, then closes the connection. So a version 1 server (PandorumLLM v3.97-p6 and earlier, or the
-  reference server with `--v1-only`) answers a version 2 HELLO with ERROR 6 framed in version 1.
+  version it speaks, then closes the connection. So a version 1 server answers a version 2 HELLO with ERROR 6 framed
+  in version 1. Version 1 servers are every PandorumLLM release up to v3.97 Beta patch7 (the first to speak version 2
+  is a PandorumLLM release after v3.97 Beta patch7), and the reference server with `--v1-only` or `--p6`.
+- **How they close.** Patch7 (its item 13g) reads the whole version 2 HELLO before it answers ERROR 6, and closes
+  cleanly. p6 and every earlier panel read only its 12-byte header, answer ERROR 6 framed in version 1 and close with
+  the payload unread, so on Windows the connection can be reset, and the ERROR 6 lost, before the bridge reads it (the
+  reference server's `--p6` closes the same way). A version 2 server always answers a version 2 HELLO, with HELLO_OK
+  or an ERROR.
 - Bridge 1.3.0 opens every connection with a version 2 HELLO: the speech connection's, each model load's and each
-  status check's. When the answer is ERROR 6 framed in version 1, it connects again at once and opens in version 1,
-  and it stays on version 1 for that server until the game restarts or the address changes (the setting, or the
-  address FIND found). The log says so once. Any other answer framed in a version the bridge didn't open with is
-  malformed.
+  status check's. When the answer is ERROR 6 framed in version 1, it connects again at once and opens in version 1.
+  When a version 2 HELLO gets no frame back (the connection reset, or closed before any answer), it says it once more
+  in version 2 on a new connection; when that too gets no frame back, it takes the server as a version 1 server and
+  connects again in version 1. Either way it stays on version 1 for that server until the game restarts or the
+  address changes (the setting, or the address FIND found), and the log says so once. No frame back once, then
+  HELLO_OK framed in version 2, stays on version 2. With Log detail at Detailed, each version 2 HELLO reset or closed
+  before any answer is logged. Any other answer framed in a version the bridge didn't open with is malformed.
 - Nothing of version 2 goes to a server that hasn't answered in version 2: NOTICE goes only on a connection whose
   HELLO was answered with HELLO_OK framed in version 2. FIND goes to the local network, not to a server, and a
   version 1 server doesn't listen for it.
@@ -247,7 +257,8 @@ before HELLO is ERROR 1, and the connection closes, as for any request but HELLO
 ```
 str  model     the model whose line fell back: a base name the connection's HELLO listed, e.g. "a2f3_fp16.onnx"
 str  reason    one word, the status check's `fallback REASON` words (src/core/Reasons.h): unreachable, paused, timeout,
-               error, notready, refused or incompatible
+               error, notready or incompatible (never refused: a refused model load is no line, and goes by the status
+               check)
 str  detail    what happened, on one line, as the bridge shows it on screen: no line break, control character, path or
                memory address, at most about 160 characters; e.g. "ERROR 4, inference failed: ..."
 u32  lines     the lines that got the game's own lip sync since the bridge's previous NOTICE, the latest included (1
@@ -366,14 +377,17 @@ PandorumLLM's choice; the bridge reports it.
   searches: with no server found, it gets the NaN answer at once. A search that finds none is logged once until one
   is found; the server found is logged by its `server` string and port, never its address. A model load that finds
   none is refused, with a note once per session: "no server answered on the local network, so lip sync is the game's
-  own. In PandorumLLM, set the A2F server's Remote IP to this PC and allow port 7871 (UDP and TCP) through that PC's
-  firewall, or enter its address on SkyrimNet's Settings > Plugins page."
+  own. In PandorumLLM, set the A2F server's Remote IP to this PC and allow port N (UDP and TCP) through that PC's
+  firewall, or enter its address on SkyrimNet's Settings > Plugins page.", N the port set on the page (7871 unless
+  changed).
 - **NOTICE** (version 2 only): each line that falls back is counted, with its model, reason and detail. The
   background thread sends a NOTICE on the main connection when one is due (at once for the first, then at most one a
   minute), only once the connection's HELLO was answered in version 2, and only while no request there awaits an
   answer (it waits for a late answer to be read first, and gives way to runs). A NOTICE that can't be sent closes the
-  connection, and waits for the next. To a server that answered in version 2, a line's fallback goes by NOTICE alone;
-  a model load's refusal and a runtime entry the bridge can't serve are no line, and go to no server.
+  connection, and waits for the next; a NOTICE that waits is sent once a run's answer clears the way, with no polling.
+  NOTICE names only a model the connection's last HELLO listed. To a server that answered in version 2, a line's
+  fallback goes by NOTICE alone; a model load's refusal and a runtime entry the bridge can't serve are no line, and
+  go by the status check (below) to every server.
 - **A connection the server closed or reset, or a send that failed** (a reused connection) is opened again within the
   same call: the bridge reconnects, says HELLO and sends the same RUN, once, within that call's deadline. The log says
   which of the three it was.
@@ -399,9 +413,10 @@ PandorumLLM's choice; the bridge reports it.
   - **PING** on a main connection idle for 60 seconds whose HELLO was answered and listed models. PONG must come
     within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
   - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
-    counters in its client string) on a connection of its own, then closed. Also once when the settings are read, and,
-    to a server not known to speak version 2, within seconds of a line falling back (at most one every 30 seconds),
-    with the fallback's reason in the client string (`fallback REASON`, the latest when several came meanwhile).
+    counters in its client string) on a connection of its own, then closed. Also once when the settings are read, and
+    within seconds of a fallback (at most one every 30 seconds), with the fallback's reason in the client string
+    (`fallback REASON`, the latest when several came meanwhile): for a line, to a server not known to speak version
+    2; for a refused model load or a runtime entry the bridge can't serve, to every server.
   - **Never past a run's timeout:** its connect and the 60-second HELLO of a reconnect go on a new connection, outside
     the main connection's lock. Its HELLO and PING on the main connection take the lock only when it is free and no
     run waits, and last at most the run timeout. A run that arrives meanwhile waits for the lock within its own
@@ -426,11 +441,13 @@ PandorumLLM's choice; the bridge reports it.
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
   no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge asks the
   player nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. It sets
-  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, it records the value
-  of `[General] ForceCPU` it found in `Data\SKSE\Plugins\BetterFacialAnimations.ini` (in its own
-  `BFARemoteBridge.ini`, the first time only) and writes `ForceCPU=1`, again at each game save (SKSE's save message)
-  so a save of BFA's menu can't undo it; BFA reads the file at its start, so it applies from the next start. A server
-  that answers only in version 1 gets the recorded value put back. Logged once, at info level; no setting, no note. BFA's CPU route
+  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3 alone
+  (the set the sizes rule names; the version the client string reports), it writes `ForceCPU=1` under `[General]` in
+  `Data\SKSE\Plugins\BetterFacialAnimations.ini` when it was 0, noting in its own `BFARemoteBridge.ini` that it did,
+  and writes it again at each game save (SKSE's save message) so a save of BFA's menu can't undo it; BFA reads the
+  file at its start, so it applies from the next start. A server that answers only in version 1, or another BFA
+  version, gets the 0 put back, and only when the bridge's note reads as written: when in doubt, nothing is put back.
+  It never creates BFA's INI. Logged once, at info level; no setting, no note. BFA's CPU route
   sets no free-dimension overrides, so its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
   (the sizes rule, ["Version 2"](#version-2)), so it serves BFA in either mode.
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each

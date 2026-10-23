@@ -19,7 +19,7 @@ schema:
     - name: "Server address"
       path: "serverAddress"
       type: "string"
-      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Empty means the bridge finds the server on the local network by itself: PandorumLLM's A2F server answers once its Remote IP is set to this PC, in a version that speaks the bridge's protocol version 2. Enter the address for an older server."
+      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Leave it empty and the bridge finds the server by itself, once its Remote IP is set to this PC: that needs a PandorumLLM that speaks the bridge's protocol version 2, a release after v3.97 Beta patch7. For an older PandorumLLM, enter the address."
       defaultValue: ""
       category: "Server"
     - name: "Port"

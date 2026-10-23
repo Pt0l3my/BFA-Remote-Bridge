@@ -18,8 +18,9 @@ server:
 
 BFA runs NVIDIA's Audio2Face models through ONNX Runtime every time an NPC speaks. When the gaming PC's graphics card
 is already busy drawing the game, each burst of inference pushes frames back and the game stutters. With the bridge,
-the arithmetic happens on the server's PC, and BFA gets the results back. BFA's files are never changed: the bridge
-attaches to BFA in memory when the game starts.
+the arithmetic happens on the server's PC, and BFA gets the results back. BFA's program files are never changed: the
+bridge attaches to BFA in memory when the game starts. The one file of BFA's it writes is BFA's INI, to set its CPU
+mode (see [BFA's mode](#bfas-mode)).
 
 ## What's new in 1.3.0
 
@@ -27,10 +28,11 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 
 - **The server is found by itself.** Leave **Server address** empty and the bridge finds PandorumLLM's A2F server on
   your local network, once its Remote IP is set to the gaming PC (a PandorumLLM that speaks the bridge's protocol
-  version 2). Allow **UDP as well as TCP** on the port in the server PC's firewall, for private networks only. An
-  older server still works with its address entered.
+  version 2: a PandorumLLM release after v3.97 Beta patch7). Allow **UDP as well as TCP** on the port in the server
+  PC's firewall, for private networks only. An older server still works with its address entered.
 - **Protocol version 2, and version 1 still.** The bridge speaks version 2 to a server that does, and version 1 to an
-  older one (PandorumLLM v3.97-p6 and earlier), by itself: nothing to set.
+  older one (PandorumLLM v3.97 Beta patch7 and earlier), by itself. An older PandorumLLM, patch7 included, can't be found
+  on the network: enter its address on SkyrimNet's page.
 - **The server hears of each line that falls back** (a NOTICE, at most one a minute, naming the model, the reason and
   what happened), so PandorumLLM's panel can show it. An older server is told by the bridge's short status check,
   with the reason in it.
@@ -52,7 +54,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 ## How it works
 
 - At start-up the bridge finds `BetterFacialAnimations.dll` and redirects its one lookup of ONNX Runtime's entry
-  point, so BFA's calls to the runtime pass through the bridge. That is the only thing it changes of BFA's.
+  point, so BFA's calls to the runtime pass through the bridge. That is the only change it makes to BFA's code;
+  besides it, the bridge sets one setting in BFA's INI ([BFA's mode](#bfas-mode)).
 - **With the bridge, no BFA model runs on the gaming PC**, neither on its graphics card nor on its processor. When BFA
   loads a model, the bridge asks the server to load the same file (matched by name, size and SHA-256); every run then
   goes to the server, BFA's warm-up run included.
@@ -74,7 +77,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   at most once every 5 seconds while none answers, and connects to the first server that answers. Its address is
   never logged.
 - **Protocol versions.** The bridge opens each connection in protocol version 2; a server that speaks only version 1
-  says so, and the bridge then speaks version 1 to it until the game restarts or the address changes.
+  says so (or, as v3.97-p6 and earlier can, drops the connection twice without an answer), and the bridge then speaks
+  version 1 to it until the game restarts or the address changes.
 - **BFA's mode.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode
   itself, from the next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the
   server. See [BFA's mode](#bfas-mode).
@@ -129,8 +133,8 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 2. In PandorumLLM's panel, point the A2F server's **Model folder** at that folder, and choose the card it runs on.
 3. Set **Remote IP** to the gaming PC's address on your network. Until it is set, the A2F server listens on its own
    PC only (127.0.0.1) and refuses the gaming PC; once set, it listens on the network and admits only that address,
-   its own PC and 127.0.0.1; it also answers the bridge's search from that address alone. Allow the port (7871)
-   through that PC's firewall for **UDP as well as TCP**, for private networks only: TCP carries the lines, UDP the
+   its own PC and 127.0.0.1; it also answers the bridge's search from that address alone. Allow the port (7871 by
+   default) through that PC's firewall for **UDP as well as TCP**, for private networks only: TCP carries the lines, UDP the
    search.
 4. **Keep both copies the same version.** After updating BFA on the gaming PC, copy its folder again: a model that
    differs from the server's copy (by size or SHA-256) is refused, and its lines get the game's own lip sync.
@@ -145,9 +149,12 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   starts), says so once in its log, and writes it again at each game save, so a change in BFA's menu in the same
   session doesn't undo it. In Mod Organizer 2 the change goes to BFA's own file, in BFA's mod folder, and the
   bridge's new file below to Overwrite.
-- The first time, the bridge keeps the value it found, in its own `SKSE/Plugins/BFARemoteBridge.ini`. With a server
-  that speaks only protocol version 1 (PandorumLLM v3.97-p6 and earlier, which can't serve BFA's CPU mode), it puts
-  that value back, from the next game start, so lip sync keeps working.
+- When it changes the setting, the bridge notes that it did, in its own `SKSE/Plugins/BFARemoteBridge.ini`. With a
+  server that speaks only protocol version 1 (PandorumLLM v3.97 Beta patch7 and earlier), it puts BFA's value back, from
+  the next game start: it sets BFA's CPU mode only for a server that speaks version 2. When its note is missing or
+  unreadable, it puts nothing back. It never creates BFA's INI: without that file, BFA's mode is left as it is.
+- Only for Better Facial Animations 4.3.2.3, the version whose sizes version 2 servers carry: any other BFA version's
+  mode is left as it is, and a value the bridge set earlier is put back.
 - In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime, and a version 2 server fills
   in BFA 4.3.2.3's own (part of protocol version 2, agreed with PandorumLLM's side;
   [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5).
@@ -241,7 +248,7 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | You see | What to do |
 |---|---|
 | "Better Facial Animations wasn't found, so the bridge is idle." | Install and enable BFA: the bridge works with it, not instead of it. |
-| "no server answered on the local network" | No server was found. In PandorumLLM, start the A2F server and set its Remote IP to the gaming PC's address; allow the port (7871) through the server PC's firewall for UDP as well as TCP, private networks only; and check both PCs are on the same network. A PandorumLLM older than protocol version 2 can't be found: enter its address on SkyrimNet's page instead, save, and restart. The log says what the search sent and whether anything answered. |
+| "no server answered on the local network" | No server was found. In PandorumLLM, start the A2F server and set its Remote IP to the gaming PC's address; allow the port (7871 by default) through the server PC's firewall for UDP as well as TCP, private networks only; and check both PCs are on the same network. A PandorumLLM older than protocol version 2 (v3.97 Beta patch7 and earlier) can't be found: enter its address on SkyrimNet's page instead, save, and restart. The log says what the search sent and whether anything answered. |
 | "SkyrimNet wasn't found" | Install SkyrimNet Beta26 or later: the settings are read from it. |
 | "the server isn't answering" | Start PandorumLLM's A2F server, check the address (if one is set) and the port, set its Remote IP to the gaming PC, and allow the port through the server PC's firewall for UDP as well as TCP (private networks only). Then reload the model in BFA's menu, or restart. |
 | "the server refused the access key" | The bridge has no access key any more: turn the key off in PandorumLLM's A2F settings. |
