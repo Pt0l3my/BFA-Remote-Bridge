@@ -236,7 +236,7 @@ public:
     void ReportFallback(Reason reason);
     int FallbackReports() const;  // status checks sent for a fallback, for the tests
 
-    // The background thread: allowed by StartBackground, it starts while the bridge is on with a server address
+    // The background thread: allowed by StartBackground, it starts once a server address is set
     // (now, or at a later Configure). StopBackground ends and joins it.
     void StartBackground();
     void StopBackground();

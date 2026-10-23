@@ -5,8 +5,8 @@
 //                   ONNX Runtime (Hook.cpp), whatever its version; note whether SkyrimNet is loaded, so a model load
 //                   waits for its settings; and, once attached, allow the client's background thread (src/core/Client.h)
 //   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
-//   main menu,      registered them; also whenever that page is saved. The first read with the bridge on and an
-//   pre-load game   address starts the background thread, which looks the server's name up (again after each change
+//   main menu,      registered them; also whenever that page is saved. The first read with a server address set
+//   pre-load game   starts the background thread, which looks the server's name up (again after each change
 //                   of the address or port), says HELLO with no models and logs the answer
 //   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
 //                   the monitor's lines (src/core/Monitor.h; setting showStatus)
@@ -67,7 +67,9 @@ void ApplySettings(const char* when) {
     std::vector<std::string> warnings;
     const SettingsRead read = ReadSkyrimNetSettings(s, warnings);
     if (read == SettingsRead::NoSkyrimNet) {
-        if (!g_settingsRead) Log(Level::Warn, std::string("SkyrimNet isn't loaded (") + when + "): the bridge is idle and BFA runs as usual");
+        if (!g_settingsRead)
+            Log(Level::Warn, std::string("SkyrimNet isn't loaded (") + when +
+                                 "): the bridge has no server address, so BFA's model loads are refused and lip sync is the game's own");
         return;
     }
     if (read == SettingsRead::NotRegistered) {
@@ -77,7 +79,7 @@ void ApplySettings(const char* when) {
     g_settingsRead = true;
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
-    g_bridge->Apply(s);  // starts the background thread once the bridge is on with an address
+    g_bridge->Apply(s);  // starts the background thread once a server address is set
 }
 
 class ConfigSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent> {
@@ -124,11 +126,11 @@ void OnGameLoaded() {
         f.problem = g_bfa.problem;
         // BFA missing is a status (Status on load); the bridge unable to attach is said either way
         const std::string status = LoadStatusText(f);
-        if (!status.empty() && (!g_bfa.found ? ShowStatus() : true)) CornerNote(status);
+        if (!status.empty() && (!g_bfa.found ? ShowStatus() : true)) ShowNote(status);
         if (g_bfa.hooked && g_bridge->CurrentSettings().serverAddress.empty())
             g_bridge->Notes().Once("noserver", NoServerText(g_skyrimNet));
     }
-    for (const auto& text : pending) CornerNote(text);
+    for (const auto& text : pending) CornerNote(text);  // each came through ShowNote already, held until now
     if (g_bfa.hooked) g_bridge->Notes().Loaded();  // every model's line, while Status on load allows it
 }
 

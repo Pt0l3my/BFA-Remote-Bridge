@@ -48,6 +48,12 @@ std::string CantAttachText(const std::string& bfaVersion, const std::string& why
            ", so BFA runs on this PC as it would without the bridge. Update the bridge.";
 }
 
+std::string CantServeText(const std::string& bfaVersion, const std::string& ortVersion, bool newer) {
+    return kPrefix + Bfa(bfaVersion) + " uses ONNX Runtime" + (ortVersion.empty() ? std::string() : " " + ortVersion) +
+           ", which the bridge can't serve, so lip sync is the game's own. " +
+           (newer ? "Update the bridge." : "Update Better Facial Animations.");
+}
+
 std::string NoServerText(bool skyrimNet) {
     if (!skyrimNet)
         return kPrefix + "SkyrimNet wasn't found, so the bridge has no server address and lip sync is the game's own.";

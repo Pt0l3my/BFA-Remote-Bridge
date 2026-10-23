@@ -19,7 +19,7 @@ schema:
     - name: "Server address"
       path: "serverAddress"
       type: "string"
-      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Needed until PandorumLLM can be found by itself (its current version can't be yet). Empty: lip sync is the game's own."
+      description: "The address of the PC running PandorumLLM's A2F server, on your local network. Empty means no server: BFA's model isn't loaded and lip sync is the game's own. Finding PandorumLLM's PC by itself comes with bridge 1.3.0."
       defaultValue: ""
       category: "Server"
     - name: "Port"

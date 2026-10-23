@@ -19,8 +19,12 @@ struct StatusFacts {
 // The line at the first game load about BFA itself; empty when the bridge is attached (the monitor's lines follow).
 std::string LoadStatusText(const StatusFacts& facts);
 
-// The bridge couldn't attach, or can't serve the runtime BFA asked for: BFA runs as it would without the bridge.
+// The bridge couldn't attach: BFA runs as it would without the bridge.
 std::string CantAttachText(const std::string& bfaVersion, const std::string& why);
+
+// The runtime BFA loaded can't be served (known to be incompatible): BFA has no model, lip sync is the game's own.
+// newer: the advice is to update the bridge, else BFA.
+std::string CantServeText(const std::string& bfaVersion, const std::string& ortVersion, bool newer);
 
 // No server address: lines get the game's own lip sync. skyrimNet: whether SkyrimNet, which holds the address, is
 // loaded.

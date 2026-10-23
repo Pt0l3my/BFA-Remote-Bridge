@@ -407,10 +407,11 @@ TEST(ForwardCreateSessionRefusedForEachReason) {
     std::vector<Case> cases = {
         {"server down", {}, Models(), Models() / "tiny.onnx", "since the server isn't answering", false},
         {"wrong key", {"--key", "k3y-right"}, Models(), Models() / "tiny.onnx", "since the server refused the access key"},
-        {"model not found", {}, empty, Models() / "tiny.onnx", "since the server lacks it or has a different copy"},
-        {"different file", {}, Models() / "other", Models() / "tiny.onnx", "since the server lacks it or has a different copy"},
-        {"failed to load", {}, broken, broken / "broken.onnx", "since the server couldn't load it"},
-        {"not allowed", {"--allow", "a2f3_fp16.onnx"}, Models(), Models() / "tiny.onnx", "since the server couldn't load it"},
+        // the server's own answer, with its detail, as the monitor's line for the model
+        {"model not found", {}, empty, Models() / "tiny.onnx", ": not ready (not found) (no such file in the model folder)"},
+        {"different file", {}, Models() / "other", Models() / "tiny.onnx", ": not ready (different file) (the file here has another size or SHA-256)"},
+        {"failed to load", {}, broken, broken / "broken.onnx", ": not ready (failed to load) ("},
+        {"not allowed", {"--allow", "a2f3_fp16.onnx"}, Models(), Models() / "tiny.onnx", ": not ready (not allowed) (this server doesn't serve that model)"},
     };
     for (const Case& c : cases) {
         std::unique_ptr<Server> server;
@@ -434,7 +435,13 @@ TEST(ForwardCreateSessionRefusedForEachReason) {
         CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
         CHECK_EQ(h.notes.size(), std::size_t{1});
         CHECK(h.notes[0].find(c.note) != std::string::npos);
-        CHECK(h.notes[0].rfind("BFA Remote Bridge: " + c.model.filename().string() + ": lines get the game's own lip sync", 0) == 0);
+        CHECK(h.notes[0].rfind("BFA Remote Bridge: " + c.model.filename().string(), 0) == 0);
+        CHECK(h.notes[0].find(fs::temp_directory_path().string()) == std::string::npos);  // no path reaches a note
+        // BFA's retry meets the same answer: no second note
+        OrtSession* again = nullptr;
+        OrtStatus* st2 = h.Create(c.model, {{"batch", 2}}, &again);
+        if (st2) h.api->ReleaseStatus(st2);
+        CHECK_EQ(h.notes.size(), std::size_t{1});
         CHECK(message.find("k3y") == std::string::npos);
         std::printf("        %s: %s\n", c.what, message.c_str());
     }
@@ -780,9 +787,19 @@ TEST(ForwardOlderApiVersionOfTheSameRuntime) {
 TEST(ForwardAnOlderRuntimeIsServedFromItsShorterTable) {
     Need();
     Server server(Models());
-    for (const auto& [text, api] : std::vector<std::pair<const char*, unsigned>>{{"1.20.1", 20}, {"1.12.0", 12}}) {
+    // each fake table sized by ONNX Runtime's published count for its version (its static_asserts), not by the
+    // bridge's own: a wrong count of the bridge's reads past it, which AddressSanitizer reports
+    struct Case {
+        const char* text;
+        unsigned api;
+        std::size_t entries;
+    };
+    for (const Case& c : {Case{"1.23.2", 23, 390}, Case{"1.20.1", 20, 285}, Case{"1.12.0", 12, 219}}) {
+        const char* text = c.text;
+        const unsigned api = c.api;
+        const std::size_t entries = c.entries;
         Harness h(On(server.Port()));
-        const std::size_t entries = OrtApiEntries(api);
+        CHECK_EQ(OrtApiEntries(api), entries);
         const OrtApiBase* base = FakeRuntime::Install(text, api, entries);
         const OrtApi* t = base->GetApi(api);
         CHECK(t != nullptr);
@@ -823,32 +840,143 @@ TEST(ForwardANewerRuntimesExtraEntriesRefuse) {
         t->ReleaseStatus(st);
     }
     CHECK(!g_extraCalled.load());  // never the runtime's
+    // GetExperimentalFunction (1.28, index 422) returns a function pointer: its stub answers null, "not available"
+    {
+        Entry e = nullptr;
+        std::memcpy(&e, &Slots(t)[422], sizeof e);
+        CHECK(e() == nullptr);
+        CHECK(!g_extraCalled.load());
+        CHECK_EQ(h.CountLogged("called ONNX Runtime entry 422"), 1);
+    }
     CHECK_EQ(h.CountLogged("called ONNX Runtime entry " + std::to_string(kKnownOrtEntries + 5)), 1);  // once per entry
-    CHECK_EQ(h.CountLogged("Update the bridge"), 3);
+    CHECK_EQ(h.CountLogged("Update the bridge"), 4);  // 415, 420, 454 and 422
     CHECK(h.CountNotes("runtime entry " + std::to_string(kKnownOrtEntries)) == 1);
     // the model editor's 1.24.4 layout isn't a newer version's: no editor
     CHECK(t->GetModelEditorApi() == nullptr);
 }
 
-// What the bridge can't serve gets the real table, untouched: BFA runs as it would without the bridge, and the note
-// says to update the bridge.
-TEST(ForwardWhatTheBridgeCantServeIsTheRealTable) {
+// What the bridge can't serve is known to be incompatible: GetApi answers null, BFA has no model (its own "wrong
+// version") and lip sync is the game's own; nothing runs on this PC. The note says what to update, once.
+TEST(ForwardWhatTheBridgeCantServeIsRefused) {
     Need();
     Harness h(Settings{});
+    h.bridge.Connection().SetBfaVersion("4.5.0");
     const OrtApi* t24 = h.api;
-    const OrtApiBase* base = FakeRuntime::Install("1.9.0", 9, OrtApiEntries(10));
-    CHECK(base->GetApi(9) == reinterpret_cast<const OrtApi*>(FakeRuntime::slots.get()));
+    const OrtApiBase* base = FakeRuntime::Install("1.9.0", 9, 200);
+    CHECK(base->GetApi(9) == nullptr);
     CHECK(Bridge::State() == Bridge::ApiState::CantServe);
-    CHECK(h.Logged("ONNX Runtime 1.9.0 is older than the bridge serves"));
+    CHECK(h.Logged("The bridge can't serve ONNX Runtime 1.9.0 (it is older than ONNX Runtime 1.10)"));
+    CHECK(h.Logged("Update Better Facial Animations."));
+    CHECK_EQ(h.CountNotes("Better Facial Animations 4.5.0 uses ONNX Runtime 1.9.0, which the bridge can't serve, so lip sync is the game's own. "
+                          "Update Better Facial Animations."),
+             1);
     base = FakeRuntime::Install("1.31.0", 31, kKnownOrtEntries);
-    CHECK(base->GetApi(31) == reinterpret_cast<const OrtApi*>(FakeRuntime::slots.get()));
-    CHECK(h.Logged("asked for API version 31, newer than the bridge serves"));
+    CHECK(base->GetApi(31) == nullptr);
+    CHECK(h.Logged("BFA asked for its API version 31, newer than the bridge serves"));
     base = FakeRuntime::Install("unknown", 24, kKnownOrtEntries);
-    CHECK(base->GetApi(24) == reinterpret_cast<const OrtApi*>(FakeRuntime::slots.get()));
-    CHECK_EQ(h.CountNotes("so BFA runs on this PC as it would without the bridge. Update the bridge."), 1);  // once
+    CHECK(base->GetApi(24) == nullptr);
+    CHECK(h.Logged("its version can't be read"));
+    CHECK_EQ(h.CountNotes("which the bridge can't serve"), 1);  // once per session
     // back to the real runtime, for the harness's own release
     h.api = Bridge::Hook(RealGetApiBase())()->GetApi(ORT_API_VERSION);
     CHECK(h.api == t24);
+}
+
+// A real newer runtime (BFARB_ORT_NEWER_LIBRARY names its libonnxruntime.so, such as 1.29.0's; never committed): BFA
+// asking for its own API version is served through it, and every entry past 1.24.4's refuses.
+TEST(ForwardARealNewerRuntime) {
+    Need();
+    const std::string lib = Env("BFARB_ORT_NEWER_LIBRARY");
+    if (lib.empty()) SKIP("BFARB_ORT_NEWER_LIBRARY isn't set");
+    void* handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+    CHECK(handle != nullptr);
+    const auto newer = reinterpret_cast<OrtGetApiBaseFn>(dlsym(handle, "OrtGetApiBase"));
+    CHECK(newer != nullptr);
+    Server server(Models());
+    Harness h(On(server.Port()));
+    const OrtApiBase* base = Bridge::Hook(newer)();
+    const unsigned version = OrtApiVersionOf(base->GetVersionString());
+    CHECK(version > ORT_API_VERSION);
+    const OrtApi* api = base->GetApi(version);
+    CHECK(api != nullptr);
+    CHECK(Bridge::State() == Bridge::ApiState::Served);
+    OrtEnv* env = nullptr;
+    OrtMemoryInfo* cpu = nullptr;
+    Ok(api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "bfarb-newer", &env));
+    Ok(api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu));
+    OrtSessionOptions* so = nullptr;
+    Ok(api->CreateSessionOptions(&so));
+    Ok(api->AddFreeDimensionOverrideByName(so, "batch", 2));
+    OrtSession* session = nullptr;
+    Ok(api->CreateSession(env, (Models() / "tiny.onnx").c_str(), so, &session));
+    api->ReleaseSessionOptions(so);
+    CHECK(h.bridge.IsBridgeSession(session));
+    {
+        TinyInputs in(api, cpu, 3);
+        Outputs out(api, 5);
+        Ok(api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(api, out.v[0]));
+    }
+    api->ReleaseSession(session);
+    using Entry = OrtStatus* (ORT_API_CALL*)() noexcept;
+    for (std::size_t index = kKnownOrtEntries; index < kKnownOrtEntries + 10; ++index) {
+        Entry e = nullptr;
+        std::memcpy(&e, &reinterpret_cast<void* const*>(api)[index], sizeof e);
+        OrtStatus* st = e();
+        if (index == 422) {
+            CHECK(st == nullptr);  // GetExperimentalFunction: "not available"
+            continue;
+        }
+        CHECK(st != nullptr);
+        CHECK(std::string(api->GetErrorMessage(st)).find("ONNX Runtime entry " + std::to_string(index)) != std::string::npos);
+        api->ReleaseStatus(st);
+    }
+    api->ReleaseMemoryInfo(cpu);
+    api->ReleaseEnv(env);
+    std::printf("        ONNX Runtime %s, API version %u: the tiny model served, entries %zu to %zu refused\n", base->GetVersionString(),
+                version, kKnownOrtEntries, kKnownOrtEntries + 9);
+    h.api = Bridge::Hook(RealGetApiBase())()->GetApi(ORT_API_VERSION);
+}
+
+// The runtime's other session makers would run a model on this PC: each answers with an error status naming it,
+// without the runtime, logged once, with the note to update the bridge.
+TEST(ForwardOtherSessionMakersAreRefused) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtSessionOptions* so = nullptr;
+    Ok(h.api->CreateSessionOptions(&so));
+    std::ifstream in(Models() / "tiny.onnx", std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto refused = [&](OrtStatus* st, const char* name) {
+        const bool ok = st && std::string(h.api->GetErrorMessage(st)).find(std::string(name) + " isn't served") != std::string::npos;
+        if (st) h.api->ReleaseStatus(st);
+        return ok;
+    };
+    for (int i = 0; i < 2; ++i) {
+        OrtSession* s = nullptr;
+        CHECK(refused(h.api->CreateSessionFromArray(h.env, bytes.data(), bytes.size(), so, &s), "CreateSessionFromArray"));
+        CHECK(s == nullptr);
+    }
+    OrtPrepackedWeightsContainer* container = nullptr;
+    Ok(h.api->CreatePrepackedWeightsContainer(&container));
+    OrtSession* s = nullptr;
+    CHECK(refused(h.api->CreateSessionWithPrepackedWeightsContainer(h.env, (Models() / "tiny.onnx").c_str(), so, container, &s),
+                  "CreateSessionWithPrepackedWeightsContainer"));
+    CHECK(refused(h.api->CreateSessionFromArrayWithPrepackedWeightsContainer(h.env, bytes.data(), bytes.size(), so, container, &s),
+                  "CreateSessionFromArrayWithPrepackedWeightsContainer"));
+    if (const OrtModelEditorApi* editor = h.api->GetModelEditorApi()) {
+        CHECK(refused(editor->CreateModelEditorSession(h.env, (Models() / "tiny.onnx").c_str(), so, &s), "CreateModelEditorSession"));
+        CHECK(refused(editor->CreateModelEditorSessionFromArray(h.env, bytes.data(), bytes.size(), so, &s), "CreateModelEditorSessionFromArray"));
+        CHECK(refused(editor->CreateSessionFromModel(h.env, nullptr, so, &s), "CreateSessionFromModel"));
+    }
+    CHECK(s == nullptr);
+    h.api->ReleasePrepackedWeightsContainer(container);
+    h.api->ReleaseSessionOptions(so);
+    CHECK_EQ(h.CountLogged("called ONNX Runtime's CreateSessionFromArray,"), 1);  // once
+    CHECK(h.Logged("Update the bridge."));
+    CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionFromArray). Update the bridge."), 1);
+    CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
 }
 
 // BFA's own Performance and Old models (never committed): BFARB_BFA_MODELS names their folder.

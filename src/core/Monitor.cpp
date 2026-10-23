@@ -60,9 +60,11 @@ void Monitor::Fallback(Reason reason, const std::string& model, const std::strin
     {
         std::lock_guard lock(mutex_);
         const Clock::time_point now = now_();
-        if (inFallback_ && now - lastFallback_ < kFallbackEvery) return;
+        if (anyFallback_ && now - lastFallback_ < kFallbackEvery) return;  // at most one a minute, whatever came between
+        anyFallback_ = true;
         inFallback_ = true;
         lastFallback_ = now;
+        fallbackModel_ = model;
         out.push_back(FallbackLine(model, words.empty() ? ReasonWords(reason) : words));
     }
     Emit(out);
@@ -73,8 +75,12 @@ void Monitor::Answered(const std::string& model) {
     {
         std::lock_guard lock(mutex_);
         if (!inFallback_) return;
+        const Clock::time_point now = now_();
+        if (anyBack_ && now - lastBack_ < kFallbackEvery) return;  // held: said by a later answer, after the minute
+        anyBack_ = true;
         inFallback_ = false;
-        out.push_back(BackLine(model));
+        lastBack_ = now;
+        out.push_back(BackLine(model == fallbackModel_ ? model : std::string()));
     }
     Emit(out);
 }

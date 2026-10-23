@@ -212,9 +212,23 @@ OrtStatus* RefuseNewer(std::size_t index) noexcept {
     return real->CreateStatus(ORT_NOT_IMPLEMENTED, text.c_str());
 }
 
+// ONNX Runtime 1.28 added GetExperimentalFunction at index 422. It returns a function pointer, null meaning "not
+// available", so its stub answers null (still logged): a status pointer there would be called as code.
+constexpr std::size_t kGetExperimentalFunctionIndex = 422;
+
 template <std::size_t I>
 OrtStatus* ORT_API_CALL NewerEntry() noexcept {
-    return RefuseNewer(kKnownOrtEntries + I);
+    if constexpr (kKnownOrtEntries + I == kGetExperimentalFunctionIndex) {
+        if (Bridge* b = Bridge::Current()) {
+            try {
+                b->OnNewerEntry(kGetExperimentalFunctionIndex);
+            } catch (...) {
+            }
+        }
+        return nullptr;
+    } else {
+        return RefuseNewer(kKnownOrtEntries + I);
+    }
 }
 
 template <std::size_t... I>
@@ -270,6 +284,38 @@ struct Guard<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
         (COPY).NAME = &G::Call;                                                                        \
     } while (false)
 
+// The runtime's other ways to make a session (from memory, with prepacked weights, the model editor's): a model
+// loaded so would run on this PC, so each answers with an error status naming it, without the runtime, logged once
+// with the "Update the bridge" note. BFA 4.3.2 uses only CreateSession.
+OrtStatus* RefuseEntry(const char* name) noexcept {
+    if (Bridge* b = Bridge::Current()) {
+        try {
+            b->OnUnservedEntry(name);
+        } catch (...) {
+        }
+    }
+    const OrtApi* real = Real();
+    if (!real) return nullptr;
+    const std::string text = std::string("BFA Remote Bridge: ") + name +
+                             " isn't served: the bridge serves the models BFA loads from a file with CreateSession";
+    return real->CreateStatus(ORT_NOT_IMPLEMENTED, text.c_str());
+}
+
+template <typename Table, typename F, F Table::*Member>
+struct Unserved;
+template <typename Table, typename... A, OrtStatus*(ORT_API_CALL* Table::*Member)(A...) noexcept>
+struct Unserved<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
+    static inline const char* name = "";
+    static OrtStatus* ORT_API_CALL Call(A...) noexcept { return RefuseEntry(name); }
+};
+
+#define BFARB_UNSERVED(TABLE, COPY, NAME)                                                              \
+    do {                                                                                               \
+        using U = Unserved<TABLE, decltype(TABLE::NAME), &TABLE::NAME>;                                \
+        U::name = #NAME;                                                                               \
+        (COPY).NAME = &U::Call;                                                                        \
+    } while (false)
+
 #define BFARB_GUARD_IF_HAS(NAME)                                                                       \
     do {                                                                                               \
         if (BFARB_HAS(NAME)) BFARB_GUARD(OrtApi, table, real, NAME);                                   \
@@ -318,6 +364,9 @@ const OrtModelEditorApi* ORT_API_CALL WrapGetModelEditorApi() noexcept {
         BFARB_GUARD(OrtModelEditorApi, g_editor, real, SessionGetOpsetForDomain);
         BFARB_GUARD(OrtModelEditorApi, g_editor, real, ApplyModelToModelEditorSession);
         BFARB_GUARD(OrtModelEditorApi, g_editor, real, FinalizeModelEditorSession);
+        BFARB_UNSERVED(OrtModelEditorApi, g_editor, CreateSessionFromModel);
+        BFARB_UNSERVED(OrtModelEditorApi, g_editor, CreateModelEditorSession);
+        BFARB_UNSERVED(OrtModelEditorApi, g_editor, CreateModelEditorSessionFromArray);
         g_realEditor.store(real);
     }
     return &g_editor;
@@ -326,14 +375,18 @@ const OrtModelEditorApi* ORT_API_CALL WrapGetModelEditorApi() noexcept {
 #pragma GCC diagnostic pop
 #endif
 
-void CantServe(const std::string& why) {
+// A runtime the bridge can't serve is known to be incompatible: GetApi answers null, BFA has no model (its own
+// "wrong version") and lip sync is the game's own; nothing runs on this PC. newer: the advice is to update the
+// bridge, else BFA.
+const OrtApi* CantServe(const std::string& runtime, const std::string& why, bool newer) noexcept {
     g_state.store(static_cast<int>(Bridge::ApiState::CantServe));
     if (Bridge* b = Bridge::Current()) {
         try {
-            b->OnCantServe(why);
+            b->OnCantServe(runtime, why, newer);
         } catch (...) {
         }
     }
+    return nullptr;
 }
 
 const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
@@ -343,18 +396,14 @@ const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
     if (!real) return nullptr;  // the runtime doesn't have it: BFA's own error ("wrong version")
     const char* text = base->GetVersionString ? base->GetVersionString() : nullptr;
     const unsigned runtime = OrtApiVersionOf(text);
-    const std::string runtimeText = std::string("ONNX Runtime ") + (text ? text : "of an unknown version");
     try {
-        if (runtime < kOldestOrtApi) {
-            CantServe(runtimeText + " is older than the bridge serves");
-            return real;
-        }
-        if (version > kNewestOrtApi) {
-            CantServe(runtimeText + " was asked for API version " + std::to_string(version) + ", newer than the bridge serves");
-            return real;
-        }
+        const std::string runtimeText = text ? text : "";
+        if (runtime == 0) return CantServe(runtimeText, "its version can't be read", true);
+        if (runtime < kOldestOrtApi) return CantServe(runtimeText, "it is older than ONNX Runtime 1.10", false);
+        if (version > kNewestOrtApi)
+            return CantServe(runtimeText, "BFA asked for its API version " + std::to_string(version) + ", newer than the bridge serves", true);
     } catch (...) {
-        return real;
+        return nullptr;
     }
     // the runtime's entries the bridge copies: as many as its own version has, at most 1.24.4's
     const std::size_t entries = OrtApiEntries(std::min<unsigned>(runtime, kOrtApiVersion));
@@ -362,11 +411,14 @@ const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
     std::lock_guard lock(g_tableMutex);
     g_runtimeApi.store(runtime);
     g_servedVersion.store(version);
+    // Rebuilt in place when the runtime's table, its count or the side of 24 changes. BFA 4.3.2 asks once, so a call
+    // through the table while a second GetApi rebuilds it doesn't happen; a BFA asking two versions on either side of
+    // 24 from two threads at once would meet a table being refilled (the verifier's N3, left as it is).
     if (g_built.real != real || g_built.entries != entries || g_built.newer != newer) {
         std::memset(static_cast<void*>(&g_table), 0, sizeof g_table);
         std::memcpy(static_cast<void*>(&g_table.api), real, entries * sizeof(void*));
         OrtApi& table = g_table.api;
-        // the entries of API version 1 (all the runtimes served have them)
+        // entries every runtime served has (all below version 10's 204)
         table.AddFreeDimensionOverrideByName = &WrapOverride;
         table.ReleaseSessionOptions = &WrapReleaseOptions;
         table.CreateSession = &WrapCreateSession;
@@ -376,6 +428,16 @@ const OrtApi* ORT_API_CALL GetApi(std::uint32_t version) noexcept {
         if (BFARB_HAS(SessionOptionsAppendExecutionProvider)) table.SessionOptionsAppendExecutionProvider = &WrapAppendProvider;
         if (BFARB_HAS(GetModelEditorApi)) table.GetModelEditorApi = &WrapGetModelEditorApi;
         GuardSessionEntries(table, real, entries);
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+#endif
+        BFARB_UNSERVED(OrtApi, table, CreateSessionFromArray);
+        BFARB_UNSERVED(OrtApi, table, CreateSessionWithPrepackedWeightsContainer);
+        BFARB_UNSERVED(OrtApi, table, CreateSessionFromArrayWithPrepackedWeightsContainer);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
         if (newer)
             for (std::size_t i = 0; i < kNewerOrtSlots; ++i) g_table.newer[i] = kNewer[i];
         g_built = Built{real, entries, newer};
@@ -479,7 +541,7 @@ const std::vector<OrtApiStart>& OrtApiStarts() {
         BFARB_START(20, CreateLoraAdapter),
         BFARB_START(22, ReleaseValueInfo),
         BFARB_START(23, GetTensorSizeInBytes),
-        BFARB_START(24, KernelInfo_GetConfigEntries),
+        BFARB_START(24, TensorTypeAndShape_HasShape),
     };
 #undef BFARB_START
     return starts;
@@ -597,17 +659,32 @@ void Bridge::OnNewerEntry(std::size_t index) {
     client_.ReportFallback(Reason::Incompatible);
 }
 
-void Bridge::OnCantServe(const std::string& why) {
-    Log(Level::Warn, "The bridge can't serve this Better Facial Animations: " + why +
-                         ". BFA runs on this PC as it would without the bridge. Update the bridge.");
-    monitor_.Once("cantserve", CantAttachText(client_.CurrentVersions().bfa, why));
+void Bridge::OnCantServe(const std::string& runtime, const std::string& why, bool newer) {
+    Log(Level::Warn, "The bridge can't serve ONNX Runtime " + (runtime.empty() ? std::string("?") : runtime) + " (" + why +
+                         "), so BFA's model isn't loaded and lip sync is the game's own. " +
+                         (newer ? "Update the bridge." : "Update Better Facial Animations."));
+    monitor_.Once("cantserve", CantServeText(client_.CurrentVersions().bfa, runtime, newer));
+}
+
+void Bridge::OnUnservedEntry(const std::string& name) {
+    {
+        std::lock_guard lock(sessionsMutex_);
+        if (std::find(unservedLogged_.begin(), unservedLogged_.end(), name) != unservedLogged_.end()) return;
+        unservedLogged_.push_back(name);
+    }
+    Log(Level::Warn, "Better Facial Animations called ONNX Runtime's " + name +
+                         ", which the bridge doesn't serve (it serves models loaded from a file with CreateSession); BFA gets an "
+                         "error status, so lip sync is the game's own. Update the bridge.");
+    monitor_.Fallback(Reason::Incompatible, std::string(),
+                      "this Better Facial Animations loads its model in a way the bridge doesn't serve (" + name + "). Update the bridge");
+    client_.ReportFallback(Reason::Incompatible);
 }
 
 void Bridge::OnStates(const std::string& server, const std::string& device, const std::vector<ModelState>& models) {
     for (const ModelState& m : models) {
         const bool ready = m.status == static_cast<std::uint8_t>(proto::ModelStatus::Ready);
         std::string state = ready ? "ready" : std::string("not ready (") + proto::ModelStatusName(m.status) + ")";
-        if (!m.detail.empty()) state += " (" + m.detail + ")";
+        if (!m.detail.empty()) state += " (" + ScrubPaths(m.detail) + ")";  // shown, then a SkyrimNet event: no path
         monitor_.ModelState(m.name, server, device, state, ready);
     }
 }
@@ -646,7 +723,16 @@ OrtStatus* Bridge::Refuse(const OrtApi* real, const std::string& model, const Ad
         words = "the bridge couldn't send it (" + a.detail + ")";
     }
     OrtStatus* status = RefuseWith(real, model, why);
-    monitor_.Fallback(reason, model, words);
+    if (a.hello.kind == K::Answered) {
+        // the server's own answer for the model, with its detail, as a monitor line (shown at each change, not again for
+        // BFA's retries with the same answer); the detail loses any path first
+        const std::string detail = ScrubPaths(a.detail);
+        monitor_.ModelState(model, a.hello.server, a.hello.device,
+                            std::string("not ready (") + proto::ModelStatusName(a.status) + ")" + (detail.empty() ? "" : " (" + detail + ")"),
+                            false);
+    } else {
+        monitor_.Fallback(reason, model, words);
+    }
     client_.ReportFallback(reason);
     return status;
 }
@@ -723,8 +809,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         if (!settingsRead_.load() || s.serverAddress.empty()) {
             const bool skyrimNet = settingsRead_.load() || skyrimNet_.load();  // the settings come from SkyrimNet
             OrtStatus* status = RefuseWith(real, name,
-                                           skyrimNet ? "no server address is set (finding the server by itself needs a newer PandorumLLM)"
-                                                     : "SkyrimNet isn't loaded, so the bridge has no server address");
+                                           skyrimNet ? "no server address is set, so there is no server" : "SkyrimNet isn't loaded, so the bridge has no server address");
             monitor_.Once("noserver", NoServerText(skyrimNet));
             return status;
         }
@@ -766,9 +851,10 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             PushModelsLocked();
         }
         *out = handle;
+        const std::string detail = ScrubPaths(a.detail);
         Log(Level::Info, "Model " + name + " is served by " + a.hello.server + " on " + a.hello.device +
-                             (a.detail.empty() ? std::string() : " (" + a.detail + ")") + "; nothing of it runs on this PC");
-        monitor_.ModelState(name, a.hello.server, a.hello.device, a.detail.empty() ? "ready" : "ready (" + a.detail + ")", true);
+                             (detail.empty() ? std::string() : " (" + detail + ")") + "; nothing of it runs on this PC");
+        monitor_.ModelState(name, a.hello.server, a.hello.device, detail.empty() ? "ready" : "ready (" + detail + ")", true);
         return nullptr;
     } catch (...) {
         return real->CreateStatus(ORT_FAIL, "BFA Remote Bridge: the model couldn't be set up; lines get the game's own lip sync");

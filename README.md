@@ -27,7 +27,8 @@ attaches to BFA in memory when the game starts.
   loads a model, the bridge asks the server to load the same file (matched by name, size and SHA-256); every run then
   goes to the server, BFA's warm-up run included.
 - **There is no local fallback.** A late lip sync looks worse than none, and running the model on the processor
-  stutters too:
+  stutters too. The runtime's other ways to make a session (from memory, with prepacked weights, the model editor's)
+  are refused with an error naming them, since a model loaded so would run on this PC:
   - With no server address set, BFA's model isn't loaded and lip sync is the game's own; a note says so once.
   - If the server can't load the model (it isn't running, it lacks the file or has another copy), BFA's model isn't
     loaded, and lip sync is the game's own. Start the server, then reload the model in BFA's menu or restart the game.
@@ -43,8 +44,10 @@ attaches to BFA in memory when the game starts.
 - **Any BFA version is tried.** The bridge finds out what doesn't work by what happens, not by a version number: it
   serves the ONNX Runtime API version BFA asks for, older or newer than the 1.24.4 it knows (an entry newer than
   1.24.4's answers with an error, so whatever needs it gets the game's own lip sync, and the log names it), and the
-  server matches the model files. If the bridge can't attach to BFA at all, or BFA's runtime is one it can't serve,
-  it says so on screen, and BFA runs on this PC as it would without the bridge: update the bridge.
+  server matches the model files. A runtime the bridge can't serve (older than 1.10, or newer than it serves) is
+  known to be incompatible: BFA's model isn't loaded, lip sync is the game's own, and a note says what to update. If
+  the bridge can't attach to BFA at all, it says so on screen, and BFA runs on this PC as it would without the bridge:
+  update the bridge.
 
 ## Requirements
 
@@ -99,7 +102,8 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 - In GPU mode BFA also reacts to a refused model load or a failed warm-up as to a failing card: with its independent
   device it turns its GPU route off until you press "Try GPU again" in its menu. Another reason for Force CPU.
 - BFA's CPU route sets none of the fixed input sizes its GPU route gives the runtime, so the server builds its
-  sessions without them; whether it should set them itself is proposed to PandorumLLM's side.
+  sessions without them. Both sides measure one session with Force CPU before deciding whether the server should set
+  them ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), "To measure").
 
 ## Settings
 
@@ -108,7 +112,7 @@ the bridge: the hardware the model runs on is chosen in PandorumLLM.
 
 | Setting | Default | What it does |
 |---|---|---|
-| Server address | (empty) | The address of PandorumLLM's PC on your local network. Needed until PandorumLLM can be found by itself (its current version can't be yet). Empty: lip sync is the game's own, and a note says so once. |
+| Server address | (empty) | The address of PandorumLLM's PC on your local network. Empty means no server: BFA's model isn't loaded, lip sync is the game's own, and a note says so once. Finding PandorumLLM's PC by itself comes with bridge 1.3.0 ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md)). |
 | Port | 7871 | The A2F server's port, as set in PandorumLLM. Used with the address above. |
 | Status on load | on | Shows on screen, at each game load and when a model is served, which card and server run each of BFA's models. Notes about lines getting the game's own lip sync show either way. |
 | Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt. |
@@ -127,12 +131,17 @@ The bridge tells you on screen what the server does, one line per model, from th
 
 - when a model is served, and at each game load (while **Status on load** is on): "BFA Remote Bridge: a2f3_fp16.onnx
   on NVIDIA GeForce RTX 5090 (DirectML 3), PandorumLLM v3.97-p6 Beta A2F: ready";
-- whenever a model's card, server or state changes, such as a model the server no longer has ready;
-- when lines fall back to the game's own lip sync, with the reason: the first time, then at most once a minute while
-  it lasts: "BFA Remote Bridge: a2f3_fp16.onnx: lines get the game's own lip sync, since the server didn't answer in
+- whenever a model's card, server or state changes, such as a model the server no longer has ready, or one it
+  refuses at a load, with the server's detail: "BFA Remote Bridge: a2f3_fp16.onnx on NVIDIA GeForce RTX 5090 (DirectML
+  3), PandorumLLM v3.97-p6 Beta A2F: not ready (different file) (...)";
+- when lines fall back to the game's own lip sync, with the reason, at most once a minute however the lines
+  alternate: "BFA Remote Bridge: a2f3_fp16.onnx: lines get the game's own lip sync, since the server didn't answer in
   time.";
-- once when lines are back on the server: "BFA Remote Bridge: a2f3_fp16.onnx: lines are back on the server.";
-- once per session: no server address set, BFA set to GPU, or the bridge unable to attach.
+- when lines are back on the server after such a note, at most once a minute: "BFA Remote Bridge: a2f3_fp16.onnx:
+  lines are back on the server." (without the model when another model's line came back);
+- once per session: no server address set, BFA set to GPU, the bridge unable to attach, or a runtime it can't serve.
+
+No path reaches a note: a server's detail loses any folder first.
 
 Every note begins with "BFA Remote Bridge:" and uses plain words (Skyrim's fonts can't draw emoji). The notes are
 Skyrim's own corner notifications, so SkyrimNet sees each one as a `notification` event: a SkyrimNet workflow trigger
@@ -180,9 +189,10 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | "no server address is set" | Enter the address of PandorumLLM's PC on SkyrimNet's page, save, and restart. |
 | "SkyrimNet wasn't found" | Install SkyrimNet Beta26 or later: the settings are read from it. |
 | "the server isn't answering" | Start PandorumLLM's A2F server, check the address and port, set its Remote IP to the gaming PC, and allow the port through the server PC's firewall (private networks only). Then reload the model in BFA's menu, or restart. |
-| "the server refused the access key" | PandorumLLM asks for no key today; check its A2F settings. |
+| "the server refused the access key" | The bridge has no access key any more: turn the key off in PandorumLLM's A2F settings. |
 | "the server lacks ... or has a different copy" | Copy the gaming PC's `BetterFacialAnimations` folder to the server's Model folder again: the two must be the same BFA version. |
 | "couldn't attach to Better Facial Animations" | This BFA looks ONNX Runtime up in a way the bridge doesn't know, or another mod loaded it first: the log says which. BFA runs on this PC as usual; update the bridge. |
+| "uses ONNX Runtime ..., which the bridge can't serve" | BFA's model isn't loaded and lip sync is the game's own. For a runtime newer than the bridge knows, update the bridge; for one older than 1.10, update BFA. |
 | "runtime entry ... which the bridge doesn't know" | This BFA's runtime is newer than the bridge knows: update the bridge. |
 | Lips on the game's own animation now and then | The notes and the log's "not answered" lines and summaries say why. |
 | "BFA is set to GPU" | Tick Force CPU in BFA's menu (see above). |

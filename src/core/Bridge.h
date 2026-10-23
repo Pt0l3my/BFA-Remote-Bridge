@@ -10,8 +10,9 @@
 //     returns an error status naming it (NewerEntry). The bridge can't tell which of them could meet its sessions,
 //     so none of them reaches the runtime: a run that needs one fails safely, and the log and the monitor name it;
 //   - a runtime older than API version 10 (whose table length the header can't tell), one whose version can't be
-//     read, or an API version past kNewestOrtApi: the real table, untouched. BFA then runs as it would without the
-//     bridge, and the bridge says so ("Update the bridge").
+//     read, or an API version past kNewestOrtApi: known to be incompatible, so GetApi answers null. BFA then has no
+//     model (its own "wrong version"), lip sync is the game's own, and the note says to update the bridge (or BFA,
+//     for a runtime older than 1.10).
 //
 // With the bridge, no BFA model runs on this PC: every model load is the server's or is refused.
 //
@@ -32,8 +33,10 @@
 // GetExecutionProviderApi ("DML" at API version 24: a copy of the real OrtDmlApi table with its three
 // SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
 // to see that BFA is set to use the graphics card, which the bridge reports. Every one of these passes the call
-// through unchanged. Every other entry that takes a session answers a bridge session with an error status. Everything
-// else is the real runtime.
+// through unchanged. Every other entry that takes a session answers a bridge session with an error status. The
+// runtime's other session makers (CreateSessionFromArray, the two with prepacked weights, the model editor's three)
+// answer with an error status naming them, since a model loaded so would run on this PC. Everything else is the real
+// runtime.
 
 #include <atomic>
 #include <chrono>
@@ -133,7 +136,8 @@ public:
     void OnReleaseOptions(const OrtSessionOptions* options);
     void OnGpuOptions(const OrtSessionOptions* options);
     void OnNewerEntry(std::size_t index);
-    void OnCantServe(const std::string& why);
+    void OnCantServe(const std::string& runtime, const std::string& why, bool newer);
+    void OnUnservedEntry(const std::string& name);
     OrtStatus* CreateSession(const OrtApi* real, const OrtEnv* env, const ORTCHAR_T* path, const OrtSessionOptions* options,
                              OrtSession** out) noexcept;
     void ReleaseSession(const OrtApi* real, OrtSession* session) noexcept;
@@ -193,6 +197,7 @@ private:
     std::uint64_t nextOrder_ = 1;
     bool gpuLogged_ = false;
     std::vector<std::size_t> newerLogged_;
+    std::vector<std::string> unservedLogged_;
 
     mutable std::mutex statsMutex_;
     Stats stats_;

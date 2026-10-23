@@ -2,8 +2,8 @@
 
 ## 1.2.0
 
-Protocol version 1 is unchanged; it works with PandorumLLM v3.97-p6. What would need the server's side is proposed to
-it first.
+Protocol version 1 is unchanged; it works with PandorumLLM v3.97-p6. What needs the server's side is agreed with it,
+in two stages: [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md).
 
 - **Not an alternative to BFA: a bridge to PandorumLLM's A2F server.** The README says so at the top, says that BFA
   stays installed (with Force CPU ticked) and how to give PandorumLLM's PC the same BFA files.
@@ -16,7 +16,7 @@ it first.
   note says so once. Before, BFA then ran its model on this PC.
 - **The monitor.** One line per model with the card and the server that run it and its state, at each load (Status
   on load) and whenever they change; a note when lines fall back to the game's own lip sync, naming the reason, at
-  most one a minute while it lasts; one when lines are back on the server. The reasons are one list
+  most one a minute, however the lines alternate; one when lines are back on the server, at most one a minute. The reasons are one list
   (`src/core/Reasons.h`). Every note begins with "BFA Remote Bridge:" and goes through one function, Skyrim's corner
   note today (which SkyrimNet sees as a `notification` event), ready for SkyrimNet's own notification call.
 - **The server is told of fallbacks:** within seconds of one, at most every 30 seconds, a status check carries its
@@ -25,11 +25,18 @@ it first.
 - **Any BFA is tried.** The 4.3.x gate is gone. The ONNX Runtime API version BFA asks for is served from the real
   table: for an older runtime, only as many entries as its version has (a count per API version, checked against the
   header), never reading past its table; for a newer version, 1.24.4's entries wrapped as before and every entry
-  past them answered with an error status naming it. A runtime the bridge can't serve (older than API version 10,
-  or an API version past 30) gets the real table, and a note says to update the bridge.
+  past them answered with an error status naming it (GetExperimentalFunction, index 422, with null: its "not
+  available"). A runtime the bridge can't serve (older than API version 10, an unreadable version, or an API version
+  past 30) is known to be incompatible: BFA gets no table, so it has no model and lip sync is the game's own, and a
+  note says to update the bridge (or BFA, for a runtime older than 1.10).
 - **BFA's GPU mode is reported, not changed:** once per session, on screen whatever Status on load says, with "Tick
   Force CPU in BFA's menu". The bridge changes nothing else of BFA's.
-- A model load BFA retries after a refusal is logged once until the refusal changes.
+- A model load BFA retries after a refusal is logged once until the refusal changes. A model the server answers as
+  not ready shows on screen with the server's detail, which, like every server text shown or logged, loses any path
+  first.
+- **The runtime's other session makers are refused:** CreateSessionFromArray, the two with prepacked weights and the
+  model editor's three answer with an error status naming them, logged once, since a model loaded so would run on
+  this PC.
 
 ## 1.1.1
 

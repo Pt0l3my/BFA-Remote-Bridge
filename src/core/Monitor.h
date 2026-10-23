@@ -5,9 +5,10 @@
 //   a model's state     a line when its server, its card or its state changed ("ready", "not ready (...)"); a ready
 //                       line only while Status on load allows it, a line about a problem always
 //   a game load         every model's line, while Status on load allows it
-//   a fallback          a line falls back: the first note, then at most one a minute while fallbacks last, each naming
-//                       the latest reason (core/Reasons.h)
-//   back on the server  the first answered line after a fallback note, once
+//   a fallback          a line falls back: a note naming its reason (core/Reasons.h), at most one a minute, however
+//                       the lines alternate
+//   back on the server  the first answered line after a fallback note, at most one a minute: named by its model
+//                       when it is the one the note named
 //   once per session    a note said once (BFA's GPU route, no server address, the bridge can't attach)
 //
 // Every note goes to one function, the sink (src/plugin/Main.cpp's ShowNote: Skyrim's own on-screen note today,
@@ -60,8 +61,11 @@ private:
     bool showStatus_ = true;
     std::map<std::string, Entry> models_;
     std::set<std::string> said_;
-    bool inFallback_ = false;
+    bool inFallback_ = false;  // a fallback note was shown and no back note since
+    bool anyFallback_ = false, anyBack_ = false;
     Clock::time_point lastFallback_{};
+    Clock::time_point lastBack_{};
+    std::string fallbackModel_;
 };
 
 }  // namespace bfarb

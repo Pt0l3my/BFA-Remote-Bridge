@@ -208,7 +208,8 @@ PandorumLLM's choice; the bridge reports it.
 - **The API version BFA asks for** (`GetApi(N)`) is served from the real table:
   - N up to 24: a copy of the runtime's entries, only as many as the runtime's own API version (read from its
     `GetVersionString`) has: OrtApi is append-only, and the bridge knows each version's first entry from 1.11 on (by
-    its `\since` note in the 1.24.4 header), so it never reads past a shorter table. The entries below are replaced,
+    its `\since` note in the 1.24.4 header; each version's count is also checked against ONNX Runtime's own
+    published sizes, such as 390 entries for 1.23), so it never reads past a shorter table. The entries below are replaced,
     each only where the runtime has it; the device check on tensors (`MemoryInfoGetDeviceType`, since 1.14) is
     skipped for an older runtime.
   - N from 25 to 30, of a runtime that has it: 1.24.4's entries as above, then every entry past them answered by the
@@ -218,8 +219,16 @@ PandorumLLM's choice; the bridge reports it.
     stubs take no parameters: both x64 calling conventions leave the arguments to the caller. One limit: an entry
     that returns something other than a status (a table, a string) gets a status pointer, which BFA would misread;
     the log names the entry first.
+    `GetExperimentalFunction` (index 422, since 1.28) returns a function pointer: its stub answers null, its
+    documented "not available".
   - A runtime older than API version 10 (whose table length the header can't tell), one whose version can't be read,
-    or N past 30: the real table, untouched; BFA runs as it would without the bridge, and a note says to update it.
+    or N past 30: known to be incompatible, so `GetApi` answers null. BFA then has no model (its own "wrong
+    version"), lip sync is the game's own, nothing runs on this PC, and a note says to update the bridge (or BFA, for
+    a runtime older than 1.10).
+  - The runtime's other session makers (`CreateSessionFromArray`, `CreateSessionWithPrepackedWeightsContainer`,
+    `CreateSessionFromArrayWithPrepackedWeightsContainer`, and the model editor's `CreateSessionFromModel`,
+    `CreateModelEditorSession` and `CreateModelEditorSessionFromArray`) answer with an error status naming them,
+    without the runtime, logged once with a note: a model loaded so would run on this PC.
   - The model editor's table is served only to BFA asking at most 24 of a runtime at least that new (its layout is
     1.24.4's); otherwise `GetModelEditorApi` answers null, as a minimal build does. The DirectML table is wrapped
     only at version 24 of such a runtime.
@@ -270,7 +279,7 @@ PandorumLLM's choice; the bridge reports it.
   - **PING** on a main connection idle for 60 seconds whose HELLO was answered and listed models. PONG must come
     within the run timeout; a missing one closes the connection and starts the pause and the reconnect.
   - **Status checks:** every 5 minutes, only when the counters changed since the last one, HELLO with no models (the
-    counters in its client string) on a connection of its own, then closed. Also once when the bridge comes on, and
+    counters in its client string) on a connection of its own, then closed. Also once when a server address is set, and
     within seconds of a line falling back (at most one every 30 seconds), with the fallback's reason in the client
     string (`fallback REASON`, the latest when several came meanwhile).
   - **Never past a run's timeout:** its connect and the 60-second HELLO of a reconnect go on a new connection, outside
@@ -300,8 +309,10 @@ PandorumLLM's choice; the bridge reports it.
   server either way." BFA's CPU route sets no free-dimension overrides, so its HELLO lists none.
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
-  game load (ready lines only while Status on load allows them); a note when lines fall back, the first then at most
-  one a minute while it lasts, naming the reason; one when lines are back on the server. Every note goes through one
+  game load (ready lines only while Status on load allows them), a model load the server refuses included, with its
+  detail; a note when lines fall back, naming the reason, at most one a minute however the lines alternate; one when
+  lines are back on the server after such a note, at most one a minute. Every server text shown or logged loses any
+  path first (`ScrubPaths`). Every note goes through one
   function (the plugin's `ShowNote`): Skyrim's corner note today, which SkyrimNet sees as a `notification` event.
 - **The log**, `BFARemoteBridge.log` in SKSE's log folder, times in UTC: BFA found or not, its version, the attachment,
   the settings (the address and the key only as set or not), each model's size, SHA-256 and overrides, the server's

@@ -224,6 +224,9 @@ TEST(StatusTexts) {
                                             "bridge. Update the bridge."));
     f.hooked = true;
     CHECK(LoadStatusText(f).empty());  // the monitor's lines follow
+    CHECK_EQ(CantServeText("4.5.0", "1.31.0", true), std::string("BFA Remote Bridge: Better Facial Animations 4.5.0 uses ONNX Runtime 1.31.0, "
+                                                               "which the bridge can't serve, so lip sync is the game's own. Update the bridge."));
+    CHECK(CantServeText("3.0.0", "1.9.0", false).find("Update Better Facial Animations.") != std::string::npos);
     CHECK(NoServerText(true).find("no server address is set, so lip sync is the game's own") != std::string::npos);
     CHECK(NoServerText(false).find("SkyrimNet wasn't found") != std::string::npos);
     CHECK(GpuText().find("Tick Force CPU in BFA's menu") != std::string::npos);
@@ -241,7 +244,7 @@ TEST(StatusTexts) {
         CHECK(!w.empty());
         for (unsigned char c : FallbackLine("", w)) CHECK(c < 0x80);
     }
-    for (const std::string& t : {NoServerText(true), NoServerText(false), GpuText(), CantAttachText("", ""), BackLine("")}) {
+    for (const std::string& t : {NoServerText(true), NoServerText(false), GpuText(), CantAttachText("", ""), CantServeText("", "", true), BackLine("")}) {
         CHECK(t.rfind("BFA Remote Bridge: ", 0) == 0);
         for (unsigned char c : t) CHECK(c < 0x80);
     }
@@ -282,9 +285,46 @@ TEST(MonitorLinesAndTheirRate) {
     m.Answered("a2f3_fp16.onnx");
     CHECK_EQ(notes.size(), std::size_t{5});
     CHECK_EQ(notes.back(), std::string("BFA Remote Bridge: a2f3_fp16.onnx: lines are back on the server."));
-    // a new fallback after that is said at once
+    // lines that alternate (one in five missed): still at most one fallback note and one back note a minute
+    for (int i = 0; i < 20; ++i) {
+        g_monitorNow += std::chrono::seconds(2);
+        m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+        m.Answered("a2f3_fp16.onnx");
+    }
+    CHECK_EQ(notes.size(), std::size_t{5});  // 40 s since the last of each: none
+    g_monitorNow += std::chrono::seconds(20);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{7});  // a minute on: one of each
+    for (int i = 0; i < 20; ++i) {
+        g_monitorNow += std::chrono::seconds(2);
+        m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+        m.Answered("a2f3_fp16.onnx");
+    }
+    CHECK_EQ(notes.size(), std::size_t{7});
+    // a back line names its model only when the fallback note named the same one
+    g_monitorNow += std::chrono::seconds(60);
     m.Fallback(Reason::ServerError, "emotion_fp16.onnx", "the server couldn't run it");
-    CHECK_EQ(notes.size(), std::size_t{6});
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{9});
+    CHECK_EQ(notes.back(), std::string("BFA Remote Bridge: lines are back on the server."));
+    // a back note held by the minute comes with a later answer
+    g_monitorNow += std::chrono::seconds(60);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{10});
+    g_monitorNow += std::chrono::seconds(1);
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{11});
+    g_monitorNow += std::chrono::seconds(59);
+    m.Fallback(Reason::TimedOut, "a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{12});
+    m.Answered("a2f3_fp16.onnx");  // within the minute of the last back note: held
+    CHECK_EQ(notes.size(), std::size_t{12});
+    g_monitorNow += std::chrono::seconds(1);
+    m.Answered("a2f3_fp16.onnx");
+    CHECK_EQ(notes.size(), std::size_t{13});
+    CHECK(!m.InFallback());
+    notes.resize(6);
     // once per session
     m.Once("gpu", "BFA Remote Bridge: gpu");
     m.Once("gpu", "BFA Remote Bridge: gpu");
@@ -320,6 +360,13 @@ TEST(OrtApiStartsMatchTheHeader) {
     unsigned since = 0, pending = 0;
     std::string line;
     const auto entryName = [](const std::string& l) -> std::string {
+        // ORT_API_T(RETURN_TYPE, NAME, ...): the name is the second argument
+        if (const auto at = l.find("ORT_API_T("); at != std::string::npos) {
+            const auto comma = l.find(',', at);
+            if (comma == std::string::npos) return {};
+            const auto from = l.find_first_not_of(' ', comma + 1);
+            return l.substr(from, l.find_first_of(",)", from) - from);
+        }
         for (const char* m : {"ORT_API2_STATUS(", "ORT_CLASS_RELEASE("}) {
             const auto at = l.find(m);
             if (at == std::string::npos) continue;
@@ -357,6 +404,12 @@ TEST(OrtApiStartsMatchTheHeader) {
         last = s.index;
     }
     CHECK_EQ(kKnownOrtEntries, std::size_t{415});
+    // each version's count pinned to ONNX Runtime's own static_asserts (onnxruntime_c_api.cc, "Size of version N"),
+    // not to the bridge's list
+    const std::map<unsigned, std::size_t> published = {{10, 204}, {11, 210}, {12, 219}, {13, 225}, {14, 239}, {15, 255},
+                                                       {16, 266}, {17, 276}, {18, 280}, {19, 280}, {20, 285}, {21, 285},
+                                                       {22, 318}, {23, 390}, {24, 415}};
+    for (const auto& [version, count] : published) CHECK_EQ(OrtApiEntries(version), count);
     CHECK_EQ(OrtApiEntries(9), std::size_t{0});
     CHECK_EQ(OrtApiEntries(10), starts.front().index);
     CHECK_EQ(OrtApiEntries(18), OrtApiEntries(19));  // 19 and 21 added nothing
