@@ -8,7 +8,8 @@
 //   main menu,      registered them; also whenever that page is saved. The first read starts the background
 //   pre-load game   thread, which looks the server's name up (again after each change of the address or port),
 //                   or, with the address empty, searches the local network for it (FIND), says HELLO with no
-//                   models and logs the answer
+//                   models and logs the answer. Lip sync in scenes takes each read at once (SceneHook.cpp); its
+//                   hook is installed at data loaded, once the scene factions are loaded
 //   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
 //                   the monitor's lines (src/core/Monitor.h; setting showStatus)
 //   game saved      BFA's CPU mode written again, while a server answered in protocol version 2 this session
@@ -84,6 +85,7 @@ void ApplySettings(const char* when) {
     g_settingsRead = true;
     for (const auto& w : warnings) Log(Level::Warn, "Setting " + w);
     Log(Level::Info, std::string("Settings (") + when + "): " + Describe(s));
+    SetSceneLipSync(s.sceneLipSync, s.logDetail == LogDetail::Detailed);  // at once, without the client
     g_bridge->Apply(s);  // starts the background thread, which looks the server up or searches for it
 }
 
@@ -159,7 +161,17 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                     Log(Level::Warn, "SKSE's mod event source isn't there: a save on SkyrimNet's page applies at the next game load");
                 static MenuSink menus;
                 if (auto* ui = RE::UI::GetSingleton()) ui->AddEventSink<RE::MenuOpenCloseEvent>(&menus);
-                ApplySettings("data loaded");
+                bool applied = true;
+                try {
+                    ApplySettings("data loaded");
+                } catch (...) {
+                    applied = false;
+                }
+                if (applied)
+                    InstallSceneHook();  // BFA finds its scene factions at this message too
+                else
+                    Log(Level::Warn, "The settings couldn't be applied at data loaded, so lip sync in scenes isn't installed: BFA leaves "
+                                     "the faces of everyone in a scene to the scene, as without the bridge");
                 break;
             }
             case SKSE::MessagingInterface::kPreLoadGame:

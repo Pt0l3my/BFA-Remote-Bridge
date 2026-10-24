@@ -19,6 +19,10 @@ bool FindImportSlot(const std::uint8_t* image, std::size_t size, std::string_vie
 // The RVA of the export named `name`. False when there is none (or it is forwarded).
 bool FindExport(const std::uint8_t* image, std::size_t size, std::string_view name, std::uint32_t& rva);
 
+// The size of a loaded module's image (its optional header's SizeOfImage), read from its headers' first `readable`
+// bytes: 0 unless they hold an MZ header, the PE signature and a PE32+ optional header with a size.
+std::size_t ImageSize(const std::uint8_t* image, std::size_t readable);
+
 // Lays a DLL file's sections out at their RVAs, as the loader would (no relocations, no imports bound). For the tests.
 bool MapFile(const std::vector<std::uint8_t>& file, std::vector<std::uint8_t>& image);
 

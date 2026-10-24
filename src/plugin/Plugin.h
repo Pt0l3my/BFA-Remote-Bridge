@@ -1,6 +1,6 @@
 #pragma once
-// The plugin's parts (Windows only): the hook in Better Facial Animations' import of GetProcAddress, SkyrimNet's
-// settings, the Winsock transport and search, and the log.
+// The plugin's parts (Windows only): the hook in Better Facial Animations' import of GetProcAddress, the scene hook
+// (lip sync in scenes), SkyrimNet's settings, the Winsock transport and search, and the log.
 
 #include <string>
 #include <vector>
@@ -25,6 +25,15 @@ struct BfaFacts {
 // import address table's GetProcAddress, so its lookup of onnxruntime.dll's OrtGetApiBase gets the bridge's. Leaves
 // everything alone when BFA isn't loaded, its runtime already is loaded, or the patch can't be made.
 BfaFacts FindAndHookBfa();
+
+// ---- SceneHook.cpp
+
+// Lip sync in scenes (core/SceneLipSync.h): at the data-loaded message, once, redirects Actor::IsInFaction on
+// Character's and PlayerCharacter's vtables so BFA's own scene checks are answered "not in a scene" while the setting
+// is on; or installs nothing, and changes nothing, when anything isn't as expected. One log line either way.
+void InstallSceneHook();
+// The setting and the log detail, from any thread; the thunk reads them at its next call.
+void SetSceneLipSync(bool on, bool detailed);
 
 // ---- SkyrimNet.cpp
 

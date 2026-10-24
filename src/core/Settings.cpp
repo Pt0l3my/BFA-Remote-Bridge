@@ -119,6 +119,7 @@ const std::vector<SettingKey>& SettingKeys() {
     static const std::vector<SettingKey> keys = {
         {"serverAddress", SettingType::String, ""},
         {"serverPort", SettingType::Int, "7871", 1, 65535},
+        {"sceneLipSync", SettingType::Bool, "true"},
         {"showStatus", SettingType::Bool, "true"},
         {"logDetail", SettingType::Select, "Normal", 0, 0, {"Normal", "Detailed"}},
     };
@@ -130,6 +131,7 @@ Settings ReadSettings(const ConfigGetter& get, std::vector<std::string>* warning
     Settings s;
     s.serverAddress = r.String("serverAddress");
     s.serverPort = r.Int("serverPort");
+    s.sceneLipSync = r.Bool("sceneLipSync");
     s.showStatus = r.Bool("showStatus");
     s.logDetail = r.Select("logDetail") == "Detailed" ? LogDetail::Detailed : LogDetail::Normal;
     return s;
@@ -138,7 +140,8 @@ Settings ReadSettings(const ConfigGetter& get, std::vector<std::string>* warning
 std::string Describe(const Settings& s) {
     return std::string("server address ") + (s.serverAddress.empty() ? "not set (searched for on the local network)" : "set") + ", port " +
            std::to_string(s.serverPort) +
-           ", timeout " + std::to_string(s.timeoutMs) + " ms, status on load " +
+           ", timeout " + std::to_string(s.timeoutMs) + " ms, lip sync in scenes " + (s.sceneLipSync ? "on" : "off") +
+           ", status on load " +
            (s.showStatus ? "on" : "off") + ", log detail " + (s.logDetail == LogDetail::Detailed ? "Detailed" : "Normal");
 }
 

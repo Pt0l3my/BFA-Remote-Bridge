@@ -82,10 +82,11 @@ TEST(SettingsDefaults) {
     CHECK_EQ(s.timeoutMs, kRunTimeoutMs);
     CHECK_EQ(kRunTimeoutMs, 1000);
     CHECK(s.showStatus);
+    CHECK(s.sceneLipSync);
     CHECK(s.logDetail == LogDetail::Normal);
     CHECK(ReadSettings(nullptr) == Settings{});
-    // the page holds four keys; 1.1's removed ones are never asked for
-    CHECK_EQ(SettingKeys().size(), std::size_t{4});
+    // the page holds five keys; 1.1's removed ones are never asked for
+    CHECK_EQ(SettingKeys().size(), std::size_t{5});
     std::vector<std::string> asked;
     ReadSettings([&](std::string_view k, std::string_view def) {
         asked.emplace_back(k);
@@ -100,6 +101,7 @@ TEST(SettingsParseAndClamp) {
     std::map<std::string, std::string> values = {
         {"enabled", "False"},   {"serverAddress", " \"192.0.2.10\" "}, {"serverPort", "99999"}, {"accessKey", "'k e y'"},
         {"timeoutMs", "10000.6"}, {"checkCalls", "3"},                  {"showStatus", "no"},    {"logDetail", "detailed"},
+        {"sceneLipSync", "off"},
     };
     std::vector<std::string> warnings;
     const auto get = [&](std::string_view k, std::string_view def) {
@@ -112,16 +114,18 @@ TEST(SettingsParseAndClamp) {
     CHECK(s.accessKey.empty());
     CHECK_EQ(s.timeoutMs, kRunTimeoutMs);
     CHECK(!s.showStatus);
+    CHECK(!s.sceneLipSync);
     CHECK(s.logDetail == LogDetail::Detailed);
     CHECK_EQ(warnings.size(), std::size_t{1});  // the port
 
-    values = {{"serverPort", "port"}, {"showStatus", "maybe"}, {"logDetail", "Verbose"}};
+    values = {{"serverPort", "port"}, {"showStatus", "maybe"}, {"logDetail", "Verbose"}, {"sceneLipSync", "sometimes"}};
     warnings.clear();
     s = ReadSettings(get, &warnings);
     CHECK_EQ(s.serverPort, 7871);
     CHECK(s.showStatus);
+    CHECK(s.sceneLipSync);
     CHECK(s.logDetail == LogDetail::Normal);
-    CHECK_EQ(warnings.size(), std::size_t{3});
+    CHECK_EQ(warnings.size(), std::size_t{4});
 
     // a getter that throws gives the default
     s = ReadSettings([](std::string_view, std::string_view) -> std::string { throw 1; });

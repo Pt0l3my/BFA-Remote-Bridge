@@ -120,6 +120,17 @@ bool FindExport(const std::uint8_t* image, std::size_t size, std::string_view na
     return false;
 }
 
+std::size_t ImageSize(const std::uint8_t* image, std::size_t readable) {
+    if (!image) return 0;
+    const View v(image, readable);
+    std::uint16_t mz = 0, magic = 0;
+    std::uint32_t lfanew = 0, sig = 0, sizeOfImage = 0;
+    if (!v.U16(0, mz) || mz != 0x5A4D || !v.U32(0x3C, lfanew) || !v.U32(lfanew, sig) || sig != 0x00004550) return 0;
+    const std::size_t opt = static_cast<std::size_t>(lfanew) + 24;
+    if (!v.U16(opt, magic) || magic != kPe32Plus || !v.U32(opt + 56, sizeOfImage)) return 0;
+    return sizeOfImage;
+}
+
 bool MapFile(const std::vector<std::uint8_t>& file, std::vector<std::uint8_t>& image) {
     const View v(file.data(), file.size());
     std::uint32_t lfanew = 0, sig = 0, sizeOfImage = 0, sizeOfHeaders = 0;

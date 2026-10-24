@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.4.0
+
+Lip sync in scenes. Protocol versions 1 and 2 are unchanged, and the server isn't involved.
+
+- **The scene answer, for BFA only.** Better Facial Animations 4.3.2 leaves the face of anyone in a SexLab or OStim
+  scene to the scene: its scene check asks the actor's virtual `Actor::IsInFaction` about SexLab.esm 0xE50F
+  (SexLabAnimatingFaction), OStim.esp 0xECA (OStimActorCountFaction) and OStim.esp 0xD93 (OStimExcitementFaction), from
+  seven places (the provider's actor check, which gives SkyrimNet "Declined/InScene", a line's start, the face's
+  update every frame, its morphs and its gaze among them). At the data-loaded message the bridge finds the three
+  factions by plugin and local ID (ignoring the plugin name's case, light plugins included; never by EditorID; a
+  plugin that isn't loaded resolves to nothing) and redirects slot 0xF9 of the main vtables of `Character` and
+  `PlayerCharacter` (CommonLibSSE-NG's `VTABLE_Character` and `VTABLE_PlayerCharacter`; the slot as CommonLib's
+  `Actor.h` declares it and its `RelocateVirtual(0x0F9, 0x0FB)` calls it, SE and AE) to a thunk per vtable. The thunk
+  answers `false` only while the setting is on, for one of the three factions found, asked from inside
+  `BetterFacialAnimations.dll`'s image (the call's return address); every other call goes to the game's function it
+  replaced. The decision is `src/core/SceneLipSync.h`, tested on Linux; the hook is `src/plugin/SceneHook.cpp`.
+- **Fail safe.** Nothing is installed, and nothing changed, when BFA isn't loaded, its image's range can't be read
+  from its headers, none of the factions is loaded, a slot isn't in the game's image or doesn't hold a function in the
+  game's code (another mod redirected it first), or a vtable can't be written (a first one already written is then put
+  back). One log line says which. The thunks change an answer only once both vtables are written (an atomic
+  "installed" flag): should the first also fail to be put back, its thunk stays and passes every call on, and the log
+  line says exactly that. If the settings can't be applied at the data-loaded message, one log line says so and the
+  hook isn't installed.
+- **The setting:** "Lip sync in scenes" (`sceneLipSync`, on by default) on SkyrimNet's page, under Lip sync. It takes
+  effect at once, on every read of the page: when off, the thunk passes every call through, and BFA's next check
+  hands a face in a scene back to the scene. It touches nothing of the client's (no reconnection).
+- **Logs.** One line at load: the hook installed, with the factions found (plugin, local ID, form ID) and those not
+  loaded, or why it wasn't. At Log detail Detailed only, one line for a line kept, at most one a minute, with the
+  speaker's form ID, the faction and the lines kept since the last such log line. BFA's per-frame checks are never
+  logged: a call is told by its site (the return address into the scene check's caller, from a stack capture taken
+  only at Detailed) and its actor. The same site asking about the same actor again within 5 ms is the same check
+  asking about the actor's next faction (OStim puts everyone in a scene in both of its), and counts for nothing; a site
+  asked about the same actor again within 250 ms is a per-frame one.
+- **PE:** `pe::ImageSize` reads a loaded module's SizeOfImage from its headers (MZ, PE signature, PE32+), for BFA's
+  and the game's ranges.
+- **Address Library** is now used for the two vtables (it was already required).
+- **Tests:** `tests/SceneTests.cpp`: each faction, other factions, callers inside and outside BFA's range, the
+  setting off, missing factions, form IDs in full and light plugins, plugin names (a longer name that starts with the
+  plugin's among them), the slot check, the call's site, the Detailed log's lines (an actor in both of OStim's
+  factions among them) and texts, the setting, and the image size (a wrong PE signature among them; BFA's own DLL too,
+  with `BFARB_BFA_DLL`).
+
 ## 1.3.0
 
 Protocol version 2, the agreement's stage 2 ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md)), written first in

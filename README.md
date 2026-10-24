@@ -9,7 +9,8 @@ server:
 
 - **BFA stays installed on the gaming PC.** Its game side (catching each line, reading the audio, fitting the face
   and moving it every frame) and its settings stay there. You set nothing in BFA's menu for the bridge (see
-  [BFA's mode](#bfas-mode)).
+  [BFA's mode](#bfas-mode)). With the bridge, BFA also animates speakers in an OStim or SexLab scene (see
+  [Lip sync in scenes](#lip-sync-in-scenes)).
 - **PandorumLLM's PC needs BFA's files too**: the server runs BFA's models there, so it needs the same models and
   runtime as your BFA folder. See [On PandorumLLM's PC](#on-pandorumllms-pc).
 - **What still runs on the gaming PC:** BFA's game side only. The model runs on the server, on the card PandorumLLM
@@ -21,6 +22,13 @@ is already busy drawing the game, each burst of inference pushes frames back and
 the arithmetic happens on the server's PC, and BFA gets the results back. BFA's program files are never changed: the
 bridge attaches to BFA in memory when the game starts. The one file of BFA's it writes is BFA's INI, to set its CPU
 mode (see [BFA's mode](#bfas-mode)).
+
+## What's new in 1.4.0
+
+- **Lip sync in scenes.** Better Facial Animations leaves the faces of everyone in an OStim or SexLab scene to the
+  scene, so their lines had no lip sync. With the new setting **Lip sync in scenes** (on by default), speakers in a
+  scene get BFA's lip sync and expression for their lines. Only BFA's own question is answered differently: OStim,
+  SexLab, SkyrimNet and the game see the scene as before. See [Lip sync in scenes](#lip-sync-in-scenes).
 
 ## What's new in 1.3.0
 
@@ -55,7 +63,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 
 - At start-up the bridge finds `BetterFacialAnimations.dll` and redirects its one lookup of ONNX Runtime's entry
   point, so BFA's calls to the runtime pass through the bridge. That is the only change it makes to BFA's code;
-  besides it, the bridge sets one setting in BFA's INI ([BFA's mode](#bfas-mode)).
+  besides it, the bridge sets one setting in BFA's INI ([BFA's mode](#bfas-mode)), and answers BFA's question whether
+  someone is in a scene ([Lip sync in scenes](#lip-sync-in-scenes)).
 - **With the bridge, no BFA model runs on the gaming PC**, neither on its graphics card nor on its processor. When BFA
   loads a model, the bridge asks the server to load the same file (matched by name, size and SHA-256); every run then
   goes to the server, BFA's warm-up run included.
@@ -160,6 +169,32 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5).
 - No setting and no note on screen: the log line is all.
 
+## Lip sync in scenes
+
+Better Facial Animations leaves the faces of everyone in an OStim or SexLab scene to the scene: it doesn't animate
+their lines, and SkyrimNet's log shows each such line as "given back (Declined/InScene)". With **Lip sync in scenes**
+on (the default), speakers in a scene get BFA's lip sync and expression for their lines, as anywhere else.
+
+- **Only BFA is answered differently.** BFA tells a scene by asking the game whether the speaker is in one of three
+  factions: SexLab's SexLabAnimatingFaction, and OStim's OStimActorCountFaction and OStimExcitementFaction. The bridge
+  answers "no" to those three questions when BFA asks them, and to nothing else. OStim, SexLab, SkyrimNet, the game
+  and every other mod get the true answer, so the scene itself runs as before.
+- **The trade-off.** While a line plays, BFA's expression sits over OStim's scene expression: the mouth, the brows
+  and the emotion are BFA's for the line, and the blinks and where the eyes look stay the scene's. A change of
+  expression OStim makes during a line shows once the line ends. When the line ends, the scene's expression fades
+  back in over about a second, but BFA draws it itself for up to five minutes after a line, as it does for anyone, so
+  the face can look softer around the mouth for a while after a line.
+- OStim's own voiced comments in a scene get BFA's lip sync too, as any line does; its moans don't.
+- BFA's own settings still apply in a scene: someone BFA doesn't animate elsewhere (by its NPC or race settings, or
+  its player setting) isn't animated in a scene either.
+- **It takes effect at once.** Turn it off on SkyrimNet's page, and BFA leaves faces in a scene to the scene again
+  from the next frame, a line already playing included.
+- It works with or without a server: it changes what BFA animates, not where the model runs.
+- Nothing about it shows on screen. The log says at load whether it was set up, with the scene factions found, or
+  why not: BFA isn't installed, neither OStim nor SexLab is, or the game's memory isn't as the bridge expects (another
+  mod changed the same function first, say). In each of those cases the bridge changes nothing, and BFA behaves as it
+  would without the bridge.
+
 ## Settings
 
 On SkyrimNet's Settings > Plugins page, under **BFA Remote Bridge**. The page holds only what the server can't tell
@@ -169,8 +204,9 @@ the bridge: the hardware the model runs on is chosen in PandorumLLM.
 |---|---|---|
 | Server address | (empty) | The address of PandorumLLM's PC on your local network. Empty means the bridge finds the server on the local network by itself (a PandorumLLM that speaks protocol version 2, its Remote IP set to the gaming PC). When none answers, BFA's model isn't loaded, lip sync is the game's own, and a note says so once. Enter the address for an older server. |
 | Port | 7871 | The A2F server's port, as set in PandorumLLM: used with the address above, and for finding the server when the address is empty. |
+| Lip sync in scenes | on | Better Facial Animations otherwise leaves the faces of everyone in an OStim or SexLab scene to the scene. With this on, speakers in a scene get BFA's lip sync and expression for their lines. Takes effect at once. See [Lip sync in scenes](#lip-sync-in-scenes). |
 | Status on load | on | Shows on screen, at each game load and when a model is served, which card and server run each of BFA's models. Notes about lines getting the game's own lip sync show either way. |
-| Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING and each reconnection attempt. |
+| Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and a line kept in a scene at most once a minute. |
 
 Bridge (on or off), Access key, Timeout and Check results, the settings of 1.1, are gone: with the bridge installed it
 takes over, PandorumLLM admits the gaming PC by its Remote IP, each call waits 1000 ms, and nothing of the model runs
@@ -178,7 +214,7 @@ on this PC to check against. Values saved for them are ignored.
 
 The bridge reads the settings when the game starts, when the main menu opens, before each save loads, and whenever
 you save the page. Until SkyrimNet has registered them, BFA's model loads are refused (BFA tries again 30 seconds
-later), so that the model never runs on this PC by mistake.
+later), so that the model never runs on this PC by mistake; Lip sync in scenes is on until then, as its default.
 
 ## The monitor
 
@@ -216,6 +252,8 @@ every 30 seconds) with the reason in its client string.
 - whether BFA was found, its version, and whether the bridge attached to it, or why not;
 - the ONNX Runtime BFA loaded, and any runtime or API version the bridge can't serve, or any newer entry BFA called;
 - the settings (the server address only as set or not);
+- at load, whether lip sync in scenes was set up, with the scene factions found (by plugin, local ID and form ID) and
+  those not loaded, or why it wasn't;
 - with the address empty, the server found on the local network, by its name and port (never its address), or that
   none answered;
 - the server's first answer at start-up (its name and device, such as "PandorumLLM ... A2F" on "DirectML 0: ..." or
@@ -236,10 +274,11 @@ every 30 seconds) with the reason in its client string.
 
 With Log detail set to Detailed it also logs one line per run, each connection opened or closed and why, each answer
 to HELLO, each unanswered PING, each late answer discarded, each background reconnection attempt and each status
-check sent for a fallback or NOTICE, each search sent and each datagram ignored, and BFA's GPU mode, once, as a
-fact.
+check sent for a fallback or NOTICE, each search sent and each datagram ignored, BFA's GPU mode, once, as a fact,
+and, at most once a minute, a line kept in a scene: the speaker's form ID, the scene faction, and how many lines were
+kept since the last such log line. The checks BFA makes every frame are never logged.
 
-The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.3.0
+The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.4.0
 (answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)", and every 5 minutes, when they changed, it sends
 them on a short connection of its own, so PandorumLLM's panel shows them.
 
@@ -257,6 +296,7 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | "uses ONNX Runtime ..., which the bridge can't serve" | BFA's model isn't loaded and lip sync is the game's own. For a runtime newer than the bridge knows, update the bridge; for one older than 1.10, update BFA. |
 | "runtime entry ... which the bridge doesn't know" | This BFA's runtime is newer than the bridge knows: update the bridge. |
 | Lips on the game's own animation now and then | The notes and the log's "not answered" lines and summaries say why. |
+| No lip sync in an OStim or SexLab scene | Check that **Lip sync in scenes** is on. The log's "Lip sync in scenes" line at load says whether it was set up, or why not. BFA's own settings still apply: someone BFA doesn't animate elsewhere isn't animated in a scene either. |
 
 ## Building
 
