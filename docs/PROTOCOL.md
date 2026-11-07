@@ -479,7 +479,7 @@ PandorumLLM's choice; the bridge reports it.
 - **Before the settings are read**: SkyrimNet registers the bridge's settings during its own start-up, so the bridge
   reads them at the data-loaded message, when the main menu opens, before each game loads and when its page is
   saved, and counts them read once SkyrimNet names the config. A model load before that is refused ("the bridge's
-  settings weren't read yet"; BFA tries a failed load again 30 seconds later, 60 for its emotion model in its CPU mode)
+  settings weren't read yet"; in its CPU mode BFA tries a failed load again 30 seconds later, 60 for its emotion model)
   while SkyrimNet is loaded, and as having
   no server address when SkyrimNet isn't.
 - **The server's name** is looked up once per change of the address or port, off the game's threads, and connections
@@ -516,12 +516,15 @@ PandorumLLM's choice; the bridge reports it.
     `added` when it held none, which the installer's files then decided. A card picked in BFA's menu since replaces N.
     Writes go through Windows' profile calls, each read back as BFA 5 reads the file. `IndependentGpuDevice` is never
     written.
-  - A server that answers only in version 1, or another BFA version, gets each value put back: ForceCPU 0 and
-    EmotionDevice N written back, or a key noted `added` removed, so BFA's installer choice applies again. Only when
-    the bridge's note reads as written and BFA's own INI still holds the bridge's value (ForceCPU 1, EmotionDevice -1):
-    when in doubt, nothing is put back. BFA's menu, saved later in that session, writes back what BFA loaded (the
-    bridge's values), so each game save of that session puts them back again, and the notes stay until a game start
-    finds BFA's own INI without the bridge's value (BFA has then loaded what was put back, or the player's own).
+  - A server that answers only in version 1, or another BFA version (once the bridge attaches to it and a server
+    answers: the put-back runs at an answer), gets each value put back: ForceCPU 0 and EmotionDevice N written back,
+    or a key noted `added` removed, so BFA's installer choice applies again. Only when the bridge's note reads as
+    written and BFA's own INI still holds the bridge's value (ForceCPU 1, EmotionDevice -1): when in doubt, nothing is
+    put back. BFA's menu, saved later in that session, writes back what BFA loaded (the bridge's values), so each game
+    save of that session puts them back again, and the notes stay until a game start finds BFA's own INI without the
+    bridge's value (BFA has then loaded what was put back, or the player's own). A start without BFA's INI leaves the
+    notes; the EmotionDevice note is cleared only at a start of BFA 5.0.6 and left alone by BFA 4.3.2.3's put-back.
+    BFA's INI there but unreadable at that moment: nothing is cleared or written, logged once.
   - It never creates BFA's INI. Logged once, at info level; no setting, no note. BFA's CPU route sets no
     free-dimension overrides; for BFA 4.3.2.3 its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
     for V3 and its emotion model (the sizes rule, ["Version 2"](#version-2)); for BFA 5.0.6 the bridge lists them

@@ -26,13 +26,17 @@ facts only.
   Windows (`Bfa5Number`, the bridge's own code; a long of 32 bits). Writes stay on the profile calls, each read back as
   BFA 5 reads the file: one BFA would read otherwise (a key given twice, a section hidden behind the byte-order mark)
   counts as failed, logged, and its record kept.
-- **A put-back that lasts.** A version 1 server or another BFA version puts each value back: ForceCPU 0 and
-  EmotionDevice N written back, or a key noted `added` removed, so the installer's files decide again. BFA's menu,
-  saved later in the same session, writes back what BFA loaded, the bridge's values among them (BFA 5's SaveIni, and
-  BFA 4.3.2.3's for ForceCPU), so each game save of that session now puts them back again, and a record stays until a
-  game start finds BFA's own INI without the bridge's value (`BfaCpuMode::OnStart`, at SKSE's post-load message, after
-  BFA has loaded its INI). Only a value still the bridge's in BFA's own INI is put back. The set line names only what
-  BFA reads on the CPU after the writes, and each failure is logged once per key.
+- **A put-back that lasts.** A version 1 server, or another BFA version once the bridge attaches to it and a server
+  answers, puts each value back: ForceCPU 0 and EmotionDevice N written back, or a key noted `added` removed, so the
+  installer's files decide again. BFA's menu, saved later in the same session, writes back what BFA loaded, the
+  bridge's values among them (BFA 5's SaveIni, and BFA 4.3.2.3's for ForceCPU), so each game save of that session now
+  puts them back again, and a record stays until a game start finds BFA's own INI without the bridge's value
+  (`BfaCpuMode::OnStart`, at SKSE's post-load message, after BFA has loaded its INI). A start without BFA's INI leaves
+  the records, since BFA loaded nothing of it; the EmotionDevice record is cleared only at a start of BFA 5.0.6, and
+  BFA 4.3.2.3's put-back leaves it, so a Mod Organizer 2 profile with 4.3.2.3 doesn't lose 5.0.6's record. BFA's INI
+  there but unreadable (`IniStore::BfaIni`, a third state): nothing is cleared or written at that start, answer or
+  save, and it is logged once. Only a value still the bridge's in BFA's own INI is put back. The set line names only
+  what BFA reads on the CPU after the writes, and each failure is logged once per key.
 - **BFA 5.0.6's sizes, listed by the bridge** (`src/core/BfaSizes.h`). In its CPU mode BFA sets no free-dimension
   overrides. For BFA 5.0.6 the bridge now lists the ones its GPU route sets, by BFA version and file name (every
   5.0.6.N alike): V3's four `_dynamic_axes_1` at 1; the Legacy model's two at BFA's `[General] Batch` (2 by default, at
@@ -52,8 +56,8 @@ facts only.
 - **Lip sync in scenes on 5.0.6, unchanged.** BFA 5.0.6 makes the same scene check, the same three factions through
   the actor's vtable (CommonLib's `IsInFaction` there reads slot 0xF9 and jumps to it, from BFA's one scene check, so
   the game's function returns into BFA's image), now beside its own ZaZ mouth-gear rule, which the bridge leaves
-  alone. No faction to add. Not yet seen in game on 5.0.6. The log words for a scene line now say what the bridge
-  knows: that it answered BFA's scene check.
+  alone. No faction to add. Not yet seen in game on 5.0.6. The log words for a scene line, and the Log detail setting's
+  description, now say what the bridge knows: that it answered BFA's scene check.
 - **Facts corrected.** BFA tries a failed emotion model again 60 seconds later on the CPU and 30 on a graphics card
   (4.3.2 and 5.0.6 alike); the README and PROTOCOL had them the wrong way round. BFA's warm-up is a run of silence,
   not of zeros for every model; BFA starts its worker after a new game too; the server's 4.3.2.3 fill covers V3 and
