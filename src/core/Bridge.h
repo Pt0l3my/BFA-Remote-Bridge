@@ -25,9 +25,10 @@
 //                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
 //                   in full, the call still succeeds (a tensor in graphics memory aside, below), with each requested
-//                   output a one-element float tensor holding NaN: BFA checks every answer it reads back, and one that
-//                   fails costs it that line alone, its model kept loaded, where an error status would make it drop
-//                   the model. A connection failure pauses the bridge (src/core/Client.h): runs answer so at once
+//                   output a one-element float tensor holding NaN: BFA checks every answer it reads back. For its
+//                   facial models one that fails costs it that line alone, the model kept loaded, where an error
+//                   status would make it drop the model; an emotion model is dropped and loaded again later either
+//                   way. A connection failure pauses the bridge (src/core/Client.h): runs answer so at once
 //                   until the background thread's HELLO is answered. Every run is counted once, answered or by its
 //                   reason.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.

@@ -9,7 +9,9 @@
 //                       the lines alternate
 //   back on the server  the first answered line after a fallback note, at most one a minute: named by its model
 //                       when it is the one the note named
-//   once per session    a note said once (no server found, no SkyrimNet, the bridge can't attach)
+//   once per session    a note said once (no server found, no SkyrimNet, the bridge can't attach, a runtime it can't
+//                       serve); once per name, a call the bridge can't send to the server; once per model, a model
+//                       whose data BFA hands it in graphics memory (core/Bridge.h)
 //
 // Every note goes to one function, the sink (src/plugin/Main.cpp's ShowNote: Skyrim's own on-screen note today,
 // SkyrimNet's notification call once its public API has one), outside the monitor's lock.
