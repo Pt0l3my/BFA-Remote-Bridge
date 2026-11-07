@@ -124,16 +124,26 @@ void BfaCpuMode::SetBfaVersion(const std::string& version) {
 
 bool BfaCpuMode::Bfa4Locked() const { return bfaVersion_ == kCpuModeBfaVersion; }
 
-// BFA's INI is there: the bridge never creates it (BFA would run its migrations on a file it didn't write).
-bool BfaCpuMode::PresentLocked() {
-    if (store_->BfaIniPresent()) return true;
-    if (!absentLogged_)
+// BFA's INI as found now, a missing or unreadable one logged once a session. Missing: the bridge never creates it (BFA
+// would run its migrations on a file it didn't write). Unreadable: what it holds can't be told, so nothing is changed.
+BfaIniState BfaCpuMode::StateLocked() {
+    const BfaIniState state = store_->BfaIni();
+    if (state == BfaIniState::Missing && !absentLogged_) {
         Log(Level::Info,
             "BFA's mode is left as it is: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini isn't there, and the bridge never "
             "creates it");
-    absentLogged_ = true;
-    return false;
+        absentLogged_ = true;
+    }
+    if (state == BfaIniState::Unreadable && !unreadableLogged_) {
+        Log(Level::Warn,
+            "BFA's mode is left as it is for now: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini is there but couldn't be read "
+            "(another program may hold it), so the bridge changes nothing in it and keeps its records");
+        unreadableLogged_ = true;
+    }
+    return state;
 }
+
+bool BfaCpuMode::PresentLocked() { return StateLocked() == BfaIniState::Readable; }
 
 bool BfaCpuMode::OwnHolds(const char* key) { return store_->ReadBfaValue(nullptr, "General", key).has_value(); }
 
@@ -156,11 +166,14 @@ void BfaCpuMode::OnStart() {
     std::lock_guard lock(mutex_);
     if (!store_) return;
     const bool force = ForceCpuPutBack(store_->ReadRecord(kForceCpuRecord)).has_value();
-    const bool emotion = EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord)).has_value();
+    // EmotionDevice is BFA 5.0.6's key: another BFA loaded nothing of it at this start
+    const bool emotion = IsBfa506(bfaVersion_) && EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord)).has_value();
     if (!force && !emotion) return;
-    const bool present = store_->BfaIniPresent();
-    if (force && (!present || !ForceCpuIsBridgesLocked())) ClearRecordLocked(kForceCpuRecord, "ForceCPU");
-    if (emotion && (!present || !EmotionIsBridgesLocked())) ClearRecordLocked(kEmotionDeviceRecord, "EmotionDevice");
+    // BFA's INI not there: BFA loaded nothing of it, and the records wait for its return. Unreadable: what BFA loaded
+    // can't be told. Either way both records stay.
+    if (StateLocked() != BfaIniState::Readable) return;
+    if (force && !ForceCpuIsBridgesLocked()) ClearRecordLocked(kForceCpuRecord, "ForceCPU");
+    if (emotion && !EmotionIsBridgesLocked()) ClearRecordLocked(kEmotionDeviceRecord, "EmotionDevice");
 }
 
 void BfaCpuMode::OnServerVersion(std::uint16_t version) {
@@ -186,12 +199,15 @@ void BfaCpuMode::FailOnceLocked(const std::string& key, const std::string& line)
     if (failLogged_.insert(key).second) Log(Level::Warn, line);
 }
 
-// Every value the bridge set goes back, each by its own record.
+// Every value the bridge set goes back, each by its own record. BFA 4.3.2.3 has no EmotionDevice: that record, made
+// for BFA 5.0.6's INI, is left as it is.
 void BfaCpuMode::PutBackLocked(const std::string& because) {
     const auto force = ForceCpuPutBack(store_->ReadRecord(kForceCpuRecord));
-    const auto emotion = EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord));
+    const auto emotion = Bfa4Locked() ? std::nullopt : EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord));
     if (!force && !emotion) return;
-    if (!PresentLocked()) {  // nothing left to put back: the records go
+    const BfaIniState state = StateLocked();
+    if (state == BfaIniState::Unreadable) return;  // nothing cleared, nothing written
+    if (state == BfaIniState::Missing) {  // nothing left to put back: the records go
         if (force) ClearRecordLocked(kForceCpuRecord, "ForceCPU");
         if (emotion) ClearRecordLocked(kEmotionDeviceRecord, "EmotionDevice");
         return;

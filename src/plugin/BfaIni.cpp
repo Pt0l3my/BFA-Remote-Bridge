@@ -4,7 +4,8 @@
 // key by SimpleIni's rules (core/IniText.h). Writes and removals go through Windows' profile calls, each checked
 // afterwards by reading the file again as BFA 5 does. Called on the game's main thread only: at a task the client's
 // version sink queued, at SKSE's save message, and at its post-load message (the start's records, BFA 5's Batch);
-// never from DllMain or at the process's exit.
+// never from DllMain or at the process's exit. The mode asks BfaIni first and changes nothing while BFA's INI can't be
+// read; a read that fails in the moment after that answer still reads as the key's absence.
 //
 // BFA 5's own saves start its INI with a UTF-8 byte-order mark, which Windows' profile calls are known to take as part
 // of the first line (not checked on Windows here). A file whose first line is [General] would then hide that section
@@ -46,11 +47,21 @@ std::optional<std::string> ReadBfa5(const char* file, const char* section, const
     return IniTextValue(text, section, key);
 }
 
+bool BfaIniPresent() {
+    const DWORD attributes = ::GetFileAttributesA(kBfaIni);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 class ProfileIniStore final : public IniStore {
 public:
-    bool BfaIniPresent() override {
-        const DWORD attributes = ::GetFileAttributesA(kBfaIni);
-        return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+    // There, and opened and read whole now: a file another program holds (a backup or sync tool, say) is unreadable,
+    // where a profile call would answer its default and the bridge would take the key for gone.
+    BfaIniState BfaIni() override {
+        if (!BfaIniPresent()) return BfaIniState::Missing;
+        std::ifstream in(kBfaIni, std::ios::binary);
+        if (!in) return BfaIniState::Unreadable;
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        return in.bad() ? BfaIniState::Unreadable : BfaIniState::Readable;
     }
     int ReadForceCpu() override {
         // as BFA's LoadIni: the legacy GPU=0 is the default, ForceCPU overrides it

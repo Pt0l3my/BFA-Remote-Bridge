@@ -25,7 +25,9 @@
 //
 //   a game start         a record whose value BFA's own INI no longer holds (ForceCPU 1, EmotionDevice -1) is cleared:
 //                        BFA loaded another value at this start, the one put back or the player's own (SKSE's
-//                        post-load message, after BFA's own load)
+//                        post-load message, after BFA's own load). The EmotionDevice record only at a start of BFA
+//                        5.0.6, whose key it is. A start without BFA's INI leaves both: BFA loaded nothing of it
+//                        (its mod disabled for a while, say), and the records wait for the file's return
 //   version 2 answered   with BFA 4.3.2.3 and its INI there: ForceCPU=1 written when it was 0, and the bridge's own
 //                        state records that it set it (only then: a 1 the bridge found is the player's, or one it set
 //                        whose record was lost, and either way nothing is put back for it); logged once, at info
@@ -35,7 +37,8 @@
 //                        the key back: the value BFA's own INI held (ForceCPU 0, EmotionDevice the card's number), or
 //                        "added" when BFA's own INI held no such key, so that the installer's files decide again. A card
 //                        picked in BFA's menu since replaces the card recorded. Another BFA version: left as it is,
-//                        and a value the bridge set put back
+//                        and a value the bridge set put back (at an answer: so only once the bridge has attached to
+//                        that BFA and a server has answered)
 //   version 1 answered   the values the bridge set put back: written as recorded, or the key the bridge added removed.
 //                        The records stay until a start has loaded what was put back; a record whose value is no
 //                        longer in BFA's own INI is cleared, with nothing put back
@@ -46,8 +49,11 @@
 //   nothing answered     nothing
 //
 // When in doubt, nothing is put back: only a record that reads exactly as the bridge wrote it counts, and only a value
-// still the bridge's in BFA's own INI (ForceCPU 1, EmotionDevice -1) is changed back. So a CPU picked in BFA's menu while
-// the bridge's value is there can't be told from the bridge's own, and is put back too. No setting and no note on
+// still the bridge's in BFA's own INI (ForceCPU 1, EmotionDevice -1) is changed back. So a CPU picked in BFA's menu, or
+// set by hand before the next start, while the bridge's value is there can't be told from the bridge's own, and is put
+// back too. BFA's INI there but unreadable (another program holding it, say): nothing is cleared or written at that
+// start, answer or save, logged once a session. With BFA 4.3.2.3, which has no EmotionDevice, that record is left as it
+// is. No setting and no note on
 // screen: the log lines are all. The files are the plugin's (src/plugin/BfaIni.cpp), behind IniStore, so the rule is
 // tested on Linux.
 
@@ -84,11 +90,14 @@ constexpr const char* kEmotionDeviceRecord = "EmotionDeviceSetByBridge";
 // A record's value when BFA's own INI held no such key: put back by removing the key.
 constexpr const char* kAddedRecord = "added";
 
+// BFA's own INI as the bridge finds it: not there, there but not readable just now (opened or read whole), or read.
+enum class BfaIniState { Missing, Unreadable, Readable };
+
 class IniStore {
 public:
     virtual ~IniStore() = default;
-    // Whether BFA's INI is there: the bridge never creates it.
-    virtual bool BfaIniPresent() = 0;
+    // Whether BFA's INI is there (the bridge never creates it) and, if so, whether it can be read now.
+    virtual BfaIniState BfaIni() = 0;
     // BFA's CPU mode as BFA 4.3.2 reads it at its start, from its INI alone (Windows' profile calls): 1 for ForceCPU=1
     // (or, without ForceCPU, the legacy GPU=0), else 0.
     virtual int ReadForceCpu() = 0;
@@ -134,7 +143,7 @@ public:
     // The gaming PC's BFA version, as the client string reports it ("4.3.2.3"; empty when unknown).
     void SetBfaVersion(const std::string& version);
     // A game start, once BFA has loaded its INI and the version is set: the records BFA's own INI no longer shows
-    // cleared.
+    // cleared (EmotionDevice's only for BFA 5.0.6); none when the INI isn't there or can't be read.
     void OnStart();
     // The protocol version the server answered in: 2 sets BFA's CPU mode, 1 puts back the values the bridge set, 0
     // nothing.
@@ -144,6 +153,7 @@ public:
     bool Set() const;  // a server answered in version 2 this session (and not version 1 since)
 
 private:
+    BfaIniState StateLocked();
     bool PresentLocked();
     bool Bfa4Locked() const;
     bool OwnHolds(const char* key);
@@ -166,6 +176,7 @@ private:
     std::set<std::string> setLogged_, failLogged_;  // by key: logged once a session
     std::set<std::string> putBack_;  // the keys put back this session (and logged so, once)
     bool absentLogged_ = false;
+    bool unreadableLogged_ = false;
     bool otherLogged_ = false;
 };
 

@@ -799,7 +799,7 @@ namespace {
 struct MemoryIni final : IniStore {
     int forceCpu = 0;
     std::string record;
-    bool BfaIniPresent() override { return true; }
+    BfaIniState BfaIni() override { return BfaIniState::Readable; }
     int ReadForceCpu() override { return forceCpu; }
     bool WriteForceCpu(int v, std::string&) override {
         forceCpu = v;
@@ -1155,6 +1155,9 @@ TEST(ForwardOtherSessionMakersAreRefused) {
     CHECK_EQ(h.CountLogged("called ONNX Runtime's CreateSessionFromArray,"), 1);  // once
     CHECK(h.Logged("Update the bridge."));
     CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionFromArray). Update the bridge."), 1);
+    // a note for each name, once: an earlier one holds no later one back
+    CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionWithPrepackedWeightsContainer). Update the bridge."), 1);
+    CHECK_EQ(h.CountNotes("(CreateSessionFromArrayWithPrepackedWeightsContainer). Update the bridge."), 1);
     CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
 }
 
@@ -1793,6 +1796,80 @@ TEST(ForwardGraphicsMemoryTensorIsRefused) {
 }
 
 // An output BFA made in graphics memory: refused the same way, its data untouched, logged and noted once.
+// Two models handed graphics memory: each logged and noted once, every refused run counted as a fallback, and the
+// server told by NOTICE, naming the model and the lines.
+TEST(ForwardGraphicsMemoryRunsCountedPerModel) {
+    Need();
+    const fs::path dir = TempFolder("graphics-two-models");
+    fs::copy_file(Models() / "tiny.onnx", dir / "tiny.onnx");
+    fs::copy_file(Models() / "tiny.onnx", dir / "second.onnx");
+    const fs::path notices = TempFolder("graphics-notices") / "notices.jsonl";
+    {
+        Server server(dir, {"--notice-log", notices.string()});
+        Harness h(On(server.Port()));
+        OrtMemoryInfo* gpu = nullptr;
+        OrtStatus* st = h.api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &gpu);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            SKIP("this runtime makes no graphics memory information");
+        }
+        OrtMemoryInfoDeviceType type = OrtMemoryInfoDeviceType_CPU;
+        h.api->MemoryInfoGetDeviceType(gpu, &type);
+        if (type == OrtMemoryInfoDeviceType_CPU) {
+            h.api->ReleaseMemoryInfo(gpu);
+            SKIP("this runtime's \"Cuda\" memory is the CPU's");
+        }
+        OrtSession* a = nullptr;
+        OrtSession* b = nullptr;
+        Ok(h.Create(dir / "tiny.onnx", {{"batch", 2}}, &a));
+        Ok(h.Create(dir / "second.onnx", {{"batch", 2}}, &b));
+        TinyInputs in(h.api, h.cpu, 2);
+        std::vector<float> x(16);
+        const std::int64_t shape[] = {2, 8};
+        OrtValue* onGpu = nullptr;
+        st = h.api->CreateTensorWithDataAsOrtValue(gpu, x.data(), x.size() * 4, shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &onGpu);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            h.api->ReleaseMemoryInfo(gpu);
+            h.api->ReleaseSession(a);
+            h.api->ReleaseSession(b);
+            SKIP("this runtime makes no tensor over graphics memory information");
+        }
+        std::vector<OrtValue*> values = in.values;
+        values[0] = onGpu;
+        const std::uint64_t before = h.bridge.Connection().Totals().fallbacks;
+        for (OrtSession* s : {a, b, a, b}) {
+            Outputs out(h.api, 5);
+            st = h.api->Run(s, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data());
+            CHECK(st != nullptr);
+            if (st) h.api->ReleaseStatus(st);
+        }
+        CHECK_EQ(h.bridge.Connection().Totals().fallbacks - before, std::uint64_t{4});
+        CHECK_EQ(h.CountLogged("tiny.onnx: input x isn't in CPU memory, which the protocol can't carry"), 1);
+        CHECK_EQ(h.CountLogged("second.onnx: input x isn't in CPU memory, which the protocol can't carry"), 1);
+        CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data"), 1);
+        CHECK_EQ(h.CountNotes("second.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data"), 1);
+        {  // an ordinary line opens the main connection, and the NOTICE goes on it
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(a, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        }
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().NoticesSent(), 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the server writes it
+        std::ifstream file(notices);
+        std::string line;
+        std::getline(file, line);
+        CHECK(line.find(R"("model": "second.onnx", "reason": "incompatible")") != std::string::npos);
+        CHECK(line.find(R"("lines": 4})") != std::string::npos);
+        h.api->ReleaseValue(onGpu);
+        h.api->ReleaseMemoryInfo(gpu);
+        h.api->ReleaseSession(a);
+        h.api->ReleaseSession(b);
+    }
+    fs::remove_all(dir);
+    fs::remove_all(notices.parent_path());
+}
+
 TEST(ForwardGraphicsMemoryOutputIsRefused) {
     Need();
     Server server(Models());
