@@ -324,7 +324,7 @@ struct Guard<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
 
 // The runtime's other ways to make a session (from memory, with prepacked weights, the model editor's): a model
 // loaded so would run on this PC, so each answers with an error status naming it, without the runtime, logged once
-// with the "Update the bridge" note. BFA 4.3.2 uses only CreateSession.
+// with the "Update the bridge" note. BFA 4.3.2 and 5.0.6 use only CreateSession.
 OrtStatus* RefuseEntry(const char* name) noexcept {
     if (Bridge* b = Bridge::Current()) {
         try {

@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.5.0
+
+Better Facial Animations 5.0.6 (its DLL says 5.0.6.3), beside 4.3.2.3. Protocol versions 1 and 2 are unchanged: nothing
+in the wire format changes, and PandorumLLM's side needs nothing new. BFA's source was read for facts only.
+
+- **BFA 5's mode, both keys** (`src/core/BfaMode.h`). BFA 5.0.6 splits its CPU switch in two: `[General] ForceCPU` for
+  Audio2Face and `[General] EmotionDevice` for Audio2Emotion (-1 the CPU, 0 the first graphics card by default). With
+  BFA 5.0.6 (5.0.6 or any 5.0.6.N) and a server that answered in protocol version 2, the bridge writes `ForceCPU=1`
+  when it was 0 and `EmotionDevice=-1` when it was a card, in BFA's own `BetterFacialAnimations.ini`, and again at
+  each game save. BFA 5 reads its settings in layers (its installer's choice files,
+  `BetterFacialAnimations/Installer/<choice>.ini`, in its order, then its own INI, which wins), and its installer
+  leaves both keys commented out in the INI, so the bridge reads them as BFA does, defaults and number parsing
+  included (SimpleIni's `GetLongValue`), and writes its values in the INI. The records, in the bridge's own
+  `BFARemoteBridge.ini`, `[BfaMode]`: `ForceCPUSetByBridge=1` as before, and `EmotionDeviceSetByBridge=N`, the card it
+  replaced. A version 1 server or another BFA version puts each back (ForceCPU 0, EmotionDevice N) under 1.3.0's rules,
+  and only while BFA's INI still holds the bridge's value (a card picked in BFA's menu since stays). The installer's
+  files are never written, BFA's INI never created, and `IndependentGpuDevice` never touched. BFA 4.3.2.3's path is
+  as before, and any other version's mode is left as it is.
+- **BFA 5.0.6's sizes, listed by the bridge** (`src/core/BfaSizes.h`). In its CPU mode BFA sets no free-dimension
+  overrides. For BFA 5.0.6 the bridge now lists the ones its GPU route sets, by BFA version and file name: V3's four
+  `_dynamic_axes_1` at 1; the Legacy model's two at BFA's `[General] Batch` (2 by default, at least 1, read at
+  post-load through BFA 5's layers); Performance's `batch` at 1; and for both emotion models, Full and the new
+  Performance one (`emotion_performance.onnx`), `batch_size` 1, `seq_len` 60000 and `batch` 1. The server builds
+  exactly those, whatever table it holds; the log line says the sizes were listed by the bridge, and the SHA-256 is
+  logged as before. BFA 4.3.2.3's HELLO lists none, as before (the sizes rule), and overrides BFA set itself (its GPU
+  route) are sent as its own.
+- **Calls the bridge can't forward byte for byte.** BFA 5.0.6 calls none, but a later BFA might: DirectML's three
+  graphics-memory entries (`CreateGPUAllocationFromD3DResource`, `FreeGPUAllocation`,
+  `GetD3D12ResourceFromAllocation`, in the DirectML table served at API version 24) now answer with an error status
+  naming them, never the runtime's; a guarded session entry on a bridge session (`CreateIoBinding` and the rest) and a
+  run handed a tensor outside CPU memory (at BFA's warm-up, its model then isn't loaded) are now logged once each with
+  "Update the bridge", and the monitor's note says to update the bridge.
+- **Lip sync in scenes on 5.0.6, unchanged.** BFA 5.0.6 checks the same three factions through the actor's vtable
+  (CommonLib's `IsInFaction` there reads slot 0xF9 and jumps to it, from BFA's one scene check, so the game's function
+  returns into BFA's image), now beside its own ZaZ gag rule, which the bridge leaves alone. No faction to add.
+- **Facts corrected.** BFA tries a failed emotion model again 60 seconds later on the CPU and 30 on a graphics card
+  (4.3.2 and 5.0.6 alike); the README and PROTOCOL had them the wrong way round.
+- **Docs.** README: BFA 5.0.6 supported (4.3.2.3 kept); BFA's mode with both keys, and Independent GPU mode not needed;
+  the server's folder holding `emotion_performance.onnx` too; SkyrimNet Beta30 animating its own speakers. PROTOCOL:
+  section 1 gives BFA 5.0.6's facts beside 4.3.2's, section 3 the client-listed sizes.
+- **The reference server**: a `--hello-log FILE` test option records each HELLO's models and overrides.
+- **Tests:** BFA 5's mode (both keys set and put back, its layers and number parsing, the version gating, 4.3.2.3
+  as before), the size table, the listed sizes on the wire, BFA 5.0.6's own emotion model through the bridge
+  (`BFARB_BFA5_EMOTION`) and DLL (`BFARB_BFA5_DLL`), the DirectML graphics-memory refusals, a tensor in graphics memory
+  and the guarded entries' notes.
+
 ## 1.4.0
 
 Lip sync in scenes. Protocol versions 1 and 2 are unchanged, and the server isn't involved.

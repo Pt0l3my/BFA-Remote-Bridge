@@ -5,13 +5,14 @@ PandorumLLM's) speak this protocol. `src/core/Protocol.h` implements both sides'
 client's conduct; `tools/reference_server.py` is a reference server, which speaks both versions (`--v1-only` for
 version 1 alone).
 
-Bridges 1.0.0 to 1.2.0 speak version 1. Bridge 1.3.0 speaks version 2, which is version 1 with three messages added
+Bridges 1.0.0 to 1.2.0 speak version 1. Bridge 1.3.0 and later speak version 2, which is version 1 with three messages added
 (NOTICE, FIND and FOUND), and version 1 to a server that speaks only that (["Version 2"](#version-2) below). The
 agreement behind version 2 is [AGREEMENT-1.2.md](AGREEMENT-1.2.md), stage 2.
 
-## 1 Facts from Better Facial Animations 4.3.2
+## 1 Facts from Better Facial Animations 4.3.2 and 5.0.6
 
-From BFA 4.3.2's public source (GPL-3.0; read, never copied):
+From BFA 4.3.2's and BFA 5.0.6's public source (GPL-3.0; read, never copied). What follows holds for both unless it
+says otherwise; [BFA 5.0.6](#bfa-506) below gives what changed.
 
 - BFA loads `onnxruntime.dll` (ONNX Runtime **1.24.4**, DirectML build, `ORT_API_VERSION` **24**) from its own folder,
   `SKSE/Plugins/BetterFacialAnimations/`, with `DirectML.dll` and `onnxruntime_providers_shared.dll` beside it. It
@@ -27,7 +28,7 @@ From BFA 4.3.2's public source (GPL-3.0; read, never copied):
 - It checks every output before use: the element count, the type (float) and that every value is finite. For the
   facial models a failed check fails that line only ("the session and device stay"); an error status from `Run` marks
   the session failed. The sentiment model (`emotion_fp16.onnx`) is the exception: BFA drops its session after any
-  failed answer, checked or not, and loads it again 30 seconds later on the processor, 60 on the graphics card.
+  failed answer, checked or not, and loads it again 60 seconds later on the processor, 30 on the graphics card.
 - Each model is **stateless between calls**: V3's recurrent state travels in its inputs and outputs (`input_latents`
   in, `output_latents` out), so the server keeps nothing per conversation.
 
@@ -37,12 +38,39 @@ The models (file names as BFA ships them; sizes per call):
 |---|---|---|---|---|
 | `a2f3_fp16.onnx` (Audio2Face-3D v3.0, folded) | V3 (default) | `window`: [1, 16000] f32; `identity`: [1, 3] f32; `emotion`: [1, 30, 10] f32; `input_latents`: [2, 2, 1, 256] f32 | `skin_latent` (30×512 f32), `tongue_latent` (30×512 f32), `jaw_eyes` (30×19 f32), `output_latents` (1024 f32) | `window_dynamic_axes_1`, `identity_dynamic_axes_1`, `emotion_dynamic_axes_1`, `input_latents_dynamic_axes_1` = 1 |
 | `performance.onnx` (Performance "Thin120") | Performance | `mel`: [1, F, 80] f32; `identity`: [1] **int64**; `emotion`: [1, F, 10] f32 | `normalized_motion` (F×73 f32) | `batch` = 1 |
-| `network_fp16.onnx` (Audio2Face-3D v2.3 Mark) | Old | `input`: [b, 1, 8320] f32; `emotion`: [b, 1, 26] f32 | `result` ([b, 1, 301] f32) | `input_dynamic_axes_1`, `emotion_dynamic_axes_1` = BFA's batch (2 by default) |
-| `emotion_fp16.onnx` (Audio2Emotion v2.2) | Sentiment | `input_values`: [1, 60000] f32 | `output` (6 f32) | `batch_size` = 1, `seq_len` = 60000 |
+| `network_fp16.onnx` (Audio2Face-3D v2.3 Mark) | Old (4.3.2), Legacy (5.0.6) | `input`: [b, 1, 8320] f32; `emotion`: [b, 1, 26] f32 | `result` ([b, 1, 301] f32) | `input_dynamic_axes_1`, `emotion_dynamic_axes_1` = BFA's batch (2 by default) |
+| `emotion_fp16.onnx` (Audio2Emotion v2.2) | Sentiment (4.3.2), Audio2Emotion Full (5.0.6) | `input_values`: [1, 60000] f32 | `output` (6 f32) | `batch_size` = 1, `seq_len` = 60000; 5.0.6 adds `batch` = 1 |
+| `emotion_performance.onnx` (Performance Audio2Emotion, 5.0.6 only) | Audio2Emotion Performance (5.0.6's default) | `mel`: [1, 48, 188] f32 | `logits` ([1, 6] f32) | `batch_size` = 1, `seq_len` = 60000, `batch` = 1 (the model has no free dimension: the runtime ignores them) |
 
-V3 runs **one 30-frame window (half a second of speech) per call**: about 70 KB up and 130 KB back. A 6-second
-SkyrimNet chunk is about 12 calls in sequence (each needs the previous call's `output_latents`), so about 2.4 MB in
-all: trivial on a LAN.
+F is BFA's Performance window, 124 frames (90, and 17 of context on each side). V3 runs **one 30-frame window (half a
+second of speech, at 60 fps) per call**: about 70 KB up and 130 KB back. A 6-second line is about 12 calls in
+sequence (each needs the previous call's `output_latents`), so about 2.4 MB in all: trivial on a LAN. The Performance
+emotion model's call is about 36 KB up and 24 bytes back; BFA runs it for each half second of a line longer than its
+60000-sample window (3.75 seconds), and once for a shorter one, as it runs the Full one.
+
+### BFA 5.0.6
+
+BFA 5.0.6 (its DLL says 5.0.6.3) ships the same runtime (`onnxruntime.dll` and `DirectML.dll` are byte for byte
+4.3.2's: ONNX Runtime 1.24.4, API version 24) and the same `performance.onnx`. It loads the runtime and looks up
+`OrtGetApiBase` as 4.3.2 does (`GetProcAddress`, imported from KERNEL32 by name), after a save loads, on its worker.
+What changed:
+
+- **The models.** A second emotion model, Performance (`emotion_performance.onnx`, 21,584,010 bytes, SHA-256
+  8245b49ef7095020c638d845abad97eb70dec278f7c960f8289a5fab9fb5ec16 in BFA's source), its default: BFA makes its 48 x
+  188 input on the gaming PC from the same 60000-sample window, and runs it as often as the Full one. The table above
+  has it. The facial models' calls are unchanged: V3's windows were already 30 frames at 60 fps in 4.3.2.
+- **The overrides.** Its GPU route sets the same as 4.3.2's, but for both emotion models it adds `batch` = 1. The
+  Legacy model's two follow BFA's `[General] Batch` setting (2 by default).
+- **The runtime entries.** It calls the same entries as 4.3.2, and `GetErrorCode` besides (on a failed status, for
+  its log). Nothing of I/O binding, of tensors on the graphics card or of DirectML's resource entries.
+- **The mode keys.** The CPU switch is split in two: `[General] ForceCPU` for Audio2Face and `[General] EmotionDevice`
+  for Audio2Emotion (-1 the CPU; 0, the default, and up a graphics card by its DXGI number). `IndependentGpuDevice`
+  chooses its GPU route (a shared device, 0 by default, or an independent one with BFA's own Agility runtime). BFA 5
+  reads its settings in layers: its installer's choice files (`BetterFacialAnimations/Installer/<choice>.ini`), then
+  its own INI, which wins. With ForceCPU=1 and EmotionDevice=-1 it opens no Direct3D 12 or DXGI device and loads no
+  Agility runtime for inference.
+- **The scene check.** The same three factions, asked the same way (`Actor::IsInFaction` through the actor's
+  vtable), now with BFA 5's own gag rule beside it (a speaker wearing a ZaZ gag keeps the game's face).
 
 ## 2 The protocol
 
@@ -220,7 +248,9 @@ route, which lists none, is served ([AGREEMENT-1.2.md](AGREEMENT-1.2.md), measur
 SHA-256). PandorumLLM's v3.97 Beta patch7 does the same in version 1. The bridge never reads a detail as a sign of the
 server's version or abilities: it knows the version by the frames alone, and sets BFA's CPU mode only for a server
 that answered in version 2 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
-stands in for one with the test files.
+stands in for one with the test files. For BFA 5.0.6 the bridge lists the sizes itself (section 3, "A model load"), so
+its HELLOs list overrides and are served exactly as listed: no server needs a table of 5.0.6's files, and nothing on
+the wire changes.
 
 **The version rule.** Each side answers in the version the other opened with.
 
@@ -343,6 +373,18 @@ PandorumLLM's choice; the bridge reports it.
 - **A model load** (`CreateSession`) never reaches the real runtime. The bridge hashes the
   model file (base name, size, SHA-256), takes the overrides BFA set on the options, and sends HELLO with that model
   alone on a **side connection** of its own (3000 ms to connect, 60 seconds for the answer), closed after the answer.
+  - **The client-listed sizes (BFA 5.0.6).** When BFA set no overrides (its CPU route) and BFA is 5.0.6 (5.0.6 or
+    5.0.6.N, from its DLL), the bridge lists the ones BFA 5.0.6's GPU route sets, by file name, in BFA's order
+    (`src/core/BfaSizes.h`); the log line says so. BFA 4.3.2.3's HELLO lists none, as before (the sizes rule fills them
+    in), and a HELLO for which BFA set overrides (its GPU route) carries BFA's own.
+
+    | File | Overrides the bridge lists for BFA 5.0.6 |
+    |---|---|
+    | `a2f3_fp16.onnx` | `window_dynamic_axes_1`, `identity_dynamic_axes_1`, `emotion_dynamic_axes_1`, `input_latents_dynamic_axes_1` = 1 |
+    | `network_fp16.onnx` | `input_dynamic_axes_1`, `emotion_dynamic_axes_1` = BFA's `[General] Batch` (2 by default, at least 1; read at start-up as BFA reads it) |
+    | `performance.onnx` | `batch` = 1 |
+    | `emotion_fp16.onnx` | `batch_size` = 1, `seq_len` = 60000, `batch` = 1 |
+    | `emotion_performance.onnx` | `batch_size` = 1, `seq_len` = 60000, `batch` = 1 |
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
     PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
     if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
@@ -433,7 +475,14 @@ PandorumLLM's choice; the bridge reports it.
   use the addresses found. A failed lookup is logged once, and runs get the NaN answer until the settings change.
 - **Every other entry that takes a session** (the 22 of `OrtApi` besides `Run`, such as `SessionGetInputCount`,
   `SessionGetOutputName`, `CreateIoBinding`, `RunWithBinding` and `RunAsync`, and the model editor's three) answers a
-  bridge session with an error status made by `CreateStatus`, without the runtime. BFA calls none of them.
+  bridge session with an error status made by `CreateStatus`, without the runtime, logged once each with a note to
+  update the bridge. BFA 4.3.2 and 5.0.6 call none of them.
+- **Graphics memory can't be sent.** DirectML's three entries for it (`CreateGPUAllocationFromD3DResource`,
+  `FreeGPUAllocation`, `GetD3D12ResourceFromAllocation`, in the DirectML table the bridge serves at API version 24)
+  answer with an error status naming them (`ORT_NOT_IMPLEMENTED`), never the runtime's, logged once each with a note
+  to update the bridge. A run handed a tensor whose memory isn't the CPU's gets the NaN answer, logged once with the
+  same advice; at BFA's warm-up that means the model isn't loaded, and its lines get the game's own lip sync. BFA
+  4.3.2 and 5.0.6 use none of this.
 - **Releasing** a bridge session frees it in the bridge; it never reaches the runtime. A session the runtime made
   itself (through another entry, such as `CreateSessionFromArray`) is the runtime's own, and every call on it is the
   real one.
@@ -441,15 +490,22 @@ PandorumLLM's choice; the bridge reports it.
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
   no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge asks the
   player nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. It sets
-  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3 alone
-  (the set the sizes rule names; the version the client string reports), it writes `ForceCPU=1` under `[General]` in
-  `Data\SKSE\Plugins\BetterFacialAnimations.ini` when it was 0, noting in its own `BFARemoteBridge.ini` that it did,
-  and writes it again at each game save (SKSE's save message) so a save of BFA's menu can't undo it; BFA reads the
-  file at its start, so it applies from the next start. A server that answers only in version 1, or another BFA
-  version, gets the 0 put back, and only when the bridge's note reads as written: when in doubt, nothing is put back.
-  It never creates BFA's INI. Logged once, at info level; no setting, no note. BFA's CPU route
-  sets no free-dimension overrides, so its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
-  (the sizes rule, ["Version 2"](#version-2)), so it serves BFA in either mode.
+  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3
+  and BFA 5.0.6 alone (the version the client string reports), it writes BFA's CPU mode under `[General]` in
+  `Data\SKSE\Plugins\BetterFacialAnimations.ini`, noting in its own `BFARemoteBridge.ini` (`[BfaMode]`) what it
+  set, and writes it again at each game save (SKSE's save message) so a save of BFA's menu can't undo it; BFA reads
+  the file at its start, so it applies from the next start.
+  - BFA 4.3.2.3: `ForceCPU=1` when it was 0 (noted as `ForceCPUSetByBridge=1`).
+  - BFA 5.0.6: `ForceCPU=1` when it was 0 (the same note) and `EmotionDevice=-1` when it was a graphics card (noted
+    as `EmotionDeviceSetByBridge=N`, N the card's number), each read as BFA 5 reads it, through its installer's
+    choice files and its own INI, and written in its own INI, which wins. `IndependentGpuDevice` is never written.
+  - A server that answers only in version 1, or another BFA version, gets each value put back (ForceCPU 0,
+    EmotionDevice N), only when the bridge's note reads as written and BFA's INI still holds the bridge's value:
+    when in doubt, nothing is put back.
+  - It never creates BFA's INI. Logged once, at info level; no setting, no note. BFA's CPU route sets no
+    free-dimension overrides; for BFA 4.3.2.3 its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
+    (the sizes rule, ["Version 2"](#version-2)); for BFA 5.0.6 the bridge lists them (above). So the server serves BFA
+    in either mode.
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
   game load (ready lines only while Status on load allows them), a model load the server refuses included, with its

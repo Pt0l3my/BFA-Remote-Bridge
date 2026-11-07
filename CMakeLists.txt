@@ -8,8 +8,9 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Without BFARB_PYTHON (or with a python lacking those packages) the tests that need a real runtime and the reference
-# server are skipped. BFARB_BFA_MODELS=<folder holding BFA's performance.onnx and network_fp16.onnx> and
-# BFARB_BFA_DLL=<BFA's BetterFacialAnimations.dll>, in the environment when the tests run, add BFA's own files
+# server are skipped. BFARB_BFA_MODELS=<folder holding BFA's performance.onnx and network_fp16.onnx>,
+# BFARB_BFA_DLL=<BFA 4.3.2's BetterFacialAnimations.dll>, BFARB_BFA5_DLL=<BFA 5.0.6's> and
+# BFARB_BFA5_EMOTION=<BFA 5.0.6's emotion_performance.onnx>, in the environment when the tests run, add BFA's own files
 # (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
 project(BFARemoteBridge VERSION 1.5.0 LANGUAGES CXX)
