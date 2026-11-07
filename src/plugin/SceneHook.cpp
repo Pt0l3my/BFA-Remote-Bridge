@@ -1,4 +1,4 @@
-// Lip sync in scenes: Better Facial Animations leaves the face of anyone in a SexLab or OStim scene to the scene, by
+// Lip sync in scenes: Better Facial Animations leaves the face of anyone in an OStim or SexLab scene to the scene, by
 // asking the game whether the actor is in one of three factions (core/SceneLipSync.h). The bridge redirects one
 // virtual, Actor::IsInFaction, on the main vtables of Character and PlayerCharacter (CommonLibSSE-NG's VTABLE_Character
 // and VTABLE_PlayerCharacter, slot 0xF9 on SE and AE) to a thunk that answers "no" to BFA's own questions about those

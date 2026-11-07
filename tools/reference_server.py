@@ -64,8 +64,7 @@ MAX_NAME = 255  # bytes of a model or tensor name; longer is malformed
 
 DTYPES = {1: np.dtype("<f4"), 6: np.dtype("<i4"), 7: np.dtype("<i8"), 10: np.dtype("<f2"), 11: np.dtype("<f8")}
 CODES = {v: k for k, v in DTYPES.items()}
-# BFA's own CPU sessions use "extended", never "all": the full level's layout fusions fail on the casts the CPU provider
-# inserts around network_fp16.onnx's operators.
+# BFA's own CPU sessions use "extended", never "all": at "all", network_fp16.onnx won't load on the CPU provider.
 OPTIMIZATION = {
     "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
     "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,

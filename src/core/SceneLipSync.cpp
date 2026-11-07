@@ -106,9 +106,9 @@ std::string InstalledText(const std::array<std::uint32_t, kSceneFactions.size()>
         }
     }
     std::string line =
-        "Lip sync in scenes: hooked Actor::IsInFaction on Character's and PlayerCharacter's vtables; BFA's own scene "
-        "checks are answered \"not in a scene\" while the setting is on, every other caller gets the game's answer. Scene "
-        "factions found: " +
+        "Lip sync in scenes: hooked Actor::IsInFaction on Character's and PlayerCharacter's vtables; a scene check BFA makes "
+        "through it will be answered \"not in a scene\" while the setting is on, every other caller gets the game's answer. "
+        "Scene factions found: " +
         (found.empty() ? std::string("none") : found);
     if (!missing.empty()) line += "; not loaded: " + missing;
     return line;
@@ -117,9 +117,10 @@ std::string InstalledText(const std::array<std::uint32_t, kSceneFactions.size()>
 std::string KeptText(std::uint32_t actorFormId, std::size_t factionIndex, std::uint32_t lines) {
     char id[16];
     std::snprintf(id, sizeof id, "%08X", static_cast<unsigned>(actorFormId));
-    std::string line = std::string("Lip sync in scenes: kept BFA's lip sync for a line of ") + id + ", who is in a scene (" +
-                       FactionName(factionIndex) + ")";
-    if (lines > 1) line += "; " + std::to_string(lines) + " lines kept since the last such log line, this one included";
+    std::string line = std::string("Lip sync in scenes: answered BFA's scene check \"not in a scene\" for a line of ") + id +
+                       ", who is in a scene (" + FactionName(factionIndex) +
+                       "); BFA's own settings, and BFA 5's mouth-gear rule, can still keep the game's face";
+    if (lines > 1) line += "; " + std::to_string(lines) + " lines so since the last such log line, this one included";
     return line;
 }
 

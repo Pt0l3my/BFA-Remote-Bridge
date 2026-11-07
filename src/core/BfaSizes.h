@@ -13,7 +13,9 @@
 // setting ([General] Batch, 2 by default, at least 1); the Performance network its batch at 1; both emotion models,
 // Full and Performance, share one list, batch_size 1, seq_len 60000 and batch 1. ONNX Runtime ignores an override
 // whose dimension a model lacks (the Performance emotion model's input is fixed: [1, 48, 188]), so the list is sent
-// as BFA sets it.
+// as BFA sets it; PandorumLLM's side is asked to confirm that its server passes such a list on as listed. The table
+// was also checked against the lists 5.0.6.3's own DLL builds, and applies to every 5.0.6.N by file name alone (the
+// SHA-256 is logged, never compared): a later 5.0.6 build with other shapes would see the server's shape check fail.
 
 #include <string>
 #include <vector>
