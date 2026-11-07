@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -1253,6 +1254,9 @@ TEST(ForwardUnsupportedInputAnswersNan) {
         CHECK(IsNanAnswer(h.api, out.v[0]));
     }
     CHECK_EQ(h.CountLogged("which the protocol can't carry"), 1);
+    CHECK_EQ(h.CountLogged("graphics memory"), 0);  // a bool isn't graphics memory: no error status, no such words
+    CHECK_EQ(h.CountLogged("error status"), 0);
+    CHECK_EQ(h.CountNotes("graphics memory"), 0);
     CHECK(!h.bridge.Connection().Paused());
     {
         Outputs out(h.api, 5);  // the next proper line goes through
@@ -1292,15 +1296,24 @@ TEST(ForwardOtherSessionEntriesRefuseBridgeSessions) {
         int opset = 0;
         CHECK(refused(editor->SessionGetOpsetForDomain(bridged, "", &opset)));
     }
-    // each logged once, naming it, with a note to update the bridge (the first: notes about lines come one a minute)
+    // each logged once, naming it, with a note of its own to update the bridge, once; lines are still served
     CHECK(refused(h.api->SessionGetInputCount(bridged, &count)));
     CHECK_EQ(h.CountLogged("Better Facial Animations called ONNX Runtime's SessionGetInputCount on a model the server runs (the bridge "
                            "forwards Run alone), which the bridge can't forward byte for byte"),
              1);
     CHECK_EQ(h.CountLogged("ONNX Runtime's CreateIoBinding on a model the server runs"), 1);
-    CHECK_EQ(h.CountNotes("BFA Remote Bridge: lines get the game's own lip sync, since this Better Facial Animations calls "
-                          "SessionGetInputCount on a model the server runs, which the bridge doesn't forward. Update the bridge."),
+    CHECK_EQ(h.CountNotes("BFA Remote Bridge: this Better Facial Animations calls SessionGetInputCount on a model the server runs, which "
+                          "the bridge doesn't forward, so BFA gets an error for it. Update the bridge."),
              1);
+    CHECK_EQ(h.CountNotes("CreateIoBinding on a model the server runs"), 1);
+    CHECK_EQ(h.CountNotes("lines get the game's own lip sync"), 0);
+    {
+        TinyInputs in(h.api, h.cpu, 3);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(bridged, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK_EQ(h.CountNotes("back on the server"), 0);
     h.api->ReleaseSession(bridged);
 
     // a real session (made outside the bridge: the bridge makes none): the real answers through the same table
@@ -1528,6 +1541,62 @@ TEST(ForwardBfa506ListsItsGpuSizes) {
     const auto gpu = HelloLines(hellos);
     CHECK(CountWith(gpu, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 2], [\"emotion_dynamic_axes_1\", 2]]}") >= 1);
     CHECK_EQ(CountWith(gpu, "\", 3]"), 0);
+    fs::remove(hellos);
+
+    // BFA's Batch not set yet: the bridge lists BFA's default, 2
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("5.0.6.3");
+        OrtSession* s = nullptr;
+        Ok(h.Create(dir / "network_fp16.onnx", {}, &s));
+        h.api->ReleaseSession(s);
+    }
+    const auto unset = HelloLines(hellos);
+    CHECK(CountWith(unset, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 2], [\"emotion_dynamic_axes_1\", 2]]}") >= 1);
+    fs::remove_all(dir);
+}
+
+// A call the bridge can't forward reaches the server's status check as a fallback, once, whatever the call (1.4's
+// session makers and 1.5's guarded entries alike).
+TEST(ForwardUnservedCallsReachTheStatusCheck) {
+    Need();
+    const fs::path dir = TempFolder("unserved-hellos");
+    const fs::path hellos = dir / "hellos.jsonl";
+    {
+        Server server(Models(), {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        OrtSession* bridged = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &bridged));
+        std::size_t count = 0;
+        OrtStatus* st = h.api->SessionGetInputCount(bridged, &count);
+        CHECK(st != nullptr);
+        if (st) h.api->ReleaseStatus(st);
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+        h.api->ReleaseSession(bridged);
+    }
+    CHECK(CountWith(HelloLines(hellos), "fallback incompatible") >= 1);
+    fs::remove(hellos);
+    {
+        Server server(Models(), {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        OrtSession* bridged = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &bridged));
+        h.api->ReleaseSession(bridged);
+        OrtSession* fromArray = nullptr;
+        const char bytes[4] = {};
+        OrtSessionOptions* so = nullptr;
+        Ok(h.api->CreateSessionOptions(&so));
+        OrtStatus* st = h.api->CreateSessionFromArray(h.env, bytes, sizeof bytes, so, &fromArray);
+        h.api->ReleaseSessionOptions(so);
+        CHECK(st != nullptr);
+        if (st) h.api->ReleaseStatus(st);
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+        CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionFromArray)"), 1);
+    }
+    CHECK(CountWith(HelloLines(hellos), "fallback incompatible") >= 1);
     fs::remove_all(dir);
 }
 
@@ -1626,7 +1695,8 @@ TEST(ForwardDirectMlGraphicsMemoryIsRefused) {
     const auto refused = [&](OrtStatus* st, const char* name) {
         const bool ok = st && std::string(t->GetErrorMessage(st)) == std::string("BFA Remote Bridge: ") + name +
                                                                         " isn't served: the model runs on the server, which a tensor "
-                                                                        "in this PC's graphics memory can't reach";
+                                                                        "in this PC's graphics memory can't reach" &&
+                        t->GetErrorCode(st) == ORT_NOT_IMPLEMENTED;
         if (st) t->ReleaseStatus(st);
         return ok;
     };
@@ -1643,9 +1713,12 @@ TEST(ForwardDirectMlGraphicsMemoryIsRefused) {
              1);
     CHECK_EQ(h.CountLogged("DirectML's FreeGPUAllocation"), 1);
     CHECK_EQ(h.CountLogged("DirectML's GetD3D12ResourceFromAllocation"), 1);
-    CHECK_EQ(h.CountNotes("this Better Facial Animations puts its model's data in graphics memory (CreateGPUAllocationFromD3DResource), "
-                          "which the bridge can't send to the server. Update the bridge."),
+    CHECK_EQ(h.CountNotes("BFA Remote Bridge: this Better Facial Animations puts its model's data in graphics memory "
+                          "(CreateGPUAllocationFromD3DResource), which the bridge can't send to the server, so BFA gets an error for it. "
+                          "Update the bridge."),
              1);
+    CHECK_EQ(h.CountNotes("(FreeGPUAllocation)"), 1);
+    CHECK_EQ(h.CountNotes("(GetD3D12ResourceFromAllocation)"), 1);
     // the rest: the runtime's own (the appends through the bridge's wrappers)
     OrtSessionOptions* so = nullptr;
     Ok(t->CreateSessionOptions(&so));
@@ -1663,9 +1736,10 @@ TEST(ForwardDirectMlGraphicsMemoryIsRefused) {
     CHECK_EQ(fake_dml::calls[7], 1);
 }
 
-// A tensor in graphics memory handed to a run: the protocol can't carry it, so the line gets NaN (at BFA's warm-up its
-// model then isn't loaded), logged once, with a note to update the bridge.
-TEST(ForwardGraphicsMemoryTensorAnswersNan) {
+// A tensor in graphics memory handed to a run, as an input or as an output BFA made: the protocol can't carry it, so
+// the run gets an error status (BFA then doesn't load the model, or drops it), nothing is written into the outputs,
+// and it is logged and noted once a model, however often BFA tries.
+TEST(ForwardGraphicsMemoryTensorIsRefused) {
     Need();
     Server server(Models());
     Harness h(On(server.Port()));
@@ -1694,20 +1768,68 @@ TEST(ForwardGraphicsMemoryTensorAnswersNan) {
         h.api->ReleaseSession(session);
         SKIP("this runtime makes no tensor over graphics memory information");
     }
+    const auto refused = [&](OrtStatus* status) {
+        const bool ok = status && h.api->GetErrorCode(status) == ORT_NOT_IMPLEMENTED &&
+                        std::string(h.api->GetErrorMessage(status)).rfind("BFA Remote Bridge: tiny.onnx: ", 0) == 0;
+        if (status) h.api->ReleaseStatus(status);
+        return ok;
+    };
     std::vector<OrtValue*> values = in.values;
     values[0] = onGpu;
     for (int k = 0; k < 2; ++k) {
         Outputs out(h.api, 5);
-        CHECK(h.api->Run(session, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data()) == nullptr);
-        CHECK(IsNanAnswer(h.api, out.v[0]));
+        CHECK(refused(h.api->Run(session, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data())));
+        for (OrtValue* v : out.v) CHECK(v == nullptr);  // nothing made for BFA to read
     }
-    CHECK_EQ(h.CountLogged("tiny.onnx: input x isn't in CPU memory, which the protocol can't carry; those lines get the game's own lip "
-                           "sync (at BFA's warm-up, its model isn't loaded). Update the bridge."),
+    CHECK_EQ(h.CountLogged("tiny.onnx: input x isn't in CPU memory, which the protocol can't carry; BFA gets an error status for the run, "
+                           "so it doesn't load the model (or drops it) and lines get the game's own lip sync. Update the bridge."),
              1);
     CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data in "
                           "graphics memory, which the bridge can't send to the server. Update the bridge."),
              1);
     h.api->ReleaseValue(onGpu);
+    h.api->ReleaseMemoryInfo(gpu);
+    h.api->ReleaseSession(session);
+}
+
+// An output BFA made in graphics memory: refused the same way, its data untouched, logged and noted once.
+TEST(ForwardGraphicsMemoryOutputIsRefused) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtMemoryInfo* gpu = nullptr;
+    OrtStatus* st = h.api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &gpu);
+    if (st) {
+        h.api->ReleaseStatus(st);
+        SKIP("this runtime makes no graphics memory information");
+    }
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 4);
+    const std::int64_t shape[] = {2, 8};
+    for (int k = 0; k < 2; ++k) {
+        std::vector<float> y(16, 7.f);
+        Outputs out(h.api, 5);
+        st = h.api->CreateTensorWithDataAsOrtValue(gpu, y.data(), y.size() * 4, shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &out.v[0]);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            h.api->ReleaseMemoryInfo(gpu);
+            h.api->ReleaseSession(session);
+            SKIP("this runtime makes no tensor over graphics memory information");
+        }
+        st = h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data());
+        CHECK(st != nullptr);
+        if (st) {
+            CHECK_EQ(static_cast<int>(h.api->GetErrorCode(st)), static_cast<int>(ORT_NOT_IMPLEMENTED));
+            h.api->ReleaseStatus(st);
+        }
+        CHECK(std::all_of(y.begin(), y.end(), [](float f) { return f == 7.f; }));
+        for (std::size_t i = 1; i < out.v.size(); ++i) CHECK(out.v[i] == nullptr);
+    }
+    CHECK_EQ(h.CountLogged("tiny.onnx: output y isn't in CPU memory, which the protocol can't carry; BFA gets an error status for the run"), 1);
+    CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data in "
+                          "graphics memory"),
+             1);
     h.api->ReleaseMemoryInfo(gpu);
     h.api->ReleaseSession(session);
 }

@@ -715,8 +715,10 @@ void Bridge::OnUnservedEntry(const std::string& name) {
     Log(Level::Warn, "Better Facial Animations called ONNX Runtime's " + name +
                          ", which the bridge doesn't serve (it serves models loaded from a file with CreateSession); BFA gets an "
                          "error status, so lip sync is the game's own. Update the bridge.");
-    monitor_.Fallback(Reason::Incompatible, std::string(),
-                      "this Better Facial Animations loads its model in a way the bridge doesn't serve (" + name + "). Update the bridge");
+    // a note of its own, once: a fallback note could be held back a minute by an earlier one, and lost
+    monitor_.Once("unserved: " + name,
+                  FallbackLine(std::string(), "this Better Facial Animations loads its model in a way the bridge doesn't serve (" + name +
+                                                  "). Update the bridge"));
     client_.ReportFallback(Reason::Incompatible);
 }
 
@@ -727,9 +729,11 @@ void Bridge::OnUnservedCall(const std::string& name, const std::string& what, co
         unservedLogged_.push_back(name);
     }
     Log(Level::Warn, "Better Facial Animations called ONNX Runtime's " + what +
-                         ", which the bridge can't forward byte for byte; BFA gets an error status, so what needs it gets the game's "
-                         "own lip sync. Update the bridge.");
-    monitor_.Fallback(Reason::Incompatible, std::string(), shown + ". Update the bridge");
+                         ", which the bridge can't forward byte for byte; BFA gets an error status for it, and what needs it gets the "
+                         "game's own lip sync. Update the bridge.");
+    // a note of its own, once: a fallback note could be held back a minute by an earlier one, and lines the server
+    // still answers needn't be the game's own
+    monitor_.Once("unserved: " + name, "BFA Remote Bridge: " + shown + ", so BFA gets an error for it. Update the bridge.");
     client_.ReportFallback(Reason::Incompatible);
 }
 
@@ -974,6 +978,36 @@ void Bridge::NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** o
     }
 }
 
+// A run handed a tensor in this PC's graphics memory, which the protocol can't carry: an error status, so BFA doesn't
+// load the model at its warm-up (or drops it later), and nothing is written into the outputs. Counted as a fallback
+// each time; logged and noted once per model, since BFA tries to load it again and again.
+OrtStatus* Bridge::RefuseGraphicsRun(const OrtApi* real, const std::string& model, const std::string& why, Clock::time_point start) noexcept {
+    try {
+        Fallback f{Why::Other, why + ", which the protocol can't carry", true};
+        client_.RecordFallback(model, f, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
+        client_.ReportFallback(Reason::Incompatible, model, f.text);
+        bool first = false;
+        {
+            std::lock_guard lock(sessionsMutex_);
+            const std::string key = "graphics memory: " + model;
+            if (std::find(unservedLogged_.begin(), unservedLogged_.end(), key) == unservedLogged_.end()) {
+                unservedLogged_.push_back(key);
+                first = true;
+            }
+        }
+        if (first) {
+            Log(Level::Warn, model + ": " + why + ", which the protocol can't carry; BFA gets an error status for the run, so it doesn't "
+                                                  "load the model (or drops it) and lines get the game's own lip sync. Update the bridge.");
+            monitor_.Once("graphics memory: " + model,
+                          FallbackLine(model, "this Better Facial Animations hands its model data in graphics memory, which the bridge "
+                                              "can't send to the server. Update the bridge"));
+        }
+    } catch (...) {
+    }
+    const std::string text = "BFA Remote Bridge: " + model + ": " + why + ", and graphics memory can't be sent to the server";
+    return real->CreateStatus(ORT_NOT_IMPLEMENTED, text.c_str());
+}
+
 void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
                       std::size_t outputCount, OrtValue** outputs, const std::string& words) noexcept {
     try {
@@ -1002,8 +1036,8 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
         return nullptr;
     }
 
-    // a bridge session: from here on every path returns success, with the server's outputs or NaN ones, and every run
-    // is counted once
+    // a bridge session: from here on every path returns success, with the server's outputs or NaN ones, but for a
+    // tensor in graphics memory (an error status), and every run is counted once
     const auto fallBack = [&](Why why, std::string text, bool quiet, Reason reason, const std::string& words = {}) -> OrtStatus* {
         Fallback f;
         f.why = why;
@@ -1048,6 +1082,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 supported = false;
             }
         }
+        if (!supported && graphicsMemory) return RefuseGraphicsRun(real, entry.name, why, start);
         if (!supported) {
             bool first = false;
             {
@@ -1056,12 +1091,8 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 if (it != sessions_.end() && !it->second->unsupportedLogged) first = it->second->unsupportedLogged = true;
             }
             if (first)
-                Log(Level::Warn, entry.name + ": " + why + ", which the protocol can't carry; those lines get the game's own lip sync" +
-                                     (graphicsMemory ? " (at BFA's warm-up, its model isn't loaded). Update the bridge." : ""));
-            return fallBack(Why::Other, why + ", which the protocol can't carry", true, Reason::Incompatible,
-                            graphicsMemory ? "this Better Facial Animations hands its model data in graphics memory, which the bridge "
-                                             "can't send to the server. Update the bridge"
-                                           : std::string());
+                Log(Level::Warn, entry.name + ": " + why + ", which the protocol can't carry; those lines get the game's own lip sync");
+            return fallBack(Why::Other, why + ", which the protocol can't carry", true, Reason::Incompatible);
         }
 
         proto::RunRequest request;

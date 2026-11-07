@@ -24,11 +24,12 @@
 //                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
 //                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
-//                   in full, the call still succeeds, with each requested output a one-element float tensor holding
-//                   NaN: BFA's output check then drops that line only (its own comment: "A failed validation fails the
-//                   line only: the session and device stay"), where an error status would make it drop the model. A
-//                   connection failure pauses the bridge (src/core/Client.h): runs answer so at once until the
-//                   background thread's HELLO is answered. Every run is counted once, answered or by its reason.
+//                   in full, the call still succeeds (a tensor in graphics memory aside, below), with each requested
+//                   output a one-element float tensor holding NaN: BFA checks every answer it reads back, and one that
+//                   fails costs it that line alone, its model kept loaded, where an error status would make it drop
+//                   the model. A connection failure pauses the bridge (src/core/Client.h): runs answer so at once
+//                   until the background thread's HELLO is answered. Every run is counted once, answered or by its
+//                   reason.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.
 //
 // AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;
@@ -41,8 +42,8 @@
 // (CreateSessionFromArray, the two with prepacked weights, the model editor's three) answer with an error status
 // naming them, since a model loaded so would run on this PC; so do the DirectML table's three entries for graphics
 // memory (CreateGPUAllocationFromD3DResource, FreeGPUAllocation, GetD3D12ResourceFromAllocation), since a tensor in
-// this PC's graphics memory can't be sent byte for byte. A run handed such a tensor gets the NaN answer (at BFA's
-// warm-up, its model then isn't loaded), with the same note. Everything else is the real runtime.
+// this PC's graphics memory can't be sent byte for byte. A run handed such a tensor gets an error status too, so BFA
+// doesn't load that model (or drops it), logged and noted once a model. Everything else is the real runtime.
 
 #include <atomic>
 #include <chrono>
@@ -183,6 +184,7 @@ private:
     std::vector<proto::ModelEntry> LiveModelsLocked() const;
     void Log(Level level, const std::string& line) const;
     void NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** outputs) noexcept;
+    OrtStatus* RefuseGraphicsRun(const OrtApi* real, const std::string& model, const std::string& why, Clock::time_point start) noexcept;
     // A run the server didn't answer: counted (and logged unless quiet) by the client, told to the monitor and the
     // server (unless quiet), then the NaN answer.
     void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
