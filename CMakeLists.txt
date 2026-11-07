@@ -12,7 +12,7 @@
 # BFARB_BFA_DLL=<BFA's BetterFacialAnimations.dll>, in the environment when the tests run, add BFA's own files
 # (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.4.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,6 +66,7 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------------------- core
 add_library(bfarb_core STATIC
   src/core/BfaMode.cpp
+  src/core/BfaSizes.cpp
   src/core/Bridge.cpp
   src/core/Client.cpp
   src/core/Monitor.cpp

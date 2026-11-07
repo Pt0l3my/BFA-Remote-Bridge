@@ -58,9 +58,10 @@ DiscoveryFactory WinsockDiscovery();
 
 // ---- BfaIni.cpp
 
-// BFA's INI (Data\SKSE\Plugins\BetterFacialAnimations.ini, the relative path BFA itself uses) and the bridge's own
-// state (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] ForceCPUSetByBridge), through Windows' profile calls, as
-// BFA's. BFA's INI is never created.
+// BFA's INI (Data\SKSE\Plugins\BetterFacialAnimations.ini, the relative path BFA itself uses), BFA 5's installer
+// choice files beside it (BetterFacialAnimations\Installer\<choice>.ini, read only) and the bridge's own state
+// (Data\SKSE\Plugins\BFARemoteBridge.ini, [BfaMode] ForceCPUSetByBridge and EmotionDeviceSetByBridge), through
+// Windows' profile calls. BFA's INI is never created.
 std::unique_ptr<IniStore> BfaIniStore();
 
 // ---- Main.cpp

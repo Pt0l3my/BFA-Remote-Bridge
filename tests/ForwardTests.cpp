@@ -807,6 +807,10 @@ struct MemoryIni final : IniStore {
         setByBridge = v;
         return true;
     }
+    std::optional<std::string> ReadBfaValue(const char*, const char*, const char*) override { return std::nullopt; }
+    bool WriteBfaValue(const char*, const std::string&, std::string&) override { return true; }
+    std::string ReadRecord(const char*) override { return {}; }
+    bool WriteRecord(const char*, const char*, std::string&) override { return true; }
 };
 }  // namespace
 

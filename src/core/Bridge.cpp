@@ -9,6 +9,7 @@
 #include <limits>
 #include <utility>
 
+#include "core/BfaSizes.h"
 #include "core/Scrub.h"
 #include "core/Sha256.h"
 #include "core/Status.h"
@@ -44,15 +45,16 @@ struct Built {
     bool newer = false;
 } g_built;
 
-// OrtDmlApi's layout in ONNX Runtime 1.24.4's dml_provider_factory.h (MIT): eight entries, of which the three that
-// append DirectML to a session's options are wrapped. The others keep the real pointers; their Direct3D types are
-// opaque here.
+// OrtDmlApi's layout in ONNX Runtime 1.24.4's dml_provider_factory.h (MIT): eight entries. The three that append
+// DirectML to a session's options are wrapped; the three for graphics memory (a D3D12 resource as the runtime's
+// allocation, and back) answer with an error status naming them, since a tensor in this PC's graphics memory can't be
+// sent to the server; the device and queue getters keep the real pointers. Their Direct3D types are opaque here.
 struct DmlApi {
     OrtStatus*(ORT_API_CALL* AppendDml)(OrtSessionOptions* options, int deviceId) noexcept;
     OrtStatus*(ORT_API_CALL* AppendDml1)(OrtSessionOptions* options, void* dmlDevice, void* commandQueue) noexcept;
-    void* createGpuAllocationFromD3DResource;
-    void* freeGpuAllocation;
-    void* getD3D12ResourceFromAllocation;
+    OrtStatus*(ORT_API_CALL* CreateGpuAllocationFromD3DResource)(void* d3dResource, void** dmlResource) noexcept;
+    OrtStatus*(ORT_API_CALL* FreeGpuAllocation)(void* dmlResource) noexcept;
+    OrtStatus*(ORT_API_CALL* GetD3D12ResourceFromAllocation)(OrtAllocator* provider, void* dmlResource, void** d3dResource) noexcept;
     OrtStatus*(ORT_API_CALL* AppendDml2)(OrtSessionOptions* options, void* deviceOptions) noexcept;
     void* getDmlDevice;
     void* getDmlCommandQueue;
@@ -121,6 +123,28 @@ OrtStatus* ORT_API_CALL WrapAppendDml2(OrtSessionOptions* options, void* deviceO
     return status;
 }
 
+// The graphics-memory entries: what they would make lives in this PC's graphics memory, which the bridge can't send.
+OrtStatus* RefuseGraphicsMemory(const char* name) noexcept {
+    if (Bridge* b = Bridge::Current()) {
+        try {
+            b->OnUnservedCall(name, std::string("DirectML's ") + name + ", for a tensor in this PC's graphics memory",
+                              "this Better Facial Animations puts its model's data in graphics memory (" + std::string(name) +
+                                  "), which the bridge can't send to the server");
+        } catch (...) {
+        }
+    }
+    const OrtApi* real = Real();
+    if (!real) return nullptr;
+    const std::string text = std::string("BFA Remote Bridge: ") + name +
+                             " isn't served: the model runs on the server, which a tensor in this PC's graphics memory can't reach";
+    return real->CreateStatus(ORT_NOT_IMPLEMENTED, text.c_str());
+}
+OrtStatus* ORT_API_CALL RefuseCreateGpuAllocation(void*, void**) noexcept { return RefuseGraphicsMemory("CreateGPUAllocationFromD3DResource"); }
+OrtStatus* ORT_API_CALL RefuseFreeGpuAllocation(void*) noexcept { return RefuseGraphicsMemory("FreeGPUAllocation"); }
+OrtStatus* ORT_API_CALL RefuseGetD3D12Resource(OrtAllocator*, void*, void**) noexcept {
+    return RefuseGraphicsMemory("GetD3D12ResourceFromAllocation");
+}
+
 // The DirectML table is wrapped only at API version 24 from a runtime at least that new: its layout is 1.24.4's.
 // Any other version gets the real table, and BFA's GPU route is then seen only through
 // SessionOptionsAppendExecutionProvider.
@@ -136,6 +160,9 @@ OrtStatus* ORT_API_CALL WrapGetProviderApi(const char* name, std::uint32_t versi
         g_dml.AppendDml = real->AppendDml ? &WrapAppendDml : nullptr;
         g_dml.AppendDml1 = real->AppendDml1 ? &WrapAppendDml1 : nullptr;
         g_dml.AppendDml2 = real->AppendDml2 ? &WrapAppendDml2 : nullptr;
+        g_dml.CreateGpuAllocationFromD3DResource = &RefuseCreateGpuAllocation;
+        g_dml.FreeGpuAllocation = &RefuseFreeGpuAllocation;
+        g_dml.GetD3D12ResourceFromAllocation = &RefuseGetD3D12Resource;
         g_realDml.store(real);
     }
     *api = &g_dml;
@@ -254,7 +281,16 @@ bool IsBridge(const T&) noexcept {
     return false;
 }
 
-OrtStatus* NotOnBridgeSession(const OrtApi* real) noexcept {
+// Logged once, with a note to update the bridge: BFA 4.3.2 and 5.0.6 call none of these on a session.
+OrtStatus* NotOnBridgeSession(const OrtApi* real, const char* name) noexcept {
+    if (Bridge* b = Bridge::Current()) {
+        try {
+            b->OnUnservedCall(name, std::string(name) + " on a model the server runs (the bridge forwards Run alone)",
+                              "this Better Facial Animations calls " + std::string(name) + " on a model the server runs, which the bridge "
+                              "doesn't forward");
+        } catch (...) {
+        }
+    }
     return real->CreateStatus(ORT_FAIL, "BFA Remote Bridge: this call isn't available on a session the server runs");
 }
 
@@ -268,8 +304,9 @@ struct Guard;
 template <typename Table, typename... A, OrtStatus*(ORT_API_CALL* Table::*Member)(A...) noexcept>
 struct Guard<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
     static inline const Table* real = nullptr;
+    static inline const char* name = "";
     static OrtStatus* ORT_API_CALL Call(A... a) noexcept {
-        if ((IsBridge(a) || ...)) return NotOnBridgeSession(Real());
+        if ((IsBridge(a) || ...)) return NotOnBridgeSession(Real(), name);
         return (real->*Member)(a...);
     }
 };
@@ -281,6 +318,7 @@ struct Guard<Table, OrtStatus*(ORT_API_CALL*)(A...) noexcept, Member> {
     do {                                                                                               \
         using G = Guard<TABLE, decltype(TABLE::NAME), &TABLE::NAME>;                                   \
         G::real = (REAL);                                                                              \
+        G::name = #NAME;                                                                               \
         (COPY).NAME = &G::Call;                                                                        \
     } while (false)
 
@@ -469,6 +507,8 @@ const OrtApiBase* ORT_API_CALL HookedGetApiBase() noexcept {
     return &g_base;
 }
 
+constexpr const char* kNotCpuMemory = "isn't in CPU memory";
+
 struct Tensor {
     std::uint8_t dtype = 0;
     std::vector<std::int64_t> dims;
@@ -512,7 +552,7 @@ bool ReadTensor(const OrtApi* real, const OrtValue* value, Tensor& t, std::strin
         }
         real->MemoryInfoGetDeviceType(memory, &device);
         if (device != OrtMemoryInfoDeviceType_CPU) {
-            why = "isn't in CPU memory";
+            why = kNotCpuMemory;
             return false;
         }
     }
@@ -680,6 +720,19 @@ void Bridge::OnUnservedEntry(const std::string& name) {
     client_.ReportFallback(Reason::Incompatible);
 }
 
+void Bridge::OnUnservedCall(const std::string& name, const std::string& what, const std::string& shown) {
+    {
+        std::lock_guard lock(sessionsMutex_);
+        if (std::find(unservedLogged_.begin(), unservedLogged_.end(), name) != unservedLogged_.end()) return;
+        unservedLogged_.push_back(name);
+    }
+    Log(Level::Warn, "Better Facial Animations called ONNX Runtime's " + what +
+                         ", which the bridge can't forward byte for byte; BFA gets an error status, so what needs it gets the game's "
+                         "own lip sync. Update the bridge.");
+    monitor_.Fallback(Reason::Incompatible, std::string(), shown + ". Update the bridge");
+    client_.ReportFallback(Reason::Incompatible);
+}
+
 void Bridge::OnStates(const std::string& server, const std::string& device, const std::vector<ModelState>& models) {
     for (const ModelState& m : models) {
         const bool ready = m.status == static_cast<std::uint8_t>(proto::ModelStatus::Ready);
@@ -757,6 +810,8 @@ OrtStatus* Bridge::RefuseWith(const OrtApi* real, const std::string& model, cons
 
 void Bridge::ExpectSettings(bool skyrimNet) { skyrimNet_.store(skyrimNet); }
 
+void Bridge::SetBfaBatch(int batch) noexcept { bfaBatch_.store(batch < 1 ? 1 : batch); }
+
 bool Bridge::HashCached(const std::filesystem::path& file, std::uint64_t& size, Sha256::Digest& digest, std::string& err) {
     std::error_code ec;
     const auto fileSize = std::filesystem::file_size(file, ec);
@@ -810,6 +865,14 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             return status;
         }
 
+        // BFA's CPU route sets no sizes: for a BFA whose GPU route's sizes the bridge knows (5.0.6), it lists them
+        std::string listed;
+        if (overrides.empty()) {
+            const std::string bfa = client_.CurrentVersions().bfa;
+            overrides = GpuRouteSizes(bfa, name, bfaBatch_.load());
+            if (!overrides.empty()) listed = " (BFA " + bfa + "'s GPU sizes, listed by the bridge)";
+        }
+
         auto session = std::make_unique<Session>();
         session->entry.name = name;
         session->entry.overrides = std::move(overrides);
@@ -829,7 +892,7 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
         std::string list;
         for (const auto& o : session->entry.overrides) list += (list.empty() ? "" : ", ") + o.name + " = " + std::to_string(o.value);
         Log(Level::Info, "Model " + name + ": " + std::to_string(session->entry.size) + " bytes, SHA-256 " + Sha256::Hex(session->entry.sha256) +
-                             (list.empty() ? ", no overrides" : ", overrides " + list) + "; asking the server");
+                             (list.empty() ? ", no overrides" : ", overrides " + list) + listed + "; asking the server");
 
         // the new model alone, on a side connection; the main connection gets the full list once the session is in
         const Admission a = client_.Admit(session->entry);
@@ -912,10 +975,10 @@ void Bridge::NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** o
 }
 
 void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
-                      std::size_t outputCount, OrtValue** outputs) noexcept {
+                      std::size_t outputCount, OrtValue** outputs, const std::string& words) noexcept {
     try {
         client_.RecordFallback(model, fallback, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
-        monitor_.Fallback(reason, model);
+        monitor_.Fallback(reason, model, words);
         client_.ReportFallback(reason, model, fallback.text);  // a line: a NOTICE to a version 2 server
     } catch (...) {
     }
@@ -941,12 +1004,12 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
 
     // a bridge session: from here on every path returns success, with the server's outputs or NaN ones, and every run
     // is counted once
-    const auto fallBack = [&](Why why, std::string text, bool quiet, Reason reason) -> OrtStatus* {
+    const auto fallBack = [&](Why why, std::string text, bool quiet, Reason reason, const std::string& words = {}) -> OrtStatus* {
         Fallback f;
         f.why = why;
         f.text = std::move(text);
         f.quiet = quiet;
-        FallBack(real, entry.name, f, reason, start, outputCount, outputs);
+        FallBack(real, entry.name, f, reason, start, outputCount, outputs, words);
         return nullptr;
     };
     if (superseded) {  // a newer session of its model replaced it: counted, nothing logged or told
@@ -967,9 +1030,10 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
             return fallBack(Why::Other, "the call names no outputs or lacks its inputs", false, Reason::Incompatible);
         std::vector<Tensor> in(inputCount), given(outputCount);
         std::string why;
-        bool supported = true;
+        bool supported = true, graphicsMemory = false;
         for (std::size_t i = 0; supported && i < inputCount; ++i) {
             if (!inputNames[i] || !ReadTensor(real, inputs[i], in[i], why)) {
+                graphicsMemory = why == kNotCpuMemory;
                 why = "input " + std::string(inputNames[i] ? inputNames[i] : "?") + " " + why;
                 supported = false;
             }
@@ -979,6 +1043,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 why = "an output has no name";
                 supported = false;
             } else if (outputs[i] && !ReadTensor(real, outputs[i], given[i], why)) {
+                graphicsMemory = why == kNotCpuMemory;
                 why = "output " + std::string(outputNames[i]) + " " + why;
                 supported = false;
             }
@@ -990,8 +1055,13 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 const auto it = sessions_.find(session);
                 if (it != sessions_.end() && !it->second->unsupportedLogged) first = it->second->unsupportedLogged = true;
             }
-            if (first) Log(Level::Warn, entry.name + ": " + why + ", which the protocol can't carry; those lines get the game's own lip sync");
-            return fallBack(Why::Other, why + ", which the protocol can't carry", true, Reason::Incompatible);
+            if (first)
+                Log(Level::Warn, entry.name + ": " + why + ", which the protocol can't carry; those lines get the game's own lip sync" +
+                                     (graphicsMemory ? " (at BFA's warm-up, its model isn't loaded). Update the bridge." : ""));
+            return fallBack(Why::Other, why + ", which the protocol can't carry", true, Reason::Incompatible,
+                            graphicsMemory ? "this Better Facial Animations hands its model data in graphics memory, which the bridge "
+                                             "can't send to the server. Update the bridge"
+                                           : std::string());
         }
 
         proto::RunRequest request;

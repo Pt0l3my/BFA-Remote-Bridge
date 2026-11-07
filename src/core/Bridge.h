@@ -18,7 +18,8 @@
 // With the bridge, no BFA model runs on this PC: every model load is the server's or is refused.
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
-//                   taken, and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
+//                   taken (none set, as BFA's CPU route sets none: for BFA 5.0.6, the sizes its GPU route sets,
+//                   core/BfaSizes.h), and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
 //                   bridge's own. Not, or no server found, or the settings not read yet: BFA gets an error
 //                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
 //                   get the game's own lip sync.
@@ -35,10 +36,13 @@
 // SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
 // to see that BFA is set to use the graphics card, which the bridge logs at Detailed, as a fact: the hardware is
 // PandorumLLM's choice, and the bridge advises nothing about it. Every one of these passes the call
-// through unchanged. Every other entry that takes a session answers a bridge session with an error status. The
-// runtime's other session makers (CreateSessionFromArray, the two with prepacked weights, the model editor's three)
-// answer with an error status naming them, since a model loaded so would run on this PC. Everything else is the real
-// runtime.
+// through unchanged. Every other entry that takes a session answers a bridge session with an error status, logged
+// once with a note to update the bridge (BFA 4.3.2 and 5.0.6 call none of them). The runtime's other session makers
+// (CreateSessionFromArray, the two with prepacked weights, the model editor's three) answer with an error status
+// naming them, since a model loaded so would run on this PC; so do the DirectML table's three entries for graphics
+// memory (CreateGPUAllocationFromD3DResource, FreeGPUAllocation, GetD3D12ResourceFromAllocation), since a tensor in
+// this PC's graphics memory can't be sent byte for byte. A run handed such a tensor gets the NaN answer (at BFA's
+// warm-up, its model then isn't loaded), with the same note. Everything else is the real runtime.
 
 #include <atomic>
 #include <chrono>
@@ -122,6 +126,8 @@ public:
     // no server address.
     void Apply(const Settings& settings);
     void ExpectSettings(bool skyrimNet);
+    // BFA 5.0.6's [General] Batch, the Legacy model's frames per run (core/BfaSizes.h); 2 until set.
+    void SetBfaBatch(int batch) noexcept;
     Settings CurrentSettings() const;
     Client& Connection() noexcept { return client_; }
     Monitor& Notes() noexcept { return monitor_; }
@@ -140,6 +146,9 @@ public:
     void OnNewerEntry(std::size_t index);
     void OnCantServe(const std::string& runtime, const std::string& why, bool newer);
     void OnUnservedEntry(const std::string& name);
+    // A call the bridge can't forward byte for byte (on a bridge session, or for graphics memory): logged once, a
+    // note to update the bridge, and the status check's fallback.
+    void OnUnservedCall(const std::string& name, const std::string& what, const std::string& shown);
     OrtStatus* CreateSession(const OrtApi* real, const OrtEnv* env, const ORTCHAR_T* path, const OrtSessionOptions* options,
                              OrtSession** out) noexcept;
     void ReleaseSession(const OrtApi* real, OrtSession* session) noexcept;
@@ -177,7 +186,7 @@ private:
     // A run the server didn't answer: counted (and logged unless quiet) by the client, told to the monitor and the
     // server (unless quiet), then the NaN answer.
     void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
-                  std::size_t outputCount, OrtValue** outputs) noexcept;
+                  std::size_t outputCount, OrtValue** outputs, const std::string& words = {}) noexcept;
     void OnStates(const std::string& server, const std::string& device, const std::vector<ModelState>& models);
 
     LogSink log_;
@@ -188,6 +197,7 @@ private:
     Settings settings_;
     std::atomic<bool> settingsRead_{false};
     std::atomic<bool> skyrimNet_{false};
+    std::atomic<int> bfaBatch_{2};
 
     std::mutex hashMutex_;
     std::map<std::string, HashEntry> hashes_;

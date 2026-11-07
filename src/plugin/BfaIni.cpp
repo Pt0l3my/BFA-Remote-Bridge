@@ -1,7 +1,8 @@
-// The plugin's IniStore (core/BfaMode.h): BFA's INI and the bridge's own state, through Windows' profile calls, as
-// BFA itself reads and writes its file (GetPrivateProfileIntA and WritePrivateProfileStringA, with the same relative
-// path, from the game's folder). Called on the game's main thread only: at a task the client's version sink queued,
-// and at SKSE's save message; never from DllMain or at the process's exit.
+// The plugin's IniStore (core/BfaMode.h): BFA's INI, BFA 5's installer choice files and the bridge's own state,
+// through Windows' profile calls, with the relative paths BFA itself uses, from the game's folder (BFA 4.3.2 reads
+// its file with GetPrivateProfileIntA; BFA 5.0.6 with SimpleIni, whose numbers core/BfaMode.cpp parses as it does).
+// Called on the game's main thread only: at a task the client's version sink queued, at SKSE's save message, and at
+// its post-load message for BFA 5's Batch; never from DllMain or at the process's exit.
 
 #include "plugin/Plugin.h"
 
@@ -12,6 +13,17 @@ constexpr char kBfaIni[] = "Data\\SKSE\\Plugins\\BetterFacialAnimations.ini";
 constexpr char kStateIni[] = "Data\\SKSE\\Plugins\\BFARemoteBridge.ini";
 constexpr char kStateSection[] = "BfaMode";
 constexpr char kStateKey[] = "ForceCPUSetByBridge";  // "1": the bridge set ForceCPU=1 over a 0
+constexpr char kInstallerFolder[] = "Data\\SKSE\\Plugins\\BetterFacialAnimations\\Installer\\";
+// What a profile call answers for a key that isn't there: no value holds it.
+constexpr char kAbsent[] = "\x01" "bfarb absent" "\x01";
+
+// [section] key in file, as written (the profile call trims its blanks); empty when the file or the key isn't there.
+std::optional<std::string> ReadValue(const char* file, const char* section, const char* key) {
+    char value[256] = {};
+    ::GetPrivateProfileStringA(section, key, kAbsent, value, sizeof value, file);
+    if (std::string_view(value) == kAbsent) return std::nullopt;
+    return std::string(value);
+}
 
 class ProfileIniStore final : public IniStore {
 public:
@@ -39,6 +51,21 @@ public:
     }
     bool WriteSetByBridge(bool set, std::string& err) override {
         return Write(kStateSection, kStateKey, set ? "1" : nullptr, kStateIni, err);
+    }
+    std::optional<std::string> ReadBfaValue(const char* choice, const char* section, const char* key) override {
+        if (!choice) return ReadValue(kBfaIni, section, key);
+        return ReadValue((std::string(kInstallerFolder) + choice + ".ini").c_str(), section, key);
+    }
+    bool WriteBfaValue(const char* key, const std::string& value, std::string& err) override {
+        if (!BfaIniPresent()) {  // never created
+            err = "BFA's INI isn't there";
+            return false;
+        }
+        return Write("General", key, value.c_str(), kBfaIni, err);
+    }
+    std::string ReadRecord(const char* key) override { return ReadValue(kStateIni, kStateSection, key).value_or(std::string()); }
+    bool WriteRecord(const char* key, const char* value, std::string& err) override {
+        return Write(kStateSection, key, value, kStateIni, err);
     }
 
 private:

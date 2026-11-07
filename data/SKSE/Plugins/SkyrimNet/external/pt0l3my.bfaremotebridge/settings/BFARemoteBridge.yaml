@@ -10,7 +10,7 @@
 
 plugin:
   name: "BFARemoteBridge"
-  version: "1.4.0"
+  version: "1.5.0"
   description: "Sends Better Facial Animations' lip-sync model runs to PandorumLLM's A2F server on another PC of your network, and shows what the server does."
 
 schema:

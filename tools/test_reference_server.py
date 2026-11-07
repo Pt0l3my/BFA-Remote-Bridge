@@ -537,6 +537,21 @@ class ReferenceServerTests(unittest.TestCase):
             self.assertEqual(c.answer()[0], 4)
         self.assertEqual(details, [(0, "built with BFA 4.3.2.3's sizes"), (0, "")])
 
+    def test_hello_log_records_the_models_and_overrides_as_listed(self):
+        path = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False).name
+        self.addCleanup(os.unlink, path)
+        port = self.other_server("--hello-log", path)
+        c = self.connect(port)
+        c.send(hello("sesame", [self.entry], version=2))
+        self.assertEqual(c.answer()[0], 2)
+        c.send(hello("sesame", [(self.entry[0], self.entry[1], self.entry[2], [])], version=2))
+        self.assertEqual(c.answer()[0], 2)
+        with open(path, encoding="utf-8") as f:
+            logged = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual([h["models"] for h in logged],
+                         [[{"name": "tiny.onnx", "overrides": [["batch", 2]]}], [{"name": "tiny.onnx", "overrides": []}]])
+        self.assertEqual([(h["client"], h["version"]) for h in logged], [("test client", 2)] * 2)
+
 
 if __name__ == "__main__":
     MODELS = sys.argv.pop(1)
