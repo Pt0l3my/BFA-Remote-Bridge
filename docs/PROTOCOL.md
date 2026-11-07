@@ -16,7 +16,7 @@ says otherwise; [BFA 5.0.6](#bfa-506) below gives what changed.
 
 - BFA loads `onnxruntime.dll` (ONNX Runtime **1.24.4**, DirectML build, `ORT_API_VERSION` **24**) from its own folder,
   `SKSE/Plugins/BetterFacialAnimations/`, with `DirectML.dll` and `onnxruntime_providers_shared.dll` beside it. It
-  does so only after a save loads or a new game starts, on its own worker thread.
+  does so only once a save has loaded or a new game has begun, on its own worker thread.
 - It runs the model on **its own worker thread**, with **ordinary CPU memory** in and out, even in GPU mode
   (`CreateTensorWithDataAsOrtValue` over host buffers, `Run`, then reading the outputs). Nothing it hands to the
   runtime lives on the GPU, so a call can be forwarded byte for byte.
@@ -54,8 +54,8 @@ second past a line's first 3.75 seconds (its 60000-sample window), and once for 
 BFA 5.0.6 ships the same runtime (`onnxruntime.dll` and `DirectML.dll` are byte for byte 4.3.2's: ONNX Runtime
 1.24.4, API version 24) and the same `performance.onnx`. Its DLL reports 5.0.6.N, N being BFA's count of its builds
 of 5.0.6; these facts were checked against 5.0.6.3's, and the bridge treats every 5.0.6.N alike. It loads the runtime
-and looks up `OrtGetApiBase` as 4.3.2 does (`GetProcAddress`, imported from KERNEL32 by name), after a save loads or a
-new game starts, on its worker. What changed:
+and looks up `OrtGetApiBase` as 4.3.2 does (`GetProcAddress`, imported from KERNEL32 by name), once a save has loaded or a
+new game has begun, on its worker. What changed:
 
 - **The models.** A second emotion model, Performance (`emotion_performance.onnx`, 21,584,010 bytes, SHA-256
   8245b49ef7095020c638d845abad97eb70dec278f7c960f8289a5fab9fb5ec16 in BFA's source), its default: BFA makes its 48 x
