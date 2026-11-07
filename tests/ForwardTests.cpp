@@ -274,15 +274,17 @@ std::vector<std::uint8_t> Bytes(const OrtApi* api, OrtValue* v, std::vector<std:
     return std::vector<std::uint8_t>(p, p + size);
 }
 
-// The same run on a real session of the runtime's own, outside the bridge.
+// The same run on a real session of the runtime's own, outside the bridge. threads: its intra-op threads (1 keeps the
+// runtime's own thread pool, which ThreadSanitizer can't see into, out of a larger model's run).
 std::vector<std::vector<std::uint8_t>> LocalRun(const fs::path& model, std::vector<std::pair<const char*, int>> overrides, const char* const* in,
-                                                const std::vector<OrtValue*>& inputs, const char* const* out, std::size_t outCount) {
+                                                const std::vector<OrtValue*>& inputs, const char* const* out, std::size_t outCount,
+                                                int threads = 2) {
     const OrtApi* real = RealApi();
     OrtEnv* env = nullptr;
     Ok(real->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "bfarb-local", &env));
     OrtSessionOptions* so = nullptr;
     Ok(real->CreateSessionOptions(&so));
-    Ok(real->SetIntraOpNumThreads(so, 2));
+    Ok(real->SetIntraOpNumThreads(so, threads));
     Ok(real->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_EXTENDED));
     for (auto [n, v] : overrides) Ok(real->AddFreeDimensionOverrideByName(so, n, v));
     OrtSession* s = nullptr;
@@ -1563,7 +1565,7 @@ TEST(ForwardBfa506PerformanceEmotion) {
         std::vector<std::int64_t> dims;
         const auto got = Bytes(h.api, o.v[0], &dims);
         CHECK(dims == (std::vector<std::int64_t>{1, 6}));
-        const auto local = LocalRun(dir / "emotion_performance.onnx", {{"batch_size", 1}, {"seq_len", 60000}, {"batch", 1}}, in, {x}, out, 1);
+        const auto local = LocalRun(dir / "emotion_performance.onnx", {{"batch_size", 1}, {"seq_len", 60000}, {"batch", 1}}, in, {x}, out, 1, 1);
         CHECK(got == local[0]);
         h.api->ReleaseValue(x);
     }
