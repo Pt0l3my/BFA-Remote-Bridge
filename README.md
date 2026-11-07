@@ -204,7 +204,14 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   the bridge's value is there, can't be told from the bridge's own, and is put back too. When its note is missing or
   unreadable, it puts nothing back. It never creates BFA's INI: without that file, BFA's mode is left as it is. A game
   start without BFA's INI (BFA's mod disabled for a while, say), or with one the bridge can't read at that moment,
-  leaves the bridge's notes as they are, and nothing is written into an INI the bridge can't read.
+  leaves the bridge's notes as they are, and nothing is written into an INI the bridge can't read. After a start at
+  which BFA's INI couldn't be read, a CPU picked in BFA's menu later that session can't be told from the bridge's own
+  either.
+- The bridge's notes are one file in Mod Organizer 2's Overwrite, so they are shared by every profile, and by every
+  BFA version you switch between. A game start whose BFA INI doesn't hold the bridge's value clears the note of it
+  (for `EmotionDevice`, only a start of BFA 5.0.6), and that value is then not put back in the other profile. A
+  `ForceCPU=1` or `EmotionDevice=-1` of your own in one profile can't be told from the bridge's while the other's note
+  is there.
 - Only for Better Facial Animations 4.3.2.3 and 5.0.6, the versions the bridge is made for: any other BFA version's
   mode is left as it is, and the values the bridge set earlier are put back once the bridge attaches to that version
   and a server answers.

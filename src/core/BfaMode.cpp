@@ -199,11 +199,14 @@ void BfaCpuMode::FailOnceLocked(const std::string& key, const std::string& line)
     if (failLogged_.insert(key).second) Log(Level::Warn, line);
 }
 
-// Every value the bridge set goes back, each by its own record. BFA 4.3.2.3 has no EmotionDevice: that record, made
-// for BFA 5.0.6's INI, is left as it is.
+// BFA 4 (4.3.2.3 or any other 4.x) has no EmotionDevice key.
+static bool IsBfa4(const std::string& version) { return version.rfind("4.", 0) == 0; }
+
+// Every value the bridge set goes back, each by its own record. BFA 4 has no EmotionDevice: that record, made for
+// BFA 5.0.6's INI, is left as it is under any BFA 4.
 void BfaCpuMode::PutBackLocked(const std::string& because) {
     const auto force = ForceCpuPutBack(store_->ReadRecord(kForceCpuRecord));
-    const auto emotion = Bfa4Locked() ? std::nullopt : EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord));
+    const auto emotion = IsBfa4(bfaVersion_) ? std::nullopt : EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord));
     if (!force && !emotion) return;
     const BfaIniState state = StateLocked();
     if (state == BfaIniState::Unreadable) return;  // nothing cleared, nothing written

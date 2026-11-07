@@ -38,13 +38,25 @@ std::optional<std::string> ReadValue(const char* file, const char* section, cons
     return std::string(value);
 }
 
+// The whole file, or nothing: opened, sized, and every byte read (a read cut short by another program's lock or a read
+// error counts as unreadable, where a stream iterator would stop silently with part of the file).
+std::optional<std::string> ReadWhole(const char* file) {
+    std::ifstream in(file, std::ios::binary | std::ios::ate);
+    if (!in) return std::nullopt;
+    const std::streamoff size = in.tellg();
+    if (size < 0) return std::nullopt;
+    in.seekg(0, std::ios::beg);
+    std::string text(static_cast<std::size_t>(size), '\0');
+    if (size > 0 && !in.read(text.data(), size)) return std::nullopt;
+    if (in.gcount() != size) return std::nullopt;
+    return text;
+}
+
 // BFA 5's files: [section] key as BFA 5 reads it; empty when the file can't be read or the key isn't there.
 std::optional<std::string> ReadBfa5(const char* file, const char* section, const char* key) {
-    std::ifstream in(file, std::ios::binary);
-    if (!in) return std::nullopt;
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (in.bad()) return std::nullopt;
-    return IniTextValue(text, section, key);
+    const auto text = ReadWhole(file);
+    if (!text) return std::nullopt;
+    return IniTextValue(*text, section, key);
 }
 
 bool BfaIniPresent() {
@@ -58,10 +70,7 @@ public:
     // where a profile call would answer its default and the bridge would take the key for gone.
     BfaIniState BfaIni() override {
         if (!BfaIniPresent()) return BfaIniState::Missing;
-        std::ifstream in(kBfaIni, std::ios::binary);
-        if (!in) return BfaIniState::Unreadable;
-        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        return in.bad() ? BfaIniState::Unreadable : BfaIniState::Readable;
+        return ReadWhole(kBfaIni) ? BfaIniState::Readable : BfaIniState::Unreadable;
     }
     int ReadForceCpu() override {
         // as BFA's LoadIni: the legacy GPU=0 is the default, ForceCPU overrides it

@@ -1048,6 +1048,7 @@ TEST(BfaModeLeavesAnUnreadableIni) {
     r.ini->readable = false;
     const int writes = r.ini->iniWrites + r.ini->recordWrites;
     auto next = r.NextStart("5.0.6.3");
+    CHECK_EQ(r.Logged("couldn't be read"), 1);  // said at the start itself
     next->OnServerVersion(1);
     next->OnGameSave();
     next->OnServerVersion(2);
@@ -1096,6 +1097,12 @@ TEST(BfaModeKeepsBfa5sRecordUnder4323) {
     CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
     CHECK_EQ(r.Logged("EmotionDevice from"), 0);
+    // another BFA 4 (4.4.0): no EmotionDevice in its INI either, and its answers and saves leave the record
+    auto other4 = r.NextStart("4.4.0");
+    other4->OnServerVersion(1);
+    other4->OnGameSave();
+    other4->OnServerVersion(2);
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
     // another version's start leaves it too (its put-back runs at an answer)
     r.NextStart("5.1.0.1");
     CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));

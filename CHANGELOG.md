@@ -33,9 +33,11 @@ facts only.
   puts them back again, and a record stays until a game start finds BFA's own INI without the bridge's value
   (`BfaCpuMode::OnStart`, at SKSE's post-load message, after BFA has loaded its INI). A start without BFA's INI leaves
   the records, since BFA loaded nothing of it; the EmotionDevice record is cleared only at a start of BFA 5.0.6, and
-  BFA 4.3.2.3's put-back leaves it, so a Mod Organizer 2 profile with 4.3.2.3 doesn't lose 5.0.6's record. BFA's INI
-  there but unreadable (`IniStore::BfaIni`, a third state): nothing is cleared or written at that start, answer or
-  save, and it is logged once. Only a value still the bridge's in BFA's own INI is put back. The set line names only
+  any BFA 4's put-back leaves it, so a Mod Organizer 2 profile with BFA 4 doesn't lose 5.0.6's EmotionDevice record.
+  The records are still one file for every profile and BFA version (README, "BFA's mode"): ForceCPU's is cleared at
+  any start whose INI doesn't hold the bridge's value, and both are, between two BFA 5.0.6 profiles. BFA's INI
+  there but unreadable (`IniStore::BfaIni`, a third state, every byte read or the file counts as unreadable): nothing
+  is cleared or written at that start, answer or save, and it is logged once. Only a value still the bridge's in BFA's own INI is put back. The set line names only
   what BFA reads on the CPU after the writes, and each failure is logged once per key.
 - **BFA 5.0.6's sizes, listed by the bridge** (`src/core/BfaSizes.h`). In its CPU mode BFA sets no free-dimension
   overrides. For BFA 5.0.6 the bridge now lists the ones its GPU route sets, by BFA version and file name (every
