@@ -552,6 +552,33 @@ TEST(PeReadsBetterFacialAnimationsDll) {
                 pe::UnpackVersion(v.pluginVersion).c_str());
 }
 
+// BFA 5.0.6's DLL (never committed): BFARB_BFA5_DLL names it. It still imports GetProcAddress from KERNEL32 by name,
+// which the bridge's hook patches, and reports 5.0.6.3, which the bridge's BFA 5 rules take as 5.0.6.
+TEST(PeReadsBetterFacialAnimations506Dll) {
+    const char* path = std::getenv("BFARB_BFA5_DLL");
+    if (!path || !*path) SKIP("BFARB_BFA5_DLL isn't set");
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<std::uint8_t> image;
+    CHECK(pe::MapFile(file, image));
+    std::size_t slot = 0;
+    CHECK(pe::FindImportSlot(image.data(), image.size(), "KERNEL32.dll", "GetProcAddress", slot));
+    std::uint32_t rva = 0;
+    CHECK(pe::FindExport(image.data(), image.size(), "SKSEPlugin_Version", rva));
+    pe::SksePluginVersion v{};
+    CHECK(rva + sizeof v <= image.size());
+    std::memcpy(&v, image.data() + rva, sizeof v);
+    CHECK_EQ(v.dataVersion, 1u);
+    const std::string version = pe::UnpackVersion(v.pluginVersion);
+    CHECK_EQ(version, std::string("5.0.6.3"));
+    CHECK(IsBfa506(version));
+    CHECK(ListsSizesFor(version));
+    CHECK_EQ(std::string(v.pluginName), std::string("BetterFacialAnimations"));
+    CHECK_EQ(pe::ImageSize(image.data(), 0x1000), image.size());
+    std::printf("        BFA 5's DLL: GetProcAddress's IAT slot at RVA 0x%zx, SKSEPlugin_Version at RVA 0x%x, version %s\n", slot, rva,
+                version.c_str());
+}
+
 // ---- paths out of other programs' messages
 
 // A server's detail as PandorumLLM sent it in the owner's Force CPU test: ONNX Runtime's raw message, with addresses
