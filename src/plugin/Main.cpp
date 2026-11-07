@@ -152,14 +152,18 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 g_skyrimNet = SkyrimNetLoaded();
                 g_bridge->ExpectSettings(g_skyrimNet);
                 g_bridge->Connection().SetBfaVersion(g_bfa.version);
-                if (g_mode) g_mode->SetBfaVersion(g_bfa.version);  // its CPU mode is set for BFA 4.3.2.3 and 5.0.6 alone
+                if (g_mode) {
+                    g_mode->SetBfaVersion(g_bfa.version);  // its CPU mode is set for BFA 4.3.2.3 and 5.0.6 alone
+                    g_mode->OnStart();                     // BFA has loaded its INI: what it loaded settles the records
+                }
                 // BFA 5.0.6's Batch, as BFA read it at its load, for its Legacy model's sizes (core/BfaSizes.h)
                 if (ListsSizesFor(g_bfa.version)) {
                     const auto store = BfaIniStore();
                     const int batch = Bfa5Batch(*store);
                     g_bridge->SetBfaBatch(batch);
-                    Log(Level::Info, "Better Facial Animations " + g_bfa.version + "'s Batch is " + std::to_string(batch) +
-                                         ": the bridge lists its GPU route's sizes for its models");
+                    if (g_bfa.hooked)
+                        Log(Level::Info, "Better Facial Animations " + g_bfa.version + "'s Batch is " + std::to_string(batch) +
+                                             ": the bridge lists its GPU route's sizes for its models");
                 }
                 if (g_bfa.hooked) g_bridge->Connection().StartBackground();
                 break;
@@ -188,7 +192,7 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 ApplySettings("before a game loads");
                 break;
             case SKSE::MessagingInterface::kSaveGame:
-                if (g_mode) g_mode->OnGameSave();  // BFA's menu may have saved its file since: its CPU mode again
+                if (g_mode) g_mode->OnGameSave();  // BFA's menu may have saved its file since: the last answer's values again
                 break;
             case SKSE::MessagingInterface::kPostLoadGame:
             case SKSE::MessagingInterface::kNewGame:

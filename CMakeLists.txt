@@ -70,6 +70,7 @@ add_library(bfarb_core STATIC
   src/core/BfaSizes.cpp
   src/core/Bridge.cpp
   src/core/Client.cpp
+  src/core/IniText.cpp
   src/core/Monitor.cpp
   src/core/PeImage.cpp
   src/core/Protocol.cpp

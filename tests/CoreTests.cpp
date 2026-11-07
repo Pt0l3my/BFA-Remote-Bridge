@@ -9,11 +9,13 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 
 #include "Test.h"
 #include "core/BfaMode.h"
 #include "core/BfaSizes.h"
+#include "core/IniText.h"
 #include "core/Bridge.h"
 #include "core/Monitor.h"
 #include "core/PeImage.h"
@@ -636,21 +638,34 @@ namespace {
 
 // BFA's INI and the bridge's state, in memory, with every write counted. BFA's own INI holds ForceCPU=forceCpu while
 // forceCpuInIni; its other keys, and BFA 5's installer choice files, are in `values` ("choice/section/key", choice
-// empty for BFA's own INI); the bridge's state's other keys in `records`.
+// empty for BFA's own INI); the bridge's records in `records`. A key in failWrites can't be written or removed in BFA's
+// INI (read-only, say).
 struct FakeIni {
     bool present = true;
     int forceCpu = 0;
     bool forceCpuInIni = true;
-    bool setByBridge = false;
     int iniWrites = 0;
     int recordWrites = 0;
     bool failRecord = false;
+    std::set<std::string> failWrites;
     std::map<std::string, std::string> values;
     std::map<std::string, std::string> records;
     void Set(const std::string& choice, const std::string& key, const std::string& value) { values[choice + "/General/" + key] = value; }
     std::string Own(const std::string& key) const {
+        if (key == "ForceCPU") return forceCpuInIni ? std::to_string(forceCpu) : "(absent)";
         const auto it = values.find("/General/" + key);
         return it == values.end() ? "(absent)" : it->second;
+    }
+    std::string Record(const char* key) const {
+        const auto it = records.find(key);
+        return it == records.end() ? "(none)" : it->second;
+    }
+    bool SetByBridge() const { return records.count(kForceCpuRecord) > 0; }
+    // BFA's SaveIni: every setting written back into its own INI, as BFA holds it
+    void BfaSaves(int force, long emotion) {
+        forceCpu = force;
+        forceCpuInIni = true;
+        Set("", "EmotionDevice", std::to_string(emotion));
     }
 };
 
@@ -659,8 +674,9 @@ public:
     explicit FakeIniStore(std::shared_ptr<FakeIni> ini) : ini_(std::move(ini)) {}
     bool BfaIniPresent() override { return ini_->present; }
     int ReadForceCpu() override { return ini_->forceCpuInIni ? ini_->forceCpu : 0; }
-    bool WriteForceCpu(int value, std::string&) override {
+    bool WriteForceCpu(int value, std::string& err) override {
         CHECK(ini_->present);  // never created
+        if (Fails("ForceCPU", err)) return false;
         ini_->forceCpu = value;
         ini_->forceCpuInIni = true;
         ++ini_->iniWrites;
@@ -674,10 +690,26 @@ public:
         if (it == ini_->values.end()) return std::nullopt;
         return it->second;
     }
-    bool WriteBfaValue(const char* key, const std::string& value, std::string&) override {
+    bool WriteBfaValue(const char* key, const std::string& value, std::string& err) override {
         CHECK(ini_->present);  // never created
         CHECK(std::string(key) != "IndependentGpuDevice");  // left as it is
-        ini_->Set("", key, value);
+        if (Fails(key, err)) return false;
+        if (std::string(key) == "ForceCPU") {
+            ini_->forceCpu = std::stoi(value);
+            ini_->forceCpuInIni = true;
+        } else {
+            ini_->Set("", key, value);
+        }
+        ++ini_->iniWrites;
+        return true;
+    }
+    bool RemoveBfaValue(const char* key, std::string& err) override {
+        CHECK(ini_->present);
+        if (Fails(key, err)) return false;
+        if (std::string(key) == "ForceCPU")
+            ini_->forceCpuInIni = false;
+        else
+            ini_->values.erase(std::string("/General/") + key);
         ++ini_->iniWrites;
         return true;
     }
@@ -697,18 +729,13 @@ public:
         ++ini_->recordWrites;
         return true;
     }
-    bool ReadSetByBridge() override { return ini_->setByBridge; }
-    bool WriteSetByBridge(bool set, std::string& err) override {
-        if (ini_->failRecord) {
-            err = "read-only";
-            return false;
-        }
-        ini_->setByBridge = set;
-        ++ini_->recordWrites;
-        return true;
-    }
 
 private:
+    bool Fails(const std::string& key, std::string& err) const {
+        if (!ini_->failWrites.count(key)) return false;
+        err = "read-only";
+        return true;
+    }
     std::shared_ptr<FakeIni> ini_;
 };
 
@@ -722,148 +749,14 @@ struct ModeRig {
         for (const auto& l : log) n += l.find(part) != std::string::npos;
         return n;
     }
-};
-
-}  // namespace
-
-// Nothing while no server has answered; version 2 sets ForceCPU=1, recording that the bridge set it; logged once.
-// Each game save writes it again.
-TEST(BfaModeSetOnVersionTwo) {
-    ModeRig r;
-    r.mode.OnGameSave();
-    r.mode.OnServerVersion(0);
-    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
-    CHECK(r.log.empty());
-    r.mode.OnServerVersion(2);
-    CHECK(r.mode.Set());
-    CHECK_EQ(r.ini->forceCpu, 1);
-    CHECK(r.ini->setByBridge);
-    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0)"), 1);
-    CHECK_EQ(r.Logged("from the next game start"), 1);
-    // BFA's menu saves its file with ForceCPU=0 in this session: the next game save writes 1 again, silently
-    r.ini->forceCpu = 0;
-    r.mode.OnGameSave();
-    CHECK_EQ(r.ini->forceCpu, 1);
-    CHECK_EQ(r.ini->iniWrites, 2);
-    CHECK_EQ(r.log.size(), std::size_t{1});
-    // already 1: nothing written
-    r.mode.OnGameSave();
-    r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->iniWrites, 2);
-}
-
-// The record is written once, and only when the bridge changes a 0: a 1 it finds (the player's, or its own whose record
-// was lost) is never recorded, so nothing is put back for it.
-TEST(BfaModeRecordsTheValueFoundOnce) {
-    ModeRig r;
-    r.mode.OnServerVersion(2);
-    r.ini->forceCpu = 0;
-    r.mode.OnGameSave();
-    r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->recordWrites, 1);
-    CHECK(r.ini->setByBridge);
-    // the next start: the file says 1 (the bridge's), the record stays
-    BfaCpuMode again(std::make_unique<FakeIniStore>(r.ini), nullptr);
-    again.SetBfaVersion(kCpuModeBfaVersion);
-    again.OnServerVersion(2);
-    CHECK_EQ(r.ini->recordWrites, 1);
-    // BFA already in its CPU mode: nothing recorded, nothing written, nothing put back at version 1
-    ModeRig cpu;
-    cpu.ini->forceCpu = 1;
-    cpu.mode.OnServerVersion(2);
-    CHECK(!cpu.ini->setByBridge);
-    CHECK_EQ(cpu.ini->iniWrites + cpu.ini->recordWrites, 0);
-    cpu.mode.OnServerVersion(1);
-    CHECK_EQ(cpu.ini->forceCpu, 1);
-    CHECK_EQ(cpu.ini->iniWrites, 0);
-    // the bridge's record lost after it set 1: its own 1 isn't taken for the player's, and nothing is put back
-    ModeRig lost;
-    lost.mode.OnServerVersion(2);
-    lost.ini->setByBridge = false;
-    BfaCpuMode later(std::make_unique<FakeIniStore>(lost.ini), nullptr);
-    later.SetBfaVersion(kCpuModeBfaVersion);
-    later.OnServerVersion(2);
-    CHECK(!lost.ini->setByBridge);
-    later.OnServerVersion(1);
-    CHECK_EQ(lost.ini->forceCpu, 1);
-    // the record can't be written: BFA's file is left as it is
-    ModeRig ro;
-    ro.ini->failRecord = true;
-    ro.mode.OnServerVersion(2);
-    CHECK_EQ(ro.ini->forceCpu, 0);
-    CHECK_EQ(ro.ini->iniWrites, 0);
-    CHECK_EQ(ro.Logged("BFA's mode is left as it is"), 1);
-}
-
-// A version 1 server: the value the bridge set goes back and the record is cleared; saves then leave BFA's file alone.
-TEST(BfaModeRestoredOnVersionOne) {
-    ModeRig r;
-    r.mode.OnServerVersion(1);  // nothing recorded: nothing to put back
-    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
-    r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->forceCpu, 1);
-    r.mode.OnServerVersion(1);
-    CHECK(!r.mode.Set());
-    CHECK_EQ(r.ini->forceCpu, 0);
-    CHECK(!r.ini->setByBridge);
-    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
-                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from "
-                      "the next game start."),
-             1);
-    r.mode.OnGameSave();
-    CHECK_EQ(r.ini->forceCpu, 0);
-    const int writes = r.ini->iniWrites;
-    r.mode.OnServerVersion(1);
-    CHECK_EQ(r.ini->iniWrites, writes);
-}
-
-// BFA's INI missing: never created. Nothing recorded or written at version 2, at saves or at version 1, one log
-// line; a record left with nothing to put back is cleared.
-TEST(BfaModeNeverCreatesBfasIni) {
-    ModeRig r;
-    r.ini->present = false;
-    r.mode.OnServerVersion(2);
-    r.mode.OnGameSave();
-    r.mode.OnServerVersion(1);
-    r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
-    CHECK_EQ(r.Logged("BFA's mode is left as it is: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini isn't there, and the bridge never "
-                      "creates it"),
-             1);
-    // set earlier, then the file went: the record is cleared, and the file isn't made again
-    ModeRig gone;
-    gone.mode.OnServerVersion(2);
-    CHECK(gone.ini->setByBridge);
-    gone.ini->present = false;
-    gone.mode.OnServerVersion(1);
-    CHECK(!gone.ini->setByBridge);
-    CHECK_EQ(gone.ini->iniWrites, 1);
-}
-
-// Another BFA version (or one unknown): its mode is left as it is, and a value the bridge set earlier is put back.
-TEST(BfaModeOnlyForBfa4323) {
-    for (const char* other : {"4.3.2.2", "4.4.0", ""}) {
-        ModeRig r(other);
-        r.mode.OnServerVersion(2);
-        r.mode.OnGameSave();
-        CHECK_EQ(r.ini->forceCpu, 0);
-        CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
-        CHECK_EQ(r.Logged("BFA's mode is left as it is: this is Better Facial Animations"), 1);
+    // The next game start: a new bridge over the same files, after BFA loaded them.
+    std::unique_ptr<BfaCpuMode> NextStart(const char* bfa) {
+        auto next = std::make_unique<BfaCpuMode>(std::make_unique<FakeIniStore>(ini), [this](Level, const std::string& l) { log.push_back(l); });
+        next->SetBfaVersion(bfa);
+        next->OnStart();
+        return next;
     }
-    // set under 4.3.2.3, then BFA updated: put back
-    ModeRig r;
-    r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->forceCpu, 1);
-    BfaCpuMode updated(std::make_unique<FakeIniStore>(r.ini), nullptr);
-    updated.SetBfaVersion("4.4.0");
-    updated.OnServerVersion(2);
-    CHECK_EQ(r.ini->forceCpu, 0);
-    CHECK(!r.ini->setByBridge);
-}
-
-// ---- BFA 5.0.6's mode: ForceCPU and EmotionDevice, read through BFA 5's layers
-
-namespace {
+};
 
 // BFA 5.0.6 as its installer leaves it: the choices in Installer\Startup.ini and Installer\EmotionDevice.ini (both
 // on graphics card 0, the default), ForceCPU and EmotionDevice commented out in BFA's own INI.
@@ -878,11 +771,237 @@ struct Mode5Rig : ModeRig {
     }
 };
 
+// BFA 5.0.6 once its menu has saved: every key in its own INI too (Audio2Face on a card, Audio2Emotion on card 2).
+struct Mode5Saved : Mode5Rig {
+    Mode5Saved() { ini->BfaSaves(0, 2); }
+};
+
 }  // namespace
 
-// Version 2 with BFA 5.0.6: ForceCPU=1 and EmotionDevice=-1 in BFA's own INI, which wins over the installer's files,
-// each recorded first (EmotionDevice by the card it replaced); one log line naming both; IndependentGpuDevice and the
-// installer's files left as they are. Each game save writes them again; a record already there is kept.
+// Nothing while no server has answered; version 2 sets ForceCPU=1, recording that the bridge set it; logged once.
+// Each game save writes it again.
+TEST(BfaModeSetOnVersionTwo) {
+    ModeRig r;
+    r.mode.OnStart();
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(0);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    CHECK(r.log.empty());
+    r.mode.OnServerVersion(2);
+    CHECK(r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 1);
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("1"));
+    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0)"), 1);
+    CHECK_EQ(r.Logged("from the next game start"), 1);
+    // BFA's menu saves its file with ForceCPU=0 in this session: the next game save writes 1 again, silently
+    r.ini->forceCpu = 0;
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 1);
+    CHECK_EQ(r.ini->iniWrites, 2);
+    CHECK_EQ(r.log.size(), std::size_t{1});
+    // already 1: nothing written
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites, 2);
+    // the next start loads the bridge's 1: the record stays
+    r.NextStart(kCpuModeBfaVersion);
+    CHECK(r.ini->SetByBridge());
+}
+
+// The record is written once, and only when the bridge changes a 0: a 1 it finds (the player's, or its own whose record
+// was lost) is never recorded, so nothing is put back for it.
+TEST(BfaModeRecordsTheValueFoundOnce) {
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    r.ini->forceCpu = 0;
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->recordWrites, 1);
+    CHECK(r.ini->SetByBridge());
+    // the next start: the file says 1 (the bridge's), the record stays
+    BfaCpuMode again(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    again.SetBfaVersion(kCpuModeBfaVersion);
+    again.OnStart();
+    again.OnServerVersion(2);
+    CHECK_EQ(r.ini->recordWrites, 1);
+    // BFA already in its CPU mode: nothing recorded, nothing written, nothing put back at version 1
+    ModeRig cpu;
+    cpu.ini->forceCpu = 1;
+    cpu.mode.OnServerVersion(2);
+    CHECK(!cpu.ini->SetByBridge());
+    CHECK_EQ(cpu.ini->iniWrites + cpu.ini->recordWrites, 0);
+    cpu.mode.OnServerVersion(1);
+    CHECK_EQ(cpu.ini->forceCpu, 1);
+    CHECK_EQ(cpu.ini->iniWrites, 0);
+    // the bridge's record lost after it set 1: its own 1 isn't taken for the player's, and nothing is put back
+    ModeRig lost;
+    lost.mode.OnServerVersion(2);
+    lost.ini->records.erase(kForceCpuRecord);
+    BfaCpuMode later(std::make_unique<FakeIniStore>(lost.ini), nullptr);
+    later.SetBfaVersion(kCpuModeBfaVersion);
+    later.OnServerVersion(2);
+    CHECK(!lost.ini->SetByBridge());
+    later.OnServerVersion(1);
+    CHECK_EQ(lost.ini->forceCpu, 1);
+    // a record that doesn't read as the bridge wrote it is none
+    for (const char* damaged : {"0", "1 ", "yes", "Added"}) {
+        ModeRig d;
+        d.mode.OnServerVersion(2);
+        d.ini->records[kForceCpuRecord] = damaged;
+        d.mode.OnServerVersion(1);
+        CHECK_EQ(d.ini->forceCpu, 1);
+    }
+    // the record can't be written: BFA's file is left as it is
+    ModeRig ro;
+    ro.ini->failRecord = true;
+    ro.mode.OnServerVersion(2);
+    CHECK_EQ(ro.ini->forceCpu, 0);
+    CHECK_EQ(ro.ini->iniWrites, 0);
+    CHECK_EQ(ro.Logged("BFA's mode is left as it is"), 1);
+}
+
+// A version 1 server: the value the bridge set goes back; its record stays until a start has loaded the 0; saves then
+// leave BFA's file alone while it holds the 0.
+TEST(BfaModeRestoredOnVersionOne) {
+    ModeRig r;
+    r.mode.OnServerVersion(1);  // nothing recorded: nothing to put back
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 1);
+    r.mode.OnServerVersion(1);
+    CHECK(!r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 0);
+    CHECK(r.ini->SetByBridge());
+    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
+                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from "
+                      "the next game start."),
+             1);
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 0);
+    const int writes = r.ini->iniWrites;
+    r.mode.OnServerVersion(1);
+    CHECK_EQ(r.ini->iniWrites, writes);
+    // the next start loads the 0: the record goes, and nothing more is written
+    auto next = r.NextStart(kCpuModeBfaVersion);
+    CHECK(!r.ini->SetByBridge());
+    next->OnServerVersion(1);
+    next->OnGameSave();
+    CHECK_EQ(r.ini->iniWrites, writes);
+}
+
+// BFA's menu, saved after the put-back in the same session, writes the bridge's value back (it holds what it loaded
+// at its start): each game save while the answer is version 1, or the BFA version isn't served, puts it back again,
+// logged once; a start that loads the bridge's value again keeps the record, so the next version 1 answer puts it back.
+TEST(BfaModePutBackSurvivesBfasSave) {
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    r.mode.OnServerVersion(1);
+    CHECK_EQ(r.ini->forceCpu, 0);
+    r.ini->forceCpu = 1;  // BFA's SaveIni
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 0);
+    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0"), 1);
+    // BFA saves again after the last game save, and the game quits: the next start loads 1, the record stays
+    r.ini->forceCpu = 1;
+    auto next = r.NextStart(kCpuModeBfaVersion);
+    CHECK(r.ini->SetByBridge());
+    next->OnServerVersion(1);
+    CHECK_EQ(r.ini->forceCpu, 0);
+    // BFA 5.0.6, both keys, each written back as BFA's own INI held it
+    Mode5Saved five;
+    five.mode.OnServerVersion(2);
+    CHECK_EQ(five.ini->Own("ForceCPU"), std::string("1"));
+    CHECK_EQ(five.ini->Own("EmotionDevice"), std::string("-1"));
+    five.mode.OnServerVersion(1);
+    CHECK_EQ(five.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(five.ini->Own("EmotionDevice"), std::string("2"));
+    five.ini->BfaSaves(1, -1);
+    five.mode.OnGameSave();
+    CHECK_EQ(five.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(five.ini->Own("EmotionDevice"), std::string("2"));
+    CHECK_EQ(five.Logged("Put BFA's [General] EmotionDevice back to 2"), 1);
+    CHECK_EQ(five.ini->Record(kEmotionDeviceRecord), std::string("2"));
+    five.NextStart("5.0.6.3");
+    CHECK(!five.ini->SetByBridge());
+    CHECK_EQ(five.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
+    // BFA updated to a version the bridge doesn't serve: the same at each save
+    Mode5Saved up;
+    up.mode.OnServerVersion(2);
+    auto updated = up.NextStart("5.1.0.1");
+    updated->OnServerVersion(2);
+    CHECK_EQ(up.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(up.ini->Own("EmotionDevice"), std::string("2"));
+    up.ini->BfaSaves(1, -1);
+    updated->OnGameSave();
+    CHECK_EQ(up.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(up.ini->Own("EmotionDevice"), std::string("2"));
+    // nothing answered this session: nothing written at a save
+    Mode5Saved quiet;
+    quiet.mode.OnServerVersion(2);
+    auto none = quiet.NextStart("5.0.6.3");
+    quiet.ini->BfaSaves(0, 2);
+    const int writes = quiet.ini->iniWrites;
+    none->OnGameSave();
+    CHECK_EQ(quiet.ini->iniWrites, writes);
+}
+
+// BFA's INI missing: never created. Nothing recorded or written at version 2, at saves or at version 1, one log
+// line; a record left with nothing to put back is cleared.
+TEST(BfaModeNeverCreatesBfasIni) {
+    ModeRig r;
+    r.ini->present = false;
+    r.mode.OnStart();
+    r.mode.OnServerVersion(2);
+    r.mode.OnGameSave();
+    r.mode.OnServerVersion(1);
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    CHECK_EQ(r.Logged("BFA's mode is left as it is: Data\\SKSE\\Plugins\\BetterFacialAnimations.ini isn't there, and the bridge never "
+                      "creates it"),
+             1);
+    // set earlier, then the file went: the record is cleared, and the file isn't made again
+    ModeRig gone;
+    gone.mode.OnServerVersion(2);
+    CHECK(gone.ini->SetByBridge());
+    gone.ini->present = false;
+    gone.mode.OnServerVersion(1);
+    CHECK(!gone.ini->SetByBridge());
+    CHECK_EQ(gone.ini->iniWrites, 1);
+    // or found gone at a start
+    ModeRig start;
+    start.mode.OnServerVersion(2);
+    start.ini->present = false;
+    start.NextStart(kCpuModeBfaVersion);
+    CHECK(!start.ini->SetByBridge());
+}
+
+// Another BFA version (or one unknown): its mode is left as it is, and a value the bridge set earlier is put back.
+TEST(BfaModeOnlyForBfa4323) {
+    for (const char* other : {"4.3.2.2", "4.4.0", ""}) {
+        ModeRig r(other);
+        r.mode.OnServerVersion(2);
+        r.mode.OnGameSave();
+        CHECK_EQ(r.ini->forceCpu, 0);
+        CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+        CHECK_EQ(r.Logged("BFA's mode is left as it is: this is Better Facial Animations"), 1);
+        CHECK_EQ(r.Logged(", the versions it is made for"), 1);
+    }
+    // set under 4.3.2.3, then BFA updated: put back
+    ModeRig r;
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 1);
+    BfaCpuMode updated(std::make_unique<FakeIniStore>(r.ini), nullptr);
+    updated.SetBfaVersion("4.4.0");
+    updated.OnServerVersion(2);
+    CHECK_EQ(r.ini->forceCpu, 0);
+}
+
+// ---- BFA 5.0.6's mode: ForceCPU and EmotionDevice, read through BFA 5's layers
+
+// Version 2 with BFA 5.0.6, as its installer leaves it (both keys only in the installer's files): ForceCPU=1 and
+// EmotionDevice=-1 in BFA's own INI, which wins over the installer's files, each recorded first as added; one log
+// line naming both; IndependentGpuDevice and the installer's files left as they are. Each game save writes them again;
+// a card picked in BFA's menu since is recorded in place of the first.
 TEST(Bfa5ModeSetsBothKeysOnVersionTwo) {
     Mode5Rig r;
     const auto installer = r.ini->values;
@@ -893,33 +1012,39 @@ TEST(Bfa5ModeSetsBothKeysOnVersionTwo) {
     CHECK_EQ(r.ini->forceCpu, 1);
     CHECK(r.ini->forceCpuInIni);
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
-    CHECK(r.ini->setByBridge);
-    CHECK_EQ(r.ini->records[kEmotionDeviceRecord], std::string("0"));
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
     CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) and EmotionDevice to -1 (it was 0) in BetterFacialAnimations.ini"), 1);
-    CHECK_EQ(r.Logged("Audio2Face and Audio2Emotion in its CPU mode from the next game start"), 1);
+    CHECK_EQ(r.Logged("Audio2Face and Audio2Emotion in its CPU mode from the next game start and creates no graphics device on this PC"), 1);
     for (const auto& [k, v] : installer)
         if (k.rfind("/", 0) != 0) CHECK_EQ(r.ini->values[k], v);  // the installer's files: never written
     CHECK_EQ(r.ini->Own("IndependentGpuDevice"), std::string("(absent)"));
     FakeIniStore reader(r.ini);
     CHECK_EQ(ReadBfa5Devices(reader).forceCpu, 1);
     CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, -1L);
-    // BFA's menu picks graphics card 1 for Audio2Emotion in this session: the next save writes -1 again, silently, and
-    // the record keeps the card the bridge found first
-    r.ini->Set("", "EmotionDevice", "1");
+    // BFA's menu picks graphics card 1 for Audio2Emotion in this session (BFA's save writes every key): the next save
+    // writes -1 again, silently, and the record names card 1, as BFA's own INI held it
+    r.ini->BfaSaves(0, 1);
     r.mode.OnGameSave();
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("1"));
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
-    CHECK_EQ(r.ini->records[kEmotionDeviceRecord], std::string("0"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("1"));
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("1"));
     CHECK_EQ(r.log.size(), std::size_t{1});
     // both on the CPU already: nothing written
     const int writes = r.ini->iniWrites + r.ini->recordWrites;
     r.mode.OnGameSave();
     r.mode.OnServerVersion(2);
     CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, writes);
+    // the card picked is the one put back
+    r.mode.OnServerVersion(1);
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("1"));
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("0"));
 }
 
 // BFA 5's layers: its own INI wins over the installer's files, the last file wins among those, and a key missing
-// everywhere takes BFA's default (ForceCPU from the legacy GPU=0; EmotionDevice -1 with ForceCPU=1, else GpuAdapter).
-// Numbers read as SimpleIni's GetLongValue reads them.
+// everywhere takes BFA's default (ForceCPU from the legacy GPU=0; EmotionDevice -1 with ForceCPU=1, else GpuAdapter
+// at least 0). Numbers read as BFA's GetLongValue reads them on Windows.
 TEST(Bfa5ModeReadsBfasLayers) {
     const auto devices = [](const std::function<void(FakeIni&)>& setUp) {
         auto ini = std::make_shared<FakeIni>();
@@ -934,23 +1059,48 @@ TEST(Bfa5ModeReadsBfasLayers) {
     CHECK(devices([](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); i.Set("EmotionDevice", "EmotionDevice", "-1"); }) == P(1, -1));
     CHECK(devices([](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, -1));  // EmotionDevice follows ForceCPU
     CHECK(devices([](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 3));  // or GpuAdapter
+    CHECK(devices([](FakeIni& i) { i.Set("Startup", "GpuAdapter", "-1"); }) == P(0, 0));  // which BFA keeps at 0 at least
     CHECK(devices([](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); i.forceCpuInIni = true; i.forceCpu = 0; }) == P(0, 0));
     CHECK(devices([](FakeIni& i) { i.Set("EmotionDevice", "EmotionDevice", "0"); i.Set("", "EmotionDevice", "2"); }) == P(0, 2));
     CHECK(devices([](FakeIni& i) { i.Set("", "GPU", "0"); }) == P(1, -1));       // the legacy key
     CHECK(devices([](FakeIni& i) { i.Set("Startup", "GPU", "0"); }) == P(1, -1));
     CHECK(devices([](FakeIni& i) { i.Set("", "GPU", "0"); i.forceCpuInIni = true; i.forceCpu = 0; }) == P(0, 0));
+    CHECK(devices([](FakeIni& i) { i.Set("Startup", "ForceCPU", "x"); i.Set("", "GPU", "0"); }) == P(1, -1));  // not a number
     // the later choice file wins (GraphicsRoute comes first, EmotionDevice last)
     CHECK(devices([](FakeIni& i) { i.Set("GraphicsRoute", "EmotionDevice", "1"); i.Set("EmotionDevice", "EmotionDevice", "2"); }) == P(0, 2));
     // numbers: hexadecimal, and anything not wholly a number is the default
     CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", "0x2"); }) == P(0, 2));
+    CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", "0X2"); }) == P(0, 2));
     CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", "1x"); i.Set("Startup", "GpuAdapter", "1"); }) == P(0, 1));
     CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", ""); }) == P(0, 0));
+    CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", "\"2\""); }) == P(0, 0));  // quotes are part of the value
     CHECK(devices([](FakeIni& i) { i.Set("", "EmotionDevice", "-7"); }) == P(0, -1));  // BFA keeps -1 at least
     CHECK_EQ(Bfa5Long(std::string("0x"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("0X"), 5), 5L);
     CHECK_EQ(Bfa5Long(std::string("12"), 5), 12L);
-    CHECK_EQ(Bfa5Long(std::string(" 12"), 5), 12L);  // strtol's leading blanks, as SimpleIni's
+    CHECK_EQ(Bfa5Long(std::string(" 12"), 5), 12L);  // strtol's leading blanks
+    CHECK_EQ(Bfa5Long(std::string("+12"), 5), 12L);
+    CHECK_EQ(Bfa5Long(std::string("-12"), 5), -12L);
+    CHECK_EQ(Bfa5Long(std::string("12 "), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("1.0"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("-"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("0x1f"), 5), 31L);
+    CHECK_EQ(Bfa5Long(std::string("0x-1"), 5), -1L);  // strtol's sign after SimpleIni's 0x
+    CHECK_EQ(Bfa5Long(std::string("0x0x1f"), 5), 31L);  // and its own 0x
+    CHECK_EQ(Bfa5Long(std::string("0x0x"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("0xg"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("2147483647"), 5), 2147483647L);  // a long on Windows: 32 bits
+    CHECK_EQ(Bfa5Long(std::string("2147483648"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("-2147483648"), 5), -2147483647L - 1);
+    CHECK_EQ(Bfa5Long(std::string("-2147483649"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string("0x7fffffff"), 5), 2147483647L);
+    CHECK_EQ(Bfa5Long(std::string("0x80000000"), 5), 5L);
     CHECK_EQ(Bfa5Long(std::string("99999999999999999999999"), 5), 5L);
+    CHECK_EQ(Bfa5Long(std::string(63, '0'), 5), 0L);
+    CHECK_EQ(Bfa5Long(std::string(64, '0'), 5), 5L);  // SimpleIni's 64-byte buffer
     CHECK_EQ(Bfa5Long(std::nullopt, 5), 5L);
+    CHECK(!Bfa5Number(std::string("")).has_value());
+    CHECK(Bfa5Number(std::string("0")) == 0L);
     // BFA 5's Batch: 2 by default, at least 1, from its layers too
     auto ini = std::make_shared<FakeIni>();
     FakeIniStore store(ini);
@@ -963,6 +1113,8 @@ TEST(Bfa5ModeReadsBfasLayers) {
     CHECK_EQ(Bfa5Batch(store), 1);
     ini->Set("", "Batch", "-3");
     CHECK_EQ(Bfa5Batch(store), 1);
+    ini->Set("", "Batch", "\"4\"");
+    CHECK_EQ(Bfa5Batch(store), 2);
 }
 
 // BFA 5's own choices are kept: both on the CPU already, nothing is recorded or written; one of them, only the other.
@@ -975,65 +1127,90 @@ TEST(Bfa5ModeKeepsWhatIsOnTheCpuAlready) {
     CHECK(both.log.empty());
     both.mode.OnServerVersion(1);
     CHECK_EQ(both.ini->iniWrites + both.ini->recordWrites, 0);
-    Mode5Rig face;  // Audio2Face on the CPU, Audio2Emotion on graphics card 2
+    Mode5Rig face;  // Audio2Face on the CPU, Audio2Emotion on graphics card 2 (BFA's own INI)
     face.ini->Set("Startup", "ForceCPU", "1");
-    face.ini->Set("EmotionDevice", "EmotionDevice", "2");
+    face.ini->Set("", "EmotionDevice", "2");
     face.mode.OnServerVersion(2);
-    CHECK(!face.ini->setByBridge);
+    CHECK(!face.ini->SetByBridge());
     CHECK(!face.ini->forceCpuInIni);
     CHECK_EQ(face.ini->Own("EmotionDevice"), std::string("-1"));
-    CHECK_EQ(face.ini->records[kEmotionDeviceRecord], std::string("2"));
+    CHECK_EQ(face.ini->Record(kEmotionDeviceRecord), std::string("2"));
     CHECK_EQ(face.Logged("Set BFA's [General] EmotionDevice to -1 (it was 2) in"), 1);
+    CHECK_EQ(face.Logged("so BFA runs Audio2Face and Audio2Emotion in its CPU mode"), 1);
     Mode5Rig emotion;  // Audio2Emotion on the CPU only
     emotion.ini->Set("", "EmotionDevice", "-1");
     emotion.mode.OnServerVersion(2);
-    CHECK(emotion.ini->setByBridge);
+    CHECK(emotion.ini->SetByBridge());
     CHECK_EQ(emotion.ini->forceCpu, 1);
-    CHECK(emotion.ini->records.empty());
+    CHECK_EQ(emotion.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
     CHECK_EQ(emotion.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) in"), 1);
 }
 
-// A version 1 server: both values the bridge set go back (ForceCPU to 0, EmotionDevice to the card recorded), the
-// records are cleared, one line for each; a value the player changed since is left as it is, its record cleared; a
-// damaged record puts nothing back.
+// A version 1 server: both values the bridge set go back, each as its record says: a key BFA's own INI didn't hold
+// is removed, so BFA's installer choice applies again (even one changed since), and a value it held is written back;
+// one line each. A value the player changed since is left as it is, its record cleared; a damaged record puts nothing
+// back.
 TEST(Bfa5ModePutBackOnVersionOne) {
     Mode5Rig r;
-    r.ini->Set("EmotionDevice", "EmotionDevice", "1");
     r.mode.OnServerVersion(2);
-    CHECK_EQ(r.ini->records[kEmotionDeviceRecord], std::string("1"));
+    // the installer's choice changed since: Audio2Emotion on the CPU (Installer\EmotionDevice.ini)
+    r.ini->Set("EmotionDevice", "EmotionDevice", "-1");
     r.mode.OnServerVersion(1);
     CHECK(!r.mode.Set());
-    CHECK_EQ(r.ini->forceCpu, 0);
-    CHECK(!r.ini->setByBridge);
-    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("1"));
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
+    FakeIniStore reader(r.ini);
+    CHECK_EQ(ReadBfa5Devices(reader).forceCpu, 0);
+    CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, -1L);  // the installer's choice
+    CHECK_EQ(r.Logged("Removed the bridge's [General] ForceCPU from BetterFacialAnimations.ini, which had none before the bridge set "
+                      "it, so BFA's installer choice applies again: the server speaks protocol version 1"),
+             1);
+    CHECK_EQ(r.Logged("Removed the bridge's [General] EmotionDevice from BetterFacialAnimations.ini"), 1);
+    CHECK_EQ(r.Logged("back to"), 0);
+    r.NextStart("5.0.6.3");
     CHECK(r.ini->records.empty());
-    CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol version 1"),
+    // BFA's own INI held both: written back as they were
+    Mode5Rig held;
+    held.ini->forceCpuInIni = true;
+    held.ini->forceCpu = 0;
+    held.ini->Set("", "EmotionDevice", "1");
+    held.mode.OnServerVersion(2);
+    CHECK_EQ(held.ini->Record(kForceCpuRecord), std::string("1"));
+    CHECK_EQ(held.ini->Record(kEmotionDeviceRecord), std::string("1"));
+    held.mode.OnServerVersion(1);
+    CHECK_EQ(held.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(held.ini->Own("EmotionDevice"), std::string("1"));
+    CHECK_EQ(held.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol version 1"),
              1);
-    CHECK_EQ(r.Logged("Put BFA's [General] EmotionDevice back to 1 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
-                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from the "
-                      "next game start."),
+    CHECK_EQ(held.Logged("Put BFA's [General] EmotionDevice back to 1 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
+                         "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from the "
+                         "next game start."),
              1);
-    const int writes = r.ini->iniWrites;
-    r.mode.OnGameSave();
-    r.mode.OnServerVersion(1);
-    CHECK_EQ(r.ini->iniWrites, writes);
+    const int writes = held.ini->iniWrites;
+    held.mode.OnGameSave();
+    held.mode.OnServerVersion(1);
+    CHECK_EQ(held.ini->iniWrites, writes);
     // the player chose graphics card 3 in BFA's menu since: left as it is, the record goes
     Mode5Rig changed;
     changed.mode.OnServerVersion(2);
     changed.ini->Set("", "EmotionDevice", "3");
     changed.mode.OnServerVersion(1);
     CHECK_EQ(changed.ini->Own("EmotionDevice"), std::string("3"));
-    CHECK(changed.ini->records.empty());
-    CHECK_EQ(changed.Logged("EmotionDevice back"), 0);
-    // BFA reinstalled since: its own INI holds no EmotionDevice; nothing is written, the record goes
+    CHECK_EQ(changed.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
+    CHECK_EQ(changed.Logged("EmotionDevice from"), 0);
+    // BFA reinstalled since: its own INI holds no EmotionDevice, and the installer's file says the CPU; nothing is
+    // written over that choice, and the record goes
     Mode5Rig reinstalled;
+    reinstalled.ini->Set("", "EmotionDevice", "0");
     reinstalled.mode.OnServerVersion(2);
+    CHECK_EQ(reinstalled.ini->Record(kEmotionDeviceRecord), std::string("0"));
     reinstalled.ini->values.erase("/General/EmotionDevice");
+    reinstalled.ini->Set("EmotionDevice", "EmotionDevice", "-1");
     reinstalled.mode.OnServerVersion(1);
     CHECK_EQ(reinstalled.ini->Own("EmotionDevice"), std::string("(absent)"));
-    CHECK(reinstalled.ini->records.empty());
+    CHECK_EQ(reinstalled.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
     // a damaged record: nothing put back, and it stays
-    for (const char* damaged : {"x", "-1", "1 ", "1234", ""}) {
+    for (const char* damaged : {"x", "-1", "1 ", "1234", "", "Added"}) {
         Mode5Rig d;
         d.mode.OnServerVersion(2);
         if (*damaged)
@@ -1042,8 +1219,63 @@ TEST(Bfa5ModePutBackOnVersionOne) {
             d.ini->records.erase(kEmotionDeviceRecord);
         d.mode.OnServerVersion(1);
         CHECK_EQ(d.ini->Own("EmotionDevice"), std::string("-1"));
-        CHECK_EQ(d.Logged("EmotionDevice back"), 0);
+        CHECK_EQ(d.Logged("EmotionDevice from"), 0);
     }
+}
+
+// A card over 999 can't be recorded, so BFA's file is left as it is; a write to BFA's INI that fails: no line claims
+// it, the record stays and the next answer tries again.
+TEST(Bfa5ModeFailuresKeepWhatTheyCant) {
+    Mode5Rig big;
+    big.ini->Set("", "EmotionDevice", "1000");
+    big.mode.OnServerVersion(2);
+    CHECK_EQ(big.ini->Own("EmotionDevice"), std::string("1000"));
+    CHECK_EQ(big.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
+    CHECK_EQ(big.Logged("BFA's EmotionDevice is left as it is: the bridge couldn't record that it sets it (card 1000 is out of range)"), 1);
+    CHECK_EQ(big.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) in BetterFacialAnimations.ini: the server speaks protocol version 2, "
+                        "so BFA runs Audio2Face in its CPU mode from the next game start. The model"),
+             1);
+    // EmotionDevice=-1 can't be written: the line names ForceCPU and Audio2Face alone
+    Mode5Rig set;
+    set.ini->failWrites.insert("EmotionDevice");
+    set.mode.OnServerVersion(2);
+    set.mode.OnGameSave();
+    CHECK_EQ(set.Logged("BFA's [General] EmotionDevice couldn't be set to -1 (read-only)"), 1);
+    CHECK_EQ(set.Logged("EmotionDevice to -1"), 0);
+    CHECK_EQ(set.Logged("so BFA runs Audio2Face in its CPU mode from the next game start. The model"), 1);
+    CHECK_EQ(set.Logged("graphics device"), 0);
+    // its put-back can't be written: the record stays, a warning, and the next answer puts it back
+    Mode5Rig back;
+    back.mode.OnServerVersion(2);
+    back.ini->failWrites.insert("EmotionDevice");
+    back.mode.OnServerVersion(1);
+    CHECK_EQ(back.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(back.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    CHECK_EQ(back.Logged("BFA's [General] EmotionDevice couldn't be removed (read-only); the bridge keeps its record"), 1);
+    CHECK_EQ(back.Logged("EmotionDevice from"), 0);
+    back.ini->failWrites.clear();
+    back.mode.OnServerVersion(1);
+    CHECK_EQ(back.ini->Own("EmotionDevice"), std::string("(absent)"));
+    CHECK_EQ(back.Logged("Removed the bridge's [General] EmotionDevice"), 1);
+    Mode5Rig written;
+    written.ini->Set("", "EmotionDevice", "2");
+    written.mode.OnServerVersion(2);
+    written.ini->failWrites.insert("EmotionDevice");
+    written.mode.OnServerVersion(1);
+    written.mode.OnGameSave();
+    CHECK_EQ(written.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(written.ini->Record(kEmotionDeviceRecord), std::string("2"));
+    CHECK_EQ(written.Logged("couldn't be put back to 2 (read-only)"), 1);
+    written.ini->failWrites.clear();
+    written.mode.OnGameSave();
+    CHECK_EQ(written.ini->Own("EmotionDevice"), std::string("2"));
+    // a ForceCPU failure is logged on its own, beside an EmotionDevice one
+    Mode5Rig two;
+    two.ini->failWrites = {"ForceCPU", "EmotionDevice"};
+    two.mode.OnServerVersion(2);
+    CHECK_EQ(two.Logged("ForceCPU couldn't be set to 1"), 1);
+    CHECK_EQ(two.Logged("EmotionDevice couldn't be set to -1"), 1);
+    CHECK_EQ(two.Logged("Set BFA's"), 0);
 }
 
 // Only BFA 5.0.6 and its builds: another 5.x is left as it is, and the values the bridge set under 5.0.6 go back once
@@ -1068,10 +1300,10 @@ TEST(Bfa5ModeOnlyFor506) {
     BfaCpuMode updated(std::make_unique<FakeIniStore>(r.ini), nullptr);
     updated.SetBfaVersion("5.1.0.1");
     updated.OnServerVersion(2);
-    CHECK_EQ(r.ini->forceCpu, 0);
-    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("0"));
-    CHECK(!r.ini->setByBridge);
-    CHECK(r.ini->records.empty());
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
+    FakeIniStore reader(r.ini);
+    CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, 0L);
     // BFA's INI missing: never created, nothing recorded
     Mode5Rig absent;
     absent.ini->present = false;
@@ -1084,15 +1316,15 @@ TEST(Bfa5ModeOnlyFor506) {
     gone.mode.OnServerVersion(2);
     gone.ini->present = false;
     gone.mode.OnServerVersion(1);
-    CHECK(!gone.ini->setByBridge);
     CHECK(gone.ini->records.empty());
-    // the records can't be written: BFA's file is left as it is, logged once
+    // the records can't be written: BFA's file is left as it is, logged once each
     Mode5Rig ro;
     ro.ini->failRecord = true;
     ro.mode.OnServerVersion(2);
     ro.mode.OnGameSave();
     CHECK_EQ(ro.ini->iniWrites, 0);
-    CHECK_EQ(ro.Logged("is left as it is: the bridge couldn't record that it sets it"), 1);
+    CHECK_EQ(ro.Logged("ForceCPU is left as it is: the bridge couldn't record that it sets it"), 1);
+    CHECK_EQ(ro.Logged("EmotionDevice is left as it is: the bridge couldn't record that it sets it"), 1);
 }
 
 // BFA 4.3.2.3 is as before: ForceCPU from its own INI alone, EmotionDevice and the installer's files never read or
@@ -1104,7 +1336,7 @@ TEST(BfaModeFor4323IgnoresBfa5sKeys) {
     r.mode.OnServerVersion(2);
     CHECK_EQ(r.ini->forceCpu, 1);
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("0"));
-    CHECK(r.ini->records.empty());
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
     CHECK_EQ(r.ini->iniWrites, 1);
     CHECK_EQ(r.ini->recordWrites, 1);
     CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0): the server speaks protocol version 2, "
@@ -1113,6 +1345,82 @@ TEST(BfaModeFor4323IgnoresBfa5sKeys) {
     r.mode.OnServerVersion(1);
     CHECK_EQ(r.ini->forceCpu, 0);
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("0"));
+}
+
+// ---- BFA 5's files read as BFA 5 reads them (core/IniText.h)
+
+TEST(IniTextReadsAsSimpleIni) {
+    const auto v = [](std::string_view text, const char* key = "EmotionDevice", const char* section = "General") {
+        return IniTextValue(text, section, key).value_or("(none)");
+    };
+    CHECK_EQ(v("[General]\nEmotionDevice=1\n"), std::string("1"));
+    CHECK_EQ(v("[General]\r\nEmotionDevice = 1 \r\n"), std::string("1"));  // blanks around
+    CHECK_EQ(v("[General]\rEmotionDevice=\t1\t\r"), std::string("1"));       // a carriage return ends a line
+    CHECK_EQ(v("[General]\nEmotionDevice=1"), std::string("1"));             // no line end at the file's end
+    CHECK_EQ(v("\xEF\xBB\xBF[General]\nEmotionDevice=1\n"), std::string("1"));  // BFA 5's own saves' byte-order mark
+    CHECK_EQ(v("x\xEF\xBB\xBF[General]\nEmotionDevice=1\n"), std::string("(none)"));
+    CHECK_EQ(v("[General]\nEmotionDevice=1\nEmotionDevice=-1\n"), std::string("-1"));  // the last one counts
+    CHECK_EQ(v("[General]\nEmotionDevice=1\n[Other]\nEmotionDevice=4\n[General]\nEmotionDevice=-1\n[Other]\n"), std::string("-1"));
+    CHECK_EQ(v("[general]\nemotiondevice=2\n"), std::string("2"));  // ASCII case
+    CHECK_EQ(v("[ General ]  trailing\nEmotionDevice=2\n"), std::string("2"));
+    CHECK_EQ(v("[\nGeneral]\nEmotionDevice=2\n"), std::string("2"));  // SimpleIni's blanks after [ run on
+    CHECK_EQ(v("[General\nEmotionDevice=2\n"), std::string("(none)"));  // no ]: no section the bridge reads
+    CHECK_EQ(v("[General]\nEmotionDevice=1\n[Gen\nEmotionDevice=2\n"), std::string("1"));
+    CHECK_EQ(v("EmotionDevice=1\n"), std::string("(none)"));  // before any section
+    CHECK_EQ(v("[General]\nEmotionDevice=\"1\"\n"), std::string("\"1\""));  // quotes kept
+    CHECK_EQ(v("[General]\nEmotionDevice=1 ; card one\n"), std::string("1 ; card one"));
+    CHECK_EQ(v("[General]\n; EmotionDevice=1\n  # EmotionDevice=2\nEmotionDevice=3\n"), std::string("3"));
+    CHECK_EQ(v("[General]\n;EmotionDevice=1\n"), std::string("(none)"));
+    CHECK_EQ(v("[General]\nEmotionDevice\n=4\n"), std::string("(none)"));  // no = on its line; no key on the next
+    CHECK_EQ(v("[General]\nEmotionDevice=\n"), std::string(""));
+    CHECK_EQ(v("[General]\nEmotionDevice==2\n"), std::string("=2"));
+    CHECK_EQ(v("[General]\nEmotion Device=2\n", "Emotion Device"), std::string("2"));
+    constexpr char withNul[] = "[General]\nEmotionDevice=1\0\nEmotionDevice=2\n";
+    CHECK_EQ(v(std::string_view(withNul, sizeof withNul - 1)), std::string("1"));  // a NUL ends the text
+    CHECK_EQ(v("", "Batch"), std::string("(none)"));
+    CHECK_EQ(v("; Better Facial Animations\n\n[General]\nBatch=3\n", "Batch"), std::string("3"));
+}
+
+// A store over BFA 5's files' text, read with IniTextValue as the plugin reads them: a key given twice in BFA's own
+// INI counts by its last value, so a CPU choice before a card the player added later doesn't keep the bridge out.
+TEST(Bfa5ModeReadsTheFilesText) {
+    struct TextStore final : IniStore {
+        std::map<std::string, std::string> files;  // "" BFA's own INI, else the choice's name
+        std::map<std::string, std::string> records;
+        bool BfaIniPresent() override { return files.count(""); }
+        int ReadForceCpu() override { return 0; }
+        bool WriteForceCpu(int, std::string&) override { return false; }
+        std::optional<std::string> ReadBfaValue(const char* choice, const char* section, const char* key) override {
+            const auto it = files.find(choice ? choice : "");
+            if (it == files.end()) return std::nullopt;
+            return IniTextValue(it->second, section, key);
+        }
+        bool WriteBfaValue(const char* key, const std::string& value, std::string&) override {
+            files[""] += std::string("\n[General]\n") + key + "=" + value + "\n";  // as a profile call past a hidden section
+            return true;
+        }
+        bool RemoveBfaValue(const char*, std::string&) override { return false; }
+        std::string ReadRecord(const char* key) override { return records.count(key) ? records[key] : std::string(); }
+        bool WriteRecord(const char* key, const char* value, std::string&) override {
+            if (value)
+                records[key] = value;
+            else
+                records.erase(key);
+            return true;
+        }
+    };
+    auto store = std::make_unique<TextStore>();
+    TextStore* files = store.get();
+    files->files[""] = "\xEF\xBB\xBF[General]\nForceCPU=1\nEmotionDevice=-1\nEmotionDevice=0\n";
+    files->files["EmotionDevice"] = "[General]\nEmotionDevice=-1\n";
+    CHECK_EQ(ReadBfa5Devices(*files).emotionDevice, 0L);
+    BfaCpuMode mode(std::move(store), nullptr);
+    mode.SetBfaVersion("5.0.6.3");
+    mode.OnServerVersion(2);
+    CHECK_EQ(files->records[kEmotionDeviceRecord], std::string("0"));
+    CHECK_EQ(ReadBfa5Devices(*files).emotionDevice, -1L);
+    CHECK_EQ(ReadBfa5Devices(*files).forceCpu, 1);
+    CHECK(!files->records.count(kForceCpuRecord));
 }
 
 // ---- the sizes the bridge lists for BFA 5.0.6 (core/BfaSizes.h)

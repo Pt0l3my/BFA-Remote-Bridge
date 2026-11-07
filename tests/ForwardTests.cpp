@@ -797,22 +797,21 @@ TEST(ForwardP6ServerEndsOnVersionOne) {
 namespace {
 struct MemoryIni final : IniStore {
     int forceCpu = 0;
-    bool setByBridge = false;
+    std::string record;
     bool BfaIniPresent() override { return true; }
     int ReadForceCpu() override { return forceCpu; }
     bool WriteForceCpu(int v, std::string&) override {
         forceCpu = v;
         return true;
     }
-    bool ReadSetByBridge() override { return setByBridge; }
-    bool WriteSetByBridge(bool v, std::string&) override {
-        setByBridge = v;
-        return true;
-    }
     std::optional<std::string> ReadBfaValue(const char*, const char*, const char*) override { return std::nullopt; }
     bool WriteBfaValue(const char*, const std::string&, std::string&) override { return true; }
-    std::string ReadRecord(const char*) override { return {}; }
-    bool WriteRecord(const char*, const char*, std::string&) override { return true; }
+    bool RemoveBfaValue(const char*, std::string&) override { return true; }
+    std::string ReadRecord(const char* key) override { return std::string(key) == kForceCpuRecord ? record : std::string(); }
+    bool WriteRecord(const char* key, const char* value, std::string&) override {
+        if (std::string(key) == kForceCpuRecord) record = value ? value : "";
+        return true;
+    }
 };
 }  // namespace
 
