@@ -3,9 +3,9 @@
 ## 1.5.0
 
 Better Facial Animations 5.0.6 (checked against its 5.0.6.3 build), beside 4.3.2.3. Protocol versions 1 and 2 are
-unchanged: nothing in the wire format changes, so PandorumLLM's side should need nothing new; it is asked to confirm
-that its server passes on, as listed, an override for a dimension the model lacks (below). BFA's source was read for
-facts only.
+unchanged: nothing in the wire format changes, so PandorumLLM's side needs nothing new. Its server accepts an
+override for a dimension the model lacks (below), tested in game with BFA 5.0.6. BFA's source was read for facts
+only.
 
 - **BFA 5's mode, both keys** (`src/core/BfaMode.h`). BFA 5.0.6 splits its CPU switch in two: `[General] ForceCPU` for
   Audio2Face and `[General] EmotionDevice` for Audio2Emotion (-1 the CPU, 0 the first graphics card by default). With

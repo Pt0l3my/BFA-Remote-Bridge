@@ -28,7 +28,7 @@ mode (see [BFA's mode](#bfas-mode)).
 - **Better Facial Animations 5.0.6.** The bridge serves BFA 5.0.6 as it serves 4.3.2.3: its three facial models, and
   both its emotion models, Full and the new Performance one (`emotion_performance.onnx`). Copy BFA 5.0.6's folder to
   the server as before (see [On PandorumLLM's PC](#on-pandorumllms-pc)). The protocol is unchanged, so PandorumLLM's
-  side should need no change; it is asked to confirm one point (see [BFA's mode](#bfas-mode)).
+  side needs no change: tested in game with BFA 5.0.6 and PandorumLLM's A2F server (see [BFA's mode](#bfas-mode)).
 - **BFA 5's mode, both keys.** BFA 5 has one CPU switch for its facial model and one for its emotion model. With a
   PandorumLLM server that speaks protocol version 2, the bridge sets both, so from the next game start BFA 5 creates
   no graphics device on this PC. See [BFA's mode](#bfas-mode).
@@ -219,9 +219,9 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   server fills in its own for V3 (`a2f3_fp16.onnx`) and the emotion model (`emotion_fp16.onnx`), part of protocol
   version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5). For BFA
   5.0.6 the bridge sends its GPU mode's sizes itself, for every 5.0.6 build alike, by the model's file name. The
-  protocol is unchanged, so PandorumLLM's server should need nothing new for it. PandorumLLM's side is asked to confirm
-  one point: that its server passes on, as listed, a size for a dimension the model lacks (the emotion models get
-  such sizes, as BFA's own GPU mode sets them).
+  protocol is unchanged, so PandorumLLM's server needs nothing new for it. That includes a size for a dimension the
+  model lacks (the emotion models get such sizes, as BFA's own GPU mode sets them): PandorumLLM's server accepts
+  them, tested in game with BFA 5.0.6.
 - No setting and no note on screen: the log lines are all.
 
 ## Lip sync in scenes
