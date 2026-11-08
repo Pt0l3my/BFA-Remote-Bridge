@@ -259,7 +259,7 @@ stands in for one with the test files. For BFA 5.0.6 the bridge lists the sizes 
 its HELLOs list overrides, to be served exactly as listed, and nothing on the wire changes: a server should need no
 table of 5.0.6's files. Two of those lists name dimensions the model lacks (`batch` for `emotion_fp16.onnx`, all three
 for `emotion_performance.onnx`, whose input is fixed), as BFA's own GPU route sets them; ONNX Runtime ignores such an
-override, and PandorumLLM's side is asked to confirm that its server passes them on as listed.
+override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6).
 
 **The version rule.** Each side answers in the version the other opened with.
 
