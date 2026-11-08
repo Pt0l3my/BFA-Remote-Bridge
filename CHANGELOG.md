@@ -1,10 +1,89 @@
 # Changelog
 
+## 1.5.0
+
+Better Facial Animations 5.0.6 (checked against its 5.0.6.3 build), beside 4.3.2.3. Protocol versions 1 and 2 are
+unchanged: nothing in the wire format changes, so PandorumLLM's side should need nothing new; it is asked to confirm
+that its server passes on, as listed, an override for a dimension the model lacks (below). BFA's source was read for
+facts only.
+
+- **BFA 5's mode, both keys** (`src/core/BfaMode.h`). BFA 5.0.6 splits its CPU switch in two: `[General] ForceCPU` for
+  Audio2Face and `[General] EmotionDevice` for Audio2Emotion (-1 the CPU, 0 the first graphics card by default). With
+  BFA 5.0.6 (5.0.6 or any 5.0.6.N) and a server that answered in protocol version 2, the bridge writes `ForceCPU=1`
+  when it was 0 and `EmotionDevice=-1` when it was a card, in BFA's own `BetterFacialAnimations.ini`, and again at
+  each game save. BFA 5 reads its settings in layers (its installer's choice files,
+  `BetterFacialAnimations/Installer/<choice>.ini`, in its order, then its own INI, which wins), and its installer
+  leaves both keys commented out in the INI, so the bridge reads them through the layers, and writes its values in the
+  INI. The records, in the bridge's own `BFARemoteBridge.ini`, `[BfaMode]`: `ForceCPUSetByBridge=1` as before, and
+  `EmotionDeviceSetByBridge=N`, the card it replaced; either is `added` when BFA's own INI held no such key. A card
+  picked in BFA's menu since replaces N at the bridge's next write. The installer's files are never written, BFA's INI
+  never created, and `IndependentGpuDevice` left alone: it plays no part once both keys are on the CPU. BFA 4.3.2.3's
+  path is as before, but for the put-back below, and any other version's mode is left as it is.
+- **BFA 5's files read as BFA 5 reads them** (`src/core/IniText.h`). BFA 5 reads its files with SimpleIni, which
+  differs from Windows' profile calls; the bridge now reads BFA 5's INI and installer files with SimpleIni's rules, in
+  its own code: a leading UTF-8 byte-order mark (BFA 5's saves write one) skipped, the last value winning, also across
+  repeated sections, quotes kept, and SimpleIni's blanks and comments. Numbers as BFA's `GetLongValue` reads them on
+  Windows (`Bfa5Number`, the bridge's own code; a long of 32 bits). Writes stay on the profile calls, each read back as
+  BFA 5 reads the file: one BFA would read otherwise (a key given twice, a section hidden behind the byte-order mark)
+  counts as failed, logged, and its record kept.
+- **A put-back that lasts.** A version 1 server, or another BFA version once the bridge attaches to it and a server
+  answers, puts each value back: ForceCPU 0 and EmotionDevice N written back, or a key noted `added` removed, so the
+  installer's files decide again. BFA's menu, saved later in the same session, writes back what BFA loaded, the
+  bridge's values among them (BFA 5's SaveIni, and BFA 4.3.2.3's for ForceCPU), so each game save of that session now
+  puts them back again, and a record stays until a game start finds BFA's own INI without the bridge's value
+  (`BfaCpuMode::OnStart`, at SKSE's post-load message, after BFA has loaded its INI). A start without BFA's INI leaves
+  the records, since BFA loaded nothing of it; the EmotionDevice record is cleared only at a start of BFA 5.0.6, and
+  any BFA 4's put-back leaves it, so a Mod Organizer 2 profile with BFA 4 doesn't lose 5.0.6's EmotionDevice record.
+  The records are still one file for every profile and BFA version (README, "BFA's mode"): ForceCPU's is cleared at
+  any start whose INI doesn't hold the bridge's value, and both are, between two BFA 5.0.6 profiles. BFA's INI
+  there but unreadable (`IniStore::BfaIni`, a third state, every byte read or the file counts as unreadable): nothing
+  is cleared or written at that start, answer or save, and it is logged once. Only a value still the bridge's in BFA's own INI is put back. The set line names only
+  what BFA reads on the CPU after the writes, and each failure is logged once per key.
+- **BFA 5.0.6's sizes, listed by the bridge** (`src/core/BfaSizes.h`). In its CPU mode BFA sets no free-dimension
+  overrides. For BFA 5.0.6 the bridge now lists the ones its GPU route sets, by BFA version and file name (every
+  5.0.6.N alike): V3's four `_dynamic_axes_1` at 1; the Legacy model's two at BFA's `[General] Batch` (2 by default, at
+  least 1, read at post-load through BFA 5's layers); Performance's `batch` at 1; and for both emotion models, Full and
+  the new Performance one (`emotion_performance.onnx`), `batch_size` 1, `seq_len` 60000 and `batch` 1, which name
+  dimensions those models lack, as BFA's GPU route does (ONNX Runtime ignores them). The server is to build exactly
+  those; the log line says the sizes were listed by the bridge, and the SHA-256 is logged as before. BFA 4.3.2.3's
+  HELLO lists none, as before (the sizes rule), and overrides BFA set itself (its GPU route) are sent as its own.
+- **Calls the bridge can't forward byte for byte.** BFA 5.0.6 calls none, but a later BFA might: DirectML's three
+  graphics-memory entries (`CreateGPUAllocationFromD3DResource`, `FreeGPUAllocation`,
+  `GetD3D12ResourceFromAllocation`, in the DirectML table served at API version 24) now answer with an error status
+  naming them, never the runtime's. A run handed a tensor outside CPU memory, input or output, gets an error status
+  too, with nothing written into the outputs, so BFA doesn't load the model (or drops it): logged and noted once a
+  model. A guarded session entry on a bridge session (`CreateIoBinding` and the rest) is logged once, with a note of
+  its own saying to update the bridge, once, which an earlier fallback note can't hold back; 1.4's unserved session
+  makers get such a note too.
+- **Lip sync in scenes on 5.0.6, unchanged.** BFA 5.0.6 makes the same scene check, the same three factions through
+  the actor's vtable (CommonLib's `IsInFaction` there reads slot 0xF9 and jumps to it, from BFA's one scene check, so
+  the game's function returns into BFA's image), now beside its own ZaZ mouth-gear rule, which the bridge leaves
+  alone. No faction to add. Not yet seen in game on 5.0.6. The log words for a scene line, and the Log detail setting's
+  description, now say what the bridge knows: that it answered BFA's scene check.
+- **Facts corrected.** BFA tries a failed emotion model again 60 seconds later on the CPU and 30 on a graphics card
+  (4.3.2 and 5.0.6 alike); the README and PROTOCOL had them the wrong way round. BFA's warm-up is a run of silence,
+  not of zeros for every model; BFA starts its worker after a new game too; the server's 4.3.2.3 fill covers V3 and
+  the emotion model only.
+- **No BFA wording.** Two comments that followed BFA's own (GPL) wording, since 1.0, are now the bridge's own words
+  (`src/core/Bridge.h`, `tools/reference_server.py`, and PROTOCOL's section 1).
+- **Docs.** README: BFA 5.0.6 supported (4.3.2.3 kept); BFA's mode with both keys and the put-back; the server's
+  folder holding `emotion_performance.onnx` too; the face after a line, per version; Potato Mode and ZaZ mouth gear
+  among BFA's own reasons a speaker isn't animated. PROTOCOL: section 1 gives BFA 5.0.6's facts beside 4.3.2's,
+  section 3 the client-listed sizes and the put-back.
+- **The reference server**: a `--hello-log FILE` test option records each HELLO's models and overrides.
+- **Tests:** BFA 5's mode (both keys set and put back, added keys removed, a put-back after BFA's save, a start's
+  records, a card picked in BFA's menu, failed writes, its layers and number parsing, the version gating, 4.3.2.3 as
+  before), SimpleIni's reading on file text, the size table, the listed sizes on the wire (BFA's Batch default
+  included), BFA 5.0.6's own emotion model through the bridge (`BFARB_BFA5_EMOTION`) and DLL (`BFARB_BFA5_DLL`), the
+  DirectML graphics-memory refusals and their error code, a tensor in graphics memory as input and as output, an
+  ordinary unsupported input kept from the graphics-memory wording, the guarded entries' notes, and the status
+  check's fallback for an unserved call.
+
 ## 1.4.0
 
 Lip sync in scenes. Protocol versions 1 and 2 are unchanged, and the server isn't involved.
 
-- **The scene answer, for BFA only.** Better Facial Animations 4.3.2 leaves the face of anyone in a SexLab or OStim
+- **The scene answer, for BFA only.** Better Facial Animations 4.3.2 leaves the face of anyone in an OStim or SexLab
   scene to the scene: its scene check asks the actor's virtual `Actor::IsInFaction` about SexLab.esm 0xE50F
   (SexLabAnimatingFaction), OStim.esp 0xECA (OStimActorCountFaction) and OStim.esp 0xD93 (OStimExcitementFaction), from
   seven places (the provider's actor check, which gives SkyrimNet "Declined/InScene", a line's start, the face's

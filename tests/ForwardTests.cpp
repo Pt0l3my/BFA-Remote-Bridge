@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -274,15 +275,17 @@ std::vector<std::uint8_t> Bytes(const OrtApi* api, OrtValue* v, std::vector<std:
     return std::vector<std::uint8_t>(p, p + size);
 }
 
-// The same run on a real session of the runtime's own, outside the bridge.
+// The same run on a real session of the runtime's own, outside the bridge. threads: its intra-op threads (1 keeps the
+// runtime's own thread pool, which ThreadSanitizer can't see into, out of a larger model's run).
 std::vector<std::vector<std::uint8_t>> LocalRun(const fs::path& model, std::vector<std::pair<const char*, int>> overrides, const char* const* in,
-                                                const std::vector<OrtValue*>& inputs, const char* const* out, std::size_t outCount) {
+                                                const std::vector<OrtValue*>& inputs, const char* const* out, std::size_t outCount,
+                                                int threads = 2) {
     const OrtApi* real = RealApi();
     OrtEnv* env = nullptr;
     Ok(real->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "bfarb-local", &env));
     OrtSessionOptions* so = nullptr;
     Ok(real->CreateSessionOptions(&so));
-    Ok(real->SetIntraOpNumThreads(so, 2));
+    Ok(real->SetIntraOpNumThreads(so, threads));
     Ok(real->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_EXTENDED));
     for (auto [n, v] : overrides) Ok(real->AddFreeDimensionOverrideByName(so, n, v));
     OrtSession* s = nullptr;
@@ -795,16 +798,19 @@ TEST(ForwardP6ServerEndsOnVersionOne) {
 namespace {
 struct MemoryIni final : IniStore {
     int forceCpu = 0;
-    bool setByBridge = false;
-    bool BfaIniPresent() override { return true; }
+    std::string record;
+    BfaIniState BfaIni() override { return BfaIniState::Readable; }
     int ReadForceCpu() override { return forceCpu; }
     bool WriteForceCpu(int v, std::string&) override {
         forceCpu = v;
         return true;
     }
-    bool ReadSetByBridge() override { return setByBridge; }
-    bool WriteSetByBridge(bool v, std::string&) override {
-        setByBridge = v;
+    std::optional<std::string> ReadBfaValue(const char*, const char*, const char*) override { return std::nullopt; }
+    bool WriteBfaValue(const char*, const std::string&, std::string&) override { return true; }
+    bool RemoveBfaValue(const char*, std::string&) override { return true; }
+    std::string ReadRecord(const char* key) override { return std::string(key) == kForceCpuRecord ? record : std::string(); }
+    bool WriteRecord(const char* key, const char* value, std::string&) override {
+        if (std::string(key) == kForceCpuRecord) record = value ? value : "";
         return true;
     }
 };
@@ -1149,6 +1155,9 @@ TEST(ForwardOtherSessionMakersAreRefused) {
     CHECK_EQ(h.CountLogged("called ONNX Runtime's CreateSessionFromArray,"), 1);  // once
     CHECK(h.Logged("Update the bridge."));
     CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionFromArray). Update the bridge."), 1);
+    // a note for each name, once: an earlier one holds no later one back
+    CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionWithPrepackedWeightsContainer). Update the bridge."), 1);
+    CHECK_EQ(h.CountNotes("(CreateSessionFromArrayWithPrepackedWeightsContainer). Update the bridge."), 1);
     CHECK_EQ(h.bridge.BridgeSessions(), std::size_t{0});
 }
 
@@ -1248,6 +1257,9 @@ TEST(ForwardUnsupportedInputAnswersNan) {
         CHECK(IsNanAnswer(h.api, out.v[0]));
     }
     CHECK_EQ(h.CountLogged("which the protocol can't carry"), 1);
+    CHECK_EQ(h.CountLogged("graphics memory"), 0);  // a bool isn't graphics memory: no error status, no such words
+    CHECK_EQ(h.CountLogged("error status"), 0);
+    CHECK_EQ(h.CountNotes("graphics memory"), 0);
     CHECK(!h.bridge.Connection().Paused());
     {
         Outputs out(h.api, 5);  // the next proper line goes through
@@ -1287,6 +1299,24 @@ TEST(ForwardOtherSessionEntriesRefuseBridgeSessions) {
         int opset = 0;
         CHECK(refused(editor->SessionGetOpsetForDomain(bridged, "", &opset)));
     }
+    // each logged once, naming it, with a note of its own to update the bridge, once; lines are still served
+    CHECK(refused(h.api->SessionGetInputCount(bridged, &count)));
+    CHECK_EQ(h.CountLogged("Better Facial Animations called ONNX Runtime's SessionGetInputCount on a model the server runs (the bridge "
+                           "forwards Run alone), which the bridge can't forward byte for byte"),
+             1);
+    CHECK_EQ(h.CountLogged("ONNX Runtime's CreateIoBinding on a model the server runs"), 1);
+    CHECK_EQ(h.CountNotes("BFA Remote Bridge: this Better Facial Animations calls SessionGetInputCount on a model the server runs, which "
+                          "the bridge doesn't forward, so BFA gets an error for it. Update the bridge."),
+             1);
+    CHECK_EQ(h.CountNotes("CreateIoBinding on a model the server runs"), 1);
+    CHECK_EQ(h.CountNotes("lines get the game's own lip sync"), 0);
+    {
+        TinyInputs in(h.api, h.cpu, 3);
+        Outputs out(h.api, 5);
+        Ok(h.api->Run(bridged, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        CHECK(!IsNanAnswer(h.api, out.v[0]));
+    }
+    CHECK_EQ(h.CountNotes("back on the server"), 0);
     h.api->ReleaseSession(bridged);
 
     // a real session (made outside the bridge: the bridge makes none): the real answers through the same table
@@ -1409,4 +1439,474 @@ TEST(ForwardRuntimeMessagesLoseTheirPaths) {
     CHECK(scrubbed.find("absent.onnx") != std::string::npos);
     std::printf("        %s\n", scrubbed.c_str());
     fs::remove_all(folder);
+}
+
+// ---- BFA 5.0.6 (1.5.0)
+
+namespace {
+
+// The HELLOs the reference server logged (--hello-log), one JSON line each.
+std::vector<std::string> HelloLines(const fs::path& file) {
+    std::ifstream in(file);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);)
+        if (!line.empty()) lines.push_back(line);
+    return lines;
+}
+int CountWith(const std::vector<std::string>& lines, const std::string& part) {
+    int n = 0;
+    for (const auto& l : lines) n += l.find(part) != std::string::npos;
+    return n;
+}
+
+}  // namespace
+
+// BFA 5.0.6 in its CPU mode sets no sizes: the bridge lists its GPU route's for each of its models (the Legacy one at
+// BFA's Batch), the server builds exactly those, and the HELLO says so on the wire. BFA 4.3.2.3's HELLO lists none, as
+// before; sizes BFA set itself (its GPU route) are sent as BFA's own.
+TEST(ForwardBfa506ListsItsGpuSizes) {
+    Need();
+    // the tiny model under BFA 5.0.6's file names: overrides of dimensions it lacks are ignored, its "batch" isn't
+    const fs::path dir = TempFolder("bfa506");
+    for (const char* name : {"a2f3_fp16.onnx", "network_fp16.onnx", "performance.onnx", "emotion_fp16.onnx", "emotion_performance.onnx"})
+        fs::copy_file(Models() / "tiny.onnx", dir / name);
+    const fs::path hellos = dir / "hellos.jsonl";
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("5.0.6.3");
+        h.bridge.SetBfaBatch(3);
+        std::vector<OrtSession*> sessions;
+        for (const char* name : {"a2f3_fp16.onnx", "network_fp16.onnx", "performance.onnx", "emotion_fp16.onnx", "emotion_performance.onnx"}) {
+            OrtSession* s = nullptr;
+            Ok(h.Create(dir / name, {}, &s));
+            CHECK(h.bridge.IsBridgeSession(s));
+            sessions.push_back(s);
+        }
+        CHECK_EQ(h.CountLogged("(BFA 5.0.6.3's GPU sizes, listed by the bridge); asking the server"), 5);
+        CHECK(h.Logged("Model performance.onnx: "));
+        CHECK(h.Logged(", overrides batch = 1 (BFA 5.0.6.3's GPU sizes, listed by the bridge)"));
+        CHECK(h.Logged(", overrides input_dynamic_axes_1 = 3, emotion_dynamic_axes_1 = 3 (BFA 5.0.6.3's"));
+        // the model the server built takes the sizes: the folded V3's don't touch the tiny model's batch, Performance's
+        // fixes it at 1, so a batch of 2 is the server's error and the line's NaN
+        TinyInputs in(h.api, h.cpu, 5);
+        {
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(sessions[0], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+            CHECK(!IsNanAnswer(h.api, out.v[0]));
+        }
+        {
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(sessions[2], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+            CHECK(IsNanAnswer(h.api, out.v[0]));
+        }
+        for (OrtSession* s : sessions) h.api->ReleaseSession(s);
+    }
+    const auto five = HelloLines(hellos);
+    CHECK(CountWith(five, "{\"name\": \"a2f3_fp16.onnx\", \"overrides\": [[\"window_dynamic_axes_1\", 1], [\"identity_dynamic_axes_1\", 1], "
+                          "[\"emotion_dynamic_axes_1\", 1], [\"input_latents_dynamic_axes_1\", 1]]}") >= 1);
+    CHECK(CountWith(five, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 3], [\"emotion_dynamic_axes_1\", 3]]}") >= 1);
+    CHECK(CountWith(five, "{\"name\": \"performance.onnx\", \"overrides\": [[\"batch\", 1]]}") >= 1);
+    CHECK(CountWith(five, "{\"name\": \"emotion_fp16.onnx\", \"overrides\": [[\"batch_size\", 1], [\"seq_len\", 60000], [\"batch\", 1]]}") >= 1);
+    CHECK(CountWith(five, "{\"name\": \"emotion_performance.onnx\", \"overrides\": [[\"batch_size\", 1], [\"seq_len\", 60000], [\"batch\", 1]]}") >= 1);
+    CHECK_EQ(CountWith(five, "\"overrides\": []"), 0);
+    CHECK_EQ(CountWith(five, "BFA 5.0.6.3"), static_cast<int>(five.size()));  // the client string reports it
+    fs::remove(hellos);
+
+    // BFA 4.3.2.3: no sizes listed, as in 1.4.0 (the server fills its own in)
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("4.3.2.3");
+        OrtSession* s = nullptr;
+        Ok(h.Create(dir / "performance.onnx", {}, &s));
+        CHECK(h.Logged("Model performance.onnx: "));
+        CHECK(h.Logged(", no overrides; asking the server"));
+        CHECK(!h.Logged("listed by the bridge"));
+        h.api->ReleaseSession(s);
+    }
+    const auto four = HelloLines(hellos);
+    CHECK(CountWith(four, "{\"name\": \"performance.onnx\", \"overrides\": []}") >= 1);
+    CHECK_EQ(CountWith(four, "[\"batch\", 1]"), 0);
+    fs::remove(hellos);
+
+    // BFA 5.0.6's GPU route sets its own: sent as BFA's
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("5.0.6.3");
+        h.bridge.SetBfaBatch(3);
+        OrtSession* s = nullptr;
+        Ok(h.Create(dir / "network_fp16.onnx", {{"input_dynamic_axes_1", 2}, {"emotion_dynamic_axes_1", 2}}, &s, true));
+        CHECK(!h.Logged("listed by the bridge"));
+        h.api->ReleaseSession(s);
+    }
+    const auto gpu = HelloLines(hellos);
+    CHECK(CountWith(gpu, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 2], [\"emotion_dynamic_axes_1\", 2]]}") >= 1);
+    CHECK_EQ(CountWith(gpu, "\", 3]"), 0);
+    fs::remove(hellos);
+
+    // BFA's Batch not set yet: the bridge lists BFA's default, 2
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("5.0.6.3");
+        OrtSession* s = nullptr;
+        Ok(h.Create(dir / "network_fp16.onnx", {}, &s));
+        h.api->ReleaseSession(s);
+    }
+    const auto unset = HelloLines(hellos);
+    CHECK(CountWith(unset, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 2], [\"emotion_dynamic_axes_1\", 2]]}") >= 1);
+    fs::remove_all(dir);
+}
+
+// A call the bridge can't forward reaches the server's status check as a fallback, once, whatever the call (1.4's
+// session makers and 1.5's guarded entries alike).
+TEST(ForwardUnservedCallsReachTheStatusCheck) {
+    Need();
+    const fs::path dir = TempFolder("unserved-hellos");
+    const fs::path hellos = dir / "hellos.jsonl";
+    {
+        Server server(Models(), {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        OrtSession* bridged = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &bridged));
+        std::size_t count = 0;
+        OrtStatus* st = h.api->SessionGetInputCount(bridged, &count);
+        CHECK(st != nullptr);
+        if (st) h.api->ReleaseStatus(st);
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+        h.api->ReleaseSession(bridged);
+    }
+    CHECK(CountWith(HelloLines(hellos), "fallback incompatible") >= 1);
+    fs::remove(hellos);
+    {
+        Server server(Models(), {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        OrtSession* bridged = nullptr;
+        Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &bridged));
+        h.api->ReleaseSession(bridged);
+        OrtSession* fromArray = nullptr;
+        const char bytes[4] = {};
+        OrtSessionOptions* so = nullptr;
+        Ok(h.api->CreateSessionOptions(&so));
+        OrtStatus* st = h.api->CreateSessionFromArray(h.env, bytes, sizeof bytes, so, &fromArray);
+        h.api->ReleaseSessionOptions(so);
+        CHECK(st != nullptr);
+        if (st) h.api->ReleaseStatus(st);
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().FallbackReports(), 1);
+        CHECK_EQ(h.CountNotes("loads its model in a way the bridge doesn't serve (CreateSessionFromArray)"), 1);
+    }
+    CHECK(CountWith(HelloLines(hellos), "fallback incompatible") >= 1);
+    fs::remove_all(dir);
+}
+
+// BFA 5.0.6's Performance Audio2Emotion model (never committed): BFARB_BFA5_EMOTION names emotion_performance.onnx.
+// Its input, mel [1, 48, 188] float, is fixed; it answers logits [1, 6]. Served with the sizes the bridge lists, it
+// answers as a local run does, byte for byte.
+TEST(ForwardBfa506PerformanceEmotion) {
+    Need();
+    const fs::path model = Env("BFARB_BFA5_EMOTION");
+    if (model.empty()) SKIP("BFARB_BFA5_EMOTION isn't set");
+    // the server's folder holds the model alone (a link to BFA's file)
+    const fs::path dir = TempFolder("bfa506-emotion");
+    fs::create_symlink(fs::absolute(model), dir / "emotion_performance.onnx");
+    Server server(dir);
+    Harness h(On(server.Port()));
+    h.bridge.Connection().SetBfaVersion("5.0.6.3");
+    OrtSession* session = nullptr;
+    const auto t0 = Clock::now();
+    Ok(h.Create(dir / "emotion_performance.onnx", {}, &session));
+    const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+    CHECK(h.Logged(", overrides batch_size = 1, seq_len = 60000, batch = 1 (BFA 5.0.6.3's GPU sizes, listed by the bridge)"));
+    std::mt19937 rng(17);
+    std::normal_distribution<float> n(0.f, 1.f);
+    for (int call = 0; call < 3; ++call) {
+        std::vector<float> mel(48 * 188);
+        for (auto& v : mel) v = call ? n(rng) : 0.f;  // BFA's warm-up is all zeros
+        const std::int64_t shape[] = {1, 48, 188};
+        OrtValue* x = nullptr;
+        Ok(h.api->CreateTensorWithDataAsOrtValue(h.cpu, mel.data(), mel.size() * 4, shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &x));
+        const char* in[] = {"mel"};
+        const char* out[] = {"logits"};
+        Outputs o(h.api, 1);
+        Ok(h.api->Run(session, nullptr, in, &x, 1, out, 1, o.v.data()));
+        std::vector<std::int64_t> dims;
+        const auto got = Bytes(h.api, o.v[0], &dims);
+        CHECK(dims == (std::vector<std::int64_t>{1, 6}));
+        const auto local = LocalRun(dir / "emotion_performance.onnx", {{"batch_size", 1}, {"seq_len", 60000}, {"batch", 1}}, in, {x}, out, 1, 1);
+        CHECK(got == local[0]);
+        h.api->ReleaseValue(x);
+    }
+    std::printf("        emotion_performance.onnx: admitted in %lld ms, 3 runs answered as a local run\n", static_cast<long long>(loadMs));
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
+namespace {
+
+// A DirectML table of the runtime's (1.24.4's layout), each entry counting its calls.
+namespace fake_dml {
+int calls[8] = {};
+OrtStatus* ORT_API_CALL Append(OrtSessionOptions*, int) noexcept { return ++calls[0], nullptr; }
+OrtStatus* ORT_API_CALL Append1(OrtSessionOptions*, void*, void*) noexcept { return ++calls[1], nullptr; }
+OrtStatus* ORT_API_CALL Allocate(void*, void**) noexcept { return ++calls[2], nullptr; }
+OrtStatus* ORT_API_CALL Free(void*) noexcept { return ++calls[3], nullptr; }
+OrtStatus* ORT_API_CALL Resource(OrtAllocator*, void*, void**) noexcept { return ++calls[4], nullptr; }
+OrtStatus* ORT_API_CALL Append2(OrtSessionOptions*, void*) noexcept { return ++calls[5], nullptr; }
+OrtStatus* ORT_API_CALL Device(OrtSessionOptions*, void**) noexcept { return ++calls[6], nullptr; }
+OrtStatus* ORT_API_CALL Queue(OrtSessionOptions*, void**) noexcept { return ++calls[7], nullptr; }
+struct Table {
+    decltype(&Append) append;
+    decltype(&Append1) append1;
+    decltype(&Allocate) allocate;
+    decltype(&Free) free;
+    decltype(&Resource) resource;
+    decltype(&Append2) append2;
+    decltype(&Device) device;
+    decltype(&Queue) queue;
+};
+const Table table{&Append, &Append1, &Allocate, &Free, &Resource, &Append2, &Device, &Queue};
+OrtStatus* ORT_API_CALL GetProviderApi(const char* name, std::uint32_t, const void** api) noexcept {
+    if (std::strcmp(name, "DML") != 0) return RealApi()->CreateStatus(ORT_FAIL, "no such provider");
+    *api = &table;
+    return nullptr;
+}
+}  // namespace fake_dml
+
+}  // namespace
+
+// The DirectML table of a runtime that has it (the Windows build's): its three entries for graphics memory answer with
+// an error status naming them, never the runtime's, logged once each with a note to update the bridge; the provider's
+// appends and its device and queue getters are the runtime's.
+TEST(ForwardDirectMlGraphicsMemoryIsRefused) {
+    Need();
+    Harness h(Settings{});
+    const OrtApiBase* base = FakeRuntime::Install("1.24.4", 24, kKnownOrtEntries);
+    auto* provider = reinterpret_cast<OrtApi*>(FakeRuntime::slots.get());
+    provider->GetExecutionProviderApi = &fake_dml::GetProviderApi;
+    const OrtApi* t = base->GetApi(24);
+    CHECK(t != nullptr);
+    for (int& c : fake_dml::calls) c = 0;
+    const void* got = nullptr;
+    Ok(t->GetExecutionProviderApi("DML", 24, &got));
+    CHECK(got != nullptr);
+    CHECK(got != &fake_dml::table);  // the bridge's copy
+    const auto* dml = static_cast<const fake_dml::Table*>(got);
+    const auto refused = [&](OrtStatus* st, const char* name) {
+        const bool ok = st && std::string(t->GetErrorMessage(st)) == std::string("BFA Remote Bridge: ") + name +
+                                                                        " isn't served: the model runs on the server, which a tensor "
+                                                                        "in this PC's graphics memory can't reach" &&
+                        t->GetErrorCode(st) == ORT_NOT_IMPLEMENTED;
+        if (st) t->ReleaseStatus(st);
+        return ok;
+    };
+    void* out = nullptr;
+    for (int k = 0; k < 2; ++k) {
+        CHECK(refused(dml->allocate(nullptr, &out), "CreateGPUAllocationFromD3DResource"));
+        CHECK(refused(dml->free(nullptr), "FreeGPUAllocation"));
+        CHECK(refused(dml->resource(nullptr, nullptr, &out), "GetD3D12ResourceFromAllocation"));
+    }
+    CHECK(out == nullptr);
+    CHECK_EQ(fake_dml::calls[2] + fake_dml::calls[3] + fake_dml::calls[4], 0);
+    CHECK_EQ(h.CountLogged("Better Facial Animations called ONNX Runtime's DirectML's CreateGPUAllocationFromD3DResource, for a tensor in "
+                           "this PC's graphics memory, which the bridge can't forward byte for byte"),
+             1);
+    CHECK_EQ(h.CountLogged("DirectML's FreeGPUAllocation"), 1);
+    CHECK_EQ(h.CountLogged("DirectML's GetD3D12ResourceFromAllocation"), 1);
+    CHECK_EQ(h.CountNotes("BFA Remote Bridge: this Better Facial Animations puts its model's data in graphics memory "
+                          "(CreateGPUAllocationFromD3DResource), which the bridge can't send to the server, so BFA gets an error for it. "
+                          "Update the bridge."),
+             1);
+    CHECK_EQ(h.CountNotes("(FreeGPUAllocation)"), 1);
+    CHECK_EQ(h.CountNotes("(GetD3D12ResourceFromAllocation)"), 1);
+    // the rest: the runtime's own (the appends through the bridge's wrappers)
+    OrtSessionOptions* so = nullptr;
+    Ok(t->CreateSessionOptions(&so));
+    Ok(dml->append(so, 0));
+    Ok(dml->append1(so, nullptr, nullptr));
+    Ok(dml->append2(so, nullptr));
+    void* device = nullptr;
+    Ok(dml->device(so, &device));
+    Ok(dml->queue(so, &device));
+    t->ReleaseSessionOptions(so);
+    CHECK_EQ(fake_dml::calls[0], 1);
+    CHECK_EQ(fake_dml::calls[1], 1);
+    CHECK_EQ(fake_dml::calls[5], 1);
+    CHECK_EQ(fake_dml::calls[6], 1);
+    CHECK_EQ(fake_dml::calls[7], 1);
+}
+
+// A tensor in graphics memory handed to a run, as an input or as an output BFA made: the protocol can't carry it, so
+// the run gets an error status (BFA then doesn't load the model, or drops it), nothing is written into the outputs,
+// and it is logged and noted once a model, however often BFA tries.
+TEST(ForwardGraphicsMemoryTensorIsRefused) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtMemoryInfo* gpu = nullptr;
+    OrtStatus* st = h.api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &gpu);
+    if (st) {
+        h.api->ReleaseStatus(st);
+        SKIP("this runtime makes no graphics memory information");
+    }
+    OrtMemoryInfoDeviceType type = OrtMemoryInfoDeviceType_CPU;
+    h.api->MemoryInfoGetDeviceType(gpu, &type);
+    if (type == OrtMemoryInfoDeviceType_CPU) {
+        h.api->ReleaseMemoryInfo(gpu);
+        SKIP("this runtime's \"Cuda\" memory is the CPU's");
+    }
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 2);
+    std::vector<float> x(16);
+    const std::int64_t shape[] = {2, 8};
+    OrtValue* onGpu = nullptr;
+    st = h.api->CreateTensorWithDataAsOrtValue(gpu, x.data(), x.size() * 4, shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &onGpu);
+    if (st) {
+        h.api->ReleaseStatus(st);
+        h.api->ReleaseMemoryInfo(gpu);
+        h.api->ReleaseSession(session);
+        SKIP("this runtime makes no tensor over graphics memory information");
+    }
+    const auto refused = [&](OrtStatus* status) {
+        const bool ok = status && h.api->GetErrorCode(status) == ORT_NOT_IMPLEMENTED &&
+                        std::string(h.api->GetErrorMessage(status)).rfind("BFA Remote Bridge: tiny.onnx: ", 0) == 0;
+        if (status) h.api->ReleaseStatus(status);
+        return ok;
+    };
+    std::vector<OrtValue*> values = in.values;
+    values[0] = onGpu;
+    for (int k = 0; k < 2; ++k) {
+        Outputs out(h.api, 5);
+        CHECK(refused(h.api->Run(session, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data())));
+        for (OrtValue* v : out.v) CHECK(v == nullptr);  // nothing made for BFA to read
+    }
+    CHECK_EQ(h.CountLogged("tiny.onnx: input x isn't in CPU memory, which the protocol can't carry; BFA gets an error status for the run, "
+                           "so it doesn't load the model (or drops it) and lines get the game's own lip sync. Update the bridge."),
+             1);
+    CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data in "
+                          "graphics memory, which the bridge can't send to the server. Update the bridge."),
+             1);
+    h.api->ReleaseValue(onGpu);
+    h.api->ReleaseMemoryInfo(gpu);
+    h.api->ReleaseSession(session);
+}
+
+// An output BFA made in graphics memory: refused the same way, its data untouched, logged and noted once.
+// Two models handed graphics memory: each logged and noted once, every refused run counted as a fallback, and the
+// server told by NOTICE, naming the model and the lines.
+TEST(ForwardGraphicsMemoryRunsCountedPerModel) {
+    Need();
+    const fs::path dir = TempFolder("graphics-two-models");
+    fs::copy_file(Models() / "tiny.onnx", dir / "tiny.onnx");
+    fs::copy_file(Models() / "tiny.onnx", dir / "second.onnx");
+    const fs::path notices = TempFolder("graphics-notices") / "notices.jsonl";
+    {
+        Server server(dir, {"--notice-log", notices.string()});
+        Harness h(On(server.Port()));
+        OrtMemoryInfo* gpu = nullptr;
+        OrtStatus* st = h.api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &gpu);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            SKIP("this runtime makes no graphics memory information");
+        }
+        OrtMemoryInfoDeviceType type = OrtMemoryInfoDeviceType_CPU;
+        h.api->MemoryInfoGetDeviceType(gpu, &type);
+        if (type == OrtMemoryInfoDeviceType_CPU) {
+            h.api->ReleaseMemoryInfo(gpu);
+            SKIP("this runtime's \"Cuda\" memory is the CPU's");
+        }
+        OrtSession* a = nullptr;
+        OrtSession* b = nullptr;
+        Ok(h.Create(dir / "tiny.onnx", {{"batch", 2}}, &a));
+        Ok(h.Create(dir / "second.onnx", {{"batch", 2}}, &b));
+        TinyInputs in(h.api, h.cpu, 2);
+        std::vector<float> x(16);
+        const std::int64_t shape[] = {2, 8};
+        OrtValue* onGpu = nullptr;
+        st = h.api->CreateTensorWithDataAsOrtValue(gpu, x.data(), x.size() * 4, shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &onGpu);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            h.api->ReleaseMemoryInfo(gpu);
+            h.api->ReleaseSession(a);
+            h.api->ReleaseSession(b);
+            SKIP("this runtime makes no tensor over graphics memory information");
+        }
+        std::vector<OrtValue*> values = in.values;
+        values[0] = onGpu;
+        const std::uint64_t before = h.bridge.Connection().Totals().fallbacks;
+        for (OrtSession* s : {a, b, a, b}) {
+            Outputs out(h.api, 5);
+            st = h.api->Run(s, nullptr, kTinyIn, values.data(), 5, kTinyOut, 5, out.v.data());
+            CHECK(st != nullptr);
+            if (st) h.api->ReleaseStatus(st);
+        }
+        CHECK_EQ(h.bridge.Connection().Totals().fallbacks - before, std::uint64_t{4});
+        CHECK_EQ(h.CountLogged("tiny.onnx: input x isn't in CPU memory, which the protocol can't carry"), 1);
+        CHECK_EQ(h.CountLogged("second.onnx: input x isn't in CPU memory, which the protocol can't carry"), 1);
+        CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data"), 1);
+        CHECK_EQ(h.CountNotes("second.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data"), 1);
+        {  // an ordinary line opens the main connection, and the NOTICE goes on it
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(a, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+        }
+        h.bridge.Connection().Tick();
+        CHECK_EQ(h.bridge.Connection().NoticesSent(), 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the server writes it
+        std::ifstream file(notices);
+        std::string line;
+        std::getline(file, line);
+        CHECK(line.find(R"("model": "second.onnx", "reason": "incompatible")") != std::string::npos);
+        CHECK(line.find(R"("lines": 4})") != std::string::npos);
+        h.api->ReleaseValue(onGpu);
+        h.api->ReleaseMemoryInfo(gpu);
+        h.api->ReleaseSession(a);
+        h.api->ReleaseSession(b);
+    }
+    fs::remove_all(dir);
+    fs::remove_all(notices.parent_path());
+}
+
+TEST(ForwardGraphicsMemoryOutputIsRefused) {
+    Need();
+    Server server(Models());
+    Harness h(On(server.Port()));
+    OrtMemoryInfo* gpu = nullptr;
+    OrtStatus* st = h.api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &gpu);
+    if (st) {
+        h.api->ReleaseStatus(st);
+        SKIP("this runtime makes no graphics memory information");
+    }
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
+    TinyInputs in(h.api, h.cpu, 4);
+    const std::int64_t shape[] = {2, 8};
+    for (int k = 0; k < 2; ++k) {
+        std::vector<float> y(16, 7.f);
+        Outputs out(h.api, 5);
+        st = h.api->CreateTensorWithDataAsOrtValue(gpu, y.data(), y.size() * 4, shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &out.v[0]);
+        if (st) {
+            h.api->ReleaseStatus(st);
+            h.api->ReleaseMemoryInfo(gpu);
+            h.api->ReleaseSession(session);
+            SKIP("this runtime makes no tensor over graphics memory information");
+        }
+        st = h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data());
+        CHECK(st != nullptr);
+        if (st) {
+            CHECK_EQ(static_cast<int>(h.api->GetErrorCode(st)), static_cast<int>(ORT_NOT_IMPLEMENTED));
+            h.api->ReleaseStatus(st);
+        }
+        CHECK(std::all_of(y.begin(), y.end(), [](float f) { return f == 7.f; }));
+        for (std::size_t i = 1; i < out.v.size(); ++i) CHECK(out.v[i] == nullptr);
+    }
+    CHECK_EQ(h.CountLogged("tiny.onnx: output y isn't in CPU memory, which the protocol can't carry; BFA gets an error status for the run"), 1);
+    CHECK_EQ(h.CountNotes("tiny.onnx: lines get the game's own lip sync, since this Better Facial Animations hands its model data in "
+                          "graphics memory"),
+             1);
+    h.api->ReleaseMemoryInfo(gpu);
+    h.api->ReleaseSession(session);
 }

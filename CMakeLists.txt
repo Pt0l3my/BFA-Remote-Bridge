@@ -8,11 +8,12 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Without BFARB_PYTHON (or with a python lacking those packages) the tests that need a real runtime and the reference
-# server are skipped. BFARB_BFA_MODELS=<folder holding BFA's performance.onnx and network_fp16.onnx> and
-# BFARB_BFA_DLL=<BFA's BetterFacialAnimations.dll>, in the environment when the tests run, add BFA's own files
+# server are skipped. BFARB_BFA_MODELS=<folder holding BFA's performance.onnx and network_fp16.onnx>,
+# BFARB_BFA_DLL=<BFA 4.3.2's BetterFacialAnimations.dll>, BFARB_BFA5_DLL=<BFA 5.0.6's> and
+# BFARB_BFA5_EMOTION=<BFA 5.0.6's emotion_performance.onnx>, in the environment when the tests run, add BFA's own files
 # (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.4.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,8 +67,10 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------------------- core
 add_library(bfarb_core STATIC
   src/core/BfaMode.cpp
+  src/core/BfaSizes.cpp
   src/core/Bridge.cpp
   src/core/Client.cpp
+  src/core/IniText.cpp
   src/core/Monitor.cpp
   src/core/PeImage.cpp
   src/core/Protocol.cpp

@@ -2,8 +2,9 @@
 //
 //   load            the log (BFARemoteBridge.log in SKSE's log folder), VR refused, the messaging listener
 //   post-load       every plugin is loaded: find Better Facial Animations, read its version, attach to its lookup of
-//                   ONNX Runtime (Hook.cpp), whatever its version; note whether SkyrimNet is loaded, so a model load
-//                   waits for its settings; and, once attached, allow the client's background thread (src/core/Client.h)
+//                   ONNX Runtime (Hook.cpp), whatever its version; for BFA 5.0.6, read its Batch setting for the sizes
+//                   the bridge lists (core/BfaSizes.h); note whether SkyrimNet is loaded, so a model load waits for its
+//                   settings; and, once attached, allow the client's background thread (src/core/Client.h)
 //   data loaded,    the settings from SkyrimNet's Settings > Plugins page, on the main thread, once SkyrimNet has
 //   main menu,      registered them; also whenever that page is saved. The first read starts the background
 //   pre-load game   thread, which looks the server's name up (again after each change of the address or port),
@@ -27,6 +28,7 @@
 
 #include "plugin/Plugin.h"
 
+#include "core/BfaSizes.h"
 #include "core/Status.h"
 #include "core/Version.h"
 
@@ -150,7 +152,19 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 g_skyrimNet = SkyrimNetLoaded();
                 g_bridge->ExpectSettings(g_skyrimNet);
                 g_bridge->Connection().SetBfaVersion(g_bfa.version);
-                if (g_mode) g_mode->SetBfaVersion(g_bfa.version);  // its CPU mode is set for BFA 4.3.2.3 alone
+                if (g_mode) {
+                    g_mode->SetBfaVersion(g_bfa.version);  // its CPU mode is set for BFA 4.3.2.3 and 5.0.6 alone
+                    g_mode->OnStart();                     // BFA has loaded its INI: what it loaded settles the records
+                }
+                // BFA 5.0.6's Batch, as BFA read it at its load, for its Legacy model's sizes (core/BfaSizes.h)
+                if (ListsSizesFor(g_bfa.version)) {
+                    const auto store = BfaIniStore();
+                    const int batch = Bfa5Batch(*store);
+                    g_bridge->SetBfaBatch(batch);
+                    if (g_bfa.hooked)
+                        Log(Level::Info, "Better Facial Animations " + g_bfa.version + "'s Batch is " + std::to_string(batch) +
+                                             ": the bridge lists its GPU route's sizes for its models");
+                }
                 if (g_bfa.hooked) g_bridge->Connection().StartBackground();
                 break;
             case SKSE::MessagingInterface::kDataLoaded: {
@@ -178,7 +192,7 @@ void OnSkse(SKSE::MessagingInterface::Message* message) {
                 ApplySettings("before a game loads");
                 break;
             case SKSE::MessagingInterface::kSaveGame:
-                if (g_mode) g_mode->OnGameSave();  // BFA's menu may have saved its file since: its CPU mode again
+                if (g_mode) g_mode->OnGameSave();  // BFA's menu may have saved its file since: the last answer's values again
                 break;
             case SKSE::MessagingInterface::kPostLoadGame:
             case SKSE::MessagingInterface::kNewGame:

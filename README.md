@@ -23,6 +23,24 @@ the arithmetic happens on the server's PC, and BFA gets the results back. BFA's 
 bridge attaches to BFA in memory when the game starts. The one file of BFA's it writes is BFA's INI, to set its CPU
 mode (see [BFA's mode](#bfas-mode)).
 
+## What's new in 1.5.0
+
+- **Better Facial Animations 5.0.6.** The bridge serves BFA 5.0.6 as it serves 4.3.2.3: its three facial models, and
+  both its emotion models, Full and the new Performance one (`emotion_performance.onnx`). Copy BFA 5.0.6's folder to
+  the server as before (see [On PandorumLLM's PC](#on-pandorumllms-pc)). The protocol is unchanged, so PandorumLLM's
+  side should need no change; it is asked to confirm one point (see [BFA's mode](#bfas-mode)).
+- **BFA 5's mode, both keys.** BFA 5 has one CPU switch for its facial model and one for its emotion model. With a
+  PandorumLLM server that speaks protocol version 2, the bridge sets both, so from the next game start BFA 5 creates
+  no graphics device on this PC. See [BFA's mode](#bfas-mode).
+- **A put-back that lasts.** When the bridge puts BFA's values back (for an older server), a save of BFA's menu later
+  in the same session, which writes the bridge's values back, is put right at the next game save, and the bridge keeps
+  its note until a game start has loaded BFA's values. A setting BFA's INI didn't hold before is taken out again, so
+  BFA's installer choice applies.
+- **Lip sync in scenes** applies to BFA 5.0.6 too: it makes the same scene check as 4.3.2.3.
+- **A call the bridge can't send to the server** (a newer BFA's use of this PC's graphics memory, say) now gets an
+  error, and a note, once, saying to update the bridge. A model whose data BFA puts in this PC's graphics memory isn't
+  loaded, and its lines get the game's own lip sync.
+
 ## What's new in 1.4.0
 
 - **Lip sync in scenes.** Better Facial Animations leaves the faces of everyone in an OStim or SexLab scene to the
@@ -63,8 +81,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 
 - At start-up the bridge finds `BetterFacialAnimations.dll` and redirects its one lookup of ONNX Runtime's entry
   point, so BFA's calls to the runtime pass through the bridge. That is the only change it makes to BFA's code;
-  besides it, the bridge sets one setting in BFA's INI ([BFA's mode](#bfas-mode)), and answers BFA's question whether
-  someone is in a scene ([Lip sync in scenes](#lip-sync-in-scenes)).
+  besides it, the bridge sets BFA's CPU mode in BFA's INI ([BFA's mode](#bfas-mode)), and answers BFA's question
+  whether someone is in a scene ([Lip sync in scenes](#lip-sync-in-scenes)).
 - **With the bridge, no BFA model runs on the gaming PC**, neither on its graphics card nor on its processor. When BFA
   loads a model, the bridge asks the server to load the same file (matched by name, size and SHA-256); every run then
   goes to the server, BFA's warm-up run included.
@@ -76,8 +94,9 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   - If the server can't load the model (it isn't running, it lacks the file or has another copy), BFA's model isn't
     loaded, and lip sync is the game's own. Start the server, then reload the model in BFA's menu or restart the game.
   - If the server doesn't answer a call in time (1000 ms), that one line gets the game's own lip sync, BFA keeps its
-    facial model, and the next line goes to the server again on the same connection. Its sentiment model is the
-    exception: BFA drops it after a missed answer and loads it again 30 seconds later (60 in GPU mode).
+    facial model, and the next line goes to the server again on the same connection. Its emotion model is the
+    exception: BFA drops it after a missed answer and loads it again 60 seconds later in its CPU mode (30 when set to
+    a graphics card).
   - If the connection fails (the server stops, the network drops, or two calls in a row time out), the bridge pauses:
     lines get the game's own lip sync at once, without waiting, while the bridge reconnects in the background (after
     1, 2, 5, 10 and 30 seconds, then every 30 seconds). Speech goes back to the server the moment it answers again.
@@ -89,8 +108,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   says so (or, as v3.97-p6 and earlier can, drops the connection twice without an answer), and the bridge then speaks
   version 1 to it until the game restarts or the address changes.
 - **BFA's mode.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode
-  itself, from the next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the
-  server. See [BFA's mode](#bfas-mode).
+  itself, from the next game start, so BFA 4.3.2.3 opens nothing on this PC's graphics card, and BFA 5.0.6 creates no
+  graphics device there. The model still runs on the server. See [BFA's mode](#bfas-mode).
 - The bridge keeps one connection for speech. When BFA loads a model, the server loads it on a short-lived connection
   of its own, so the lines of a model already loaded keep flowing meanwhile. After a minute without speech the bridge
   checks the connection (PING), so it is ready before the next line needs it.
@@ -98,9 +117,11 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   serves the ONNX Runtime API version BFA asks for, older or newer than the 1.24.4 it knows (an entry newer than
   1.24.4's answers with an error, so whatever needs it gets the game's own lip sync, and the log names it), and the
   server matches the model files. A runtime the bridge can't serve (older than 1.10, or newer than it serves) is
-  known to be incompatible: BFA's model isn't loaded, lip sync is the game's own, and a note says what to update. If
-  the bridge can't attach to BFA at all, it says so on screen, and BFA runs on this PC as it would without the bridge:
-  update the bridge.
+  known to be incompatible: BFA's model isn't loaded, lip sync is the game's own, and a note says what to update. So
+  is a call the bridge can't send to the server byte for byte: it gets an error, and a note, once, says to update the
+  bridge. A model whose data BFA puts in this PC's graphics memory isn't loaded, and its lines get the game's own lip
+  sync. If the bridge can't attach to BFA at all, it says so on screen, and BFA runs on this PC as it would without
+  the bridge: update the bridge.
 
 ## Requirements
 
@@ -108,7 +129,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 - [SKSE](https://skse.silverlock.org/) for your game version and
   [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444).
 - SkyrimNet Beta26 or later: the bridge's settings are on its Settings > Plugins page.
-- Better Facial Animations (tested with 4.3.2, which ships ONNX Runtime 1.24.4). Other versions are tried too.
+- Better Facial Animations 5.0.6 or 4.3.2 (made for 5.0.6.3 and 4.3.2.3, which both ship ONNX Runtime 1.24.4). Other
+  versions are tried too.
 - PandorumLLM's A2F server on another PC of your local network, holding the same BFA files as your gaming PC (or any
   server that speaks [the bridge's protocol](docs/PROTOCOL.md)). Finding it by itself needs one that speaks protocol
   version 2; an older one is reached by its address.
@@ -127,7 +149,10 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
 By hand: copy the zip's `SKSE` folder into the game's `Data` folder.
 
 To run BFA on its own again, disable the bridge in Mod Organizer 2. If you remove the bridge, BFA keeps the CPU
-mode the bridge set; BFA's own menu shows it.
+mode the bridge set (with BFA 5.0.6, for both its facial and its emotion model); BFA's own menu shows it and can
+change it. The bridge's own `SKSE/Plugins/BFARemoteBridge.ini` notes how each setting it changed was:
+`ForceCPUSetByBridge=1` when BFA's INI held 0, `EmotionDeviceSetByBridge` with the graphics card's number for BFA 5's
+emotion model, and `added` for either when BFA's INI had no value of its own.
 
 ## On PandorumLLM's PC
 
@@ -135,8 +160,8 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 
 1. Copy the gaming PC's `Data/SKSE/Plugins/BetterFacialAnimations/` folder to PandorumLLM's PC (or install the same
    BFA version there and take that folder). It must hold:
-   - the `.onnx` models (`a2f3_fp16.onnx`, `emotion_fp16.onnx`, `performance.onnx`, `network_fp16.onnx`, as many as
-     your BFA has);
+   - the `.onnx` models (`a2f3_fp16.onnx`, `emotion_fp16.onnx`, `performance.onnx`, `network_fp16.onnx`, and, from
+     BFA 5.0.6, `emotion_performance.onnx`, as many as your BFA has): copying the whole folder takes them all;
    - `onnxruntime.dll`, `DirectML.dll` and `onnxruntime_providers_shared.dll`;
    - BFA's licence files (`NOTICE.txt` and the `licenses` folder), which go with its models.
 2. In PandorumLLM's panel, point the A2F server's **Model folder** at that folder, and choose the card it runs on.
@@ -153,27 +178,58 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
 The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you set nothing about it on the gaming PC.
 
 - With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode itself, from the
-  next game start, so BFA opens nothing on this PC's graphics card. The model still runs on the server. It writes
-  `ForceCPU=1` under `[General]` in BFA's own `BetterFacialAnimations.ini` (BFA reads that file once, as the game
-  starts), says so once in its log, and writes it again at each game save, so a change in BFA's menu in the same
-  session doesn't undo it. In Mod Organizer 2 the change goes to BFA's own file, in BFA's mod folder, and the
-  bridge's new file below to Overwrite.
-- When it changes the setting, the bridge notes that it did, in its own `SKSE/Plugins/BFARemoteBridge.ini`. With a
-  server that speaks only protocol version 1 (PandorumLLM v3.97 Beta patch7 and earlier), it puts BFA's value back, from
-  the next game start: it sets BFA's CPU mode only for a server that speaks version 2. When its note is missing or
-  unreadable, it puts nothing back. It never creates BFA's INI: without that file, BFA's mode is left as it is.
-- Only for Better Facial Animations 4.3.2.3, the version whose sizes version 2 servers carry: any other BFA version's
-  mode is left as it is, and a value the bridge set earlier is put back.
-- In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime, and a version 2 server fills
-  in BFA 4.3.2.3's own (part of protocol version 2, agreed with PandorumLLM's side;
-  [docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5).
-- No setting and no note on screen: the log line is all.
+  next game start. The model still runs on the server. It writes the CPU mode under `[General]` in BFA's own
+  `BetterFacialAnimations.ini` (BFA reads that file once, as the game starts), says so once in its log, and writes it
+  again at each game save, so a change in BFA's menu before that save doesn't undo it; one made after the last save
+  of a session is what BFA loads at the next start. In Mod Organizer 2 the change goes to BFA's own file, in BFA's
+  mod folder, and the bridge's new file below to Overwrite.
+  - **BFA 4.3.2.3:** `ForceCPU=1`, so BFA opens nothing on this PC's graphics card.
+  - **BFA 5.0.6:** both of its keys, `ForceCPU=1` for its facial model (Audio2Face) and `EmotionDevice=-1` for its
+    emotion model (Audio2Emotion), so BFA creates no graphics device on this PC. BFA 5's installer keeps your choices
+    in small files of its own (`BetterFacialAnimations/Installer`), and a value in BFA's INI wins over them: the
+    bridge reads them all as BFA 5 does, and writes its values in BFA's INI.
+  - BFA's Independent GPU mode (`IndependentGpuDevice`) plays no part once both keys are on the CPU, and the bridge
+    never changes it.
+- When it changes a setting, the bridge notes how it was, in its own `SKSE/Plugins/BFARemoteBridge.ini`: the value
+  BFA's INI held (for `EmotionDevice`, the graphics card's number), or `added` when BFA's INI held none. A graphics
+  card picked in BFA's menu for the emotion model while the bridge's value is there is noted in its place at the
+  bridge's next write.
+- With a server that speaks only protocol version 1 (PandorumLLM v3.97 Beta patch7 and earlier), it puts BFA's values
+  back, from the next game start: it sets BFA's CPU mode only for a server that speaks version 2. It writes back the
+  value BFA's INI held, or takes out the one it added, so BFA's installer choice applies again. A save of BFA's menu
+  later in that session would write the bridge's values back, so the bridge puts BFA's values back again at each game
+  save of that session, and keeps its note until a game start has loaded them.
+- It puts back only a value that is still its own in BFA's INI (`ForceCPU=1`, `EmotionDevice=-1`): one you changed
+  since in BFA's menu is left as you set it. The CPU, picked in BFA's menu or set by hand before the next start while
+  the bridge's value is there, can't be told from the bridge's own, and is put back too. When its note is missing or
+  unreadable, it puts nothing back. It never creates BFA's INI: without that file, BFA's mode is left as it is. A game
+  start without BFA's INI (BFA's mod disabled for a while, say), or with one the bridge can't read at that moment,
+  leaves the bridge's notes as they are, and nothing is written into an INI the bridge can't read. After a start at
+  which BFA's INI couldn't be read, a CPU picked in BFA's menu later that session can't be told from the bridge's own
+  either.
+- The bridge's notes are one file in Mod Organizer 2's Overwrite, so they are shared by every profile, and by every
+  BFA version you switch between. A game start whose BFA INI doesn't hold the bridge's value clears the note of it
+  (for `EmotionDevice`, only a start of BFA 5.0.6), and that value is then not put back in the other profile. A
+  `ForceCPU=1` or `EmotionDevice=-1` of your own in one profile can't be told from the bridge's while the other's note
+  is there.
+- Only for Better Facial Animations 4.3.2.3 and 5.0.6, the versions the bridge is made for: any other BFA version's
+  mode is left as it is, and the values the bridge set earlier are put back once the bridge attaches to that version
+  and a server answers.
+- In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime. For BFA 4.3.2.3 a version 2
+  server fills in its own for V3 (`a2f3_fp16.onnx`) and the emotion model (`emotion_fp16.onnx`), part of protocol
+  version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5). For BFA
+  5.0.6 the bridge sends its GPU mode's sizes itself, for every 5.0.6 build alike, by the model's file name. The
+  protocol is unchanged, so PandorumLLM's server should need nothing new for it. PandorumLLM's side is asked to confirm
+  one point: that its server passes on, as listed, a size for a dimension the model lacks (the emotion models get
+  such sizes, as BFA's own GPU mode sets them).
+- No setting and no note on screen: the log lines are all.
 
 ## Lip sync in scenes
 
 Better Facial Animations leaves the faces of everyone in an OStim or SexLab scene to the scene: it doesn't animate
 their lines, and SkyrimNet's log shows each such line as "given back (Declined/InScene)". With **Lip sync in scenes**
-on (the default), speakers in a scene get BFA's lip sync and expression for their lines, as anywhere else.
+on (the default), speakers in a scene get BFA's lip sync and expression for their lines, as anywhere else. It works
+with BFA 4.3.2.3, and BFA 5.0.6 makes the same scene check, so the setting applies to it too.
 
 - **Only BFA is answered differently.** BFA tells a scene by asking the game whether the speaker is in one of three
   factions: SexLab's SexLabAnimatingFaction, and OStim's OStimActorCountFaction and OStimExcitementFaction. The bridge
@@ -182,11 +238,14 @@ on (the default), speakers in a scene get BFA's lip sync and expression for thei
 - **The trade-off.** While a line plays, BFA's expression sits over OStim's scene expression: the mouth, the brows
   and the emotion are BFA's for the line, and the blinks and where the eyes look stay the scene's. A change of
   expression OStim makes during a line shows once the line ends. When the line ends, the scene's expression fades
-  back in over about a second, but BFA draws it itself for up to five minutes after a line, as it does for anyone, so
-  the face can look softer around the mouth for a while after a line.
+  back in over about a second. BFA 4.3.2.3 still draws the face itself for up to five minutes after a line, as it does
+  for anyone, so the face can look softer around the mouth for a while after a line; BFA 5.0.6 hands the face back
+  about three seconds after a line, with a one-second fade.
 - OStim's own voiced comments in a scene get BFA's lip sync too, as any line does; its moans don't.
-- BFA's own settings still apply in a scene: someone BFA doesn't animate elsewhere (by its NPC or race settings, or
-  its player setting) isn't animated in a scene either.
+- BFA's own settings still apply in a scene: someone BFA doesn't animate elsewhere (by its NPC or race settings, its
+  player setting, or BFA 5's Potato Mode, which animates only the player and the one they are talking to) isn't
+  animated in a scene either. So does BFA 5's own rule for ZaZ mouth gear: a speaker wearing an item with one of ZaZ
+  Animation Pack's gag or mouth keywords keeps the game's face.
 - **It takes effect at once.** Turn it off on SkyrimNet's page, and BFA leaves faces in a scene to the scene again
   from the next frame, a line already playing included.
 - It works with or without a server: it changes what BFA animates, not where the model runs.
@@ -206,15 +265,15 @@ the bridge: the hardware the model runs on is chosen in PandorumLLM.
 | Port | 7871 | The A2F server's port, as set in PandorumLLM: used with the address above, and for finding the server when the address is empty. |
 | Lip sync in scenes | on | Better Facial Animations otherwise leaves the faces of everyone in an OStim or SexLab scene to the scene. With this on, speakers in a scene get BFA's lip sync and expression for their lines. Takes effect at once. See [Lip sync in scenes](#lip-sync-in-scenes). |
 | Status on load | on | Shows on screen, at each game load and when a model is served, which card and server run each of BFA's models. Notes about lines getting the game's own lip sync show either way. |
-| Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and a line kept in a scene at most once a minute. |
+| Log detail | Normal | Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and, at most once a minute, a line whose scene check the bridge answered. |
 
 Bridge (on or off), Access key, Timeout and Check results, the settings of 1.1, are gone: with the bridge installed it
 takes over, PandorumLLM admits the gaming PC by its Remote IP, each call waits 1000 ms, and nothing of the model runs
 on this PC to check against. Values saved for them are ignored.
 
 The bridge reads the settings when the game starts, when the main menu opens, before each save loads, and whenever
-you save the page. Until SkyrimNet has registered them, BFA's model loads are refused (BFA tries again 30 seconds
-later), so that the model never runs on this PC by mistake; Lip sync in scenes is on until then, as its default.
+you save the page. Until SkyrimNet has registered them, BFA's model loads are refused (in its CPU mode BFA tries again
+30 seconds later, its emotion model 60 seconds later), so that the model never runs on this PC by mistake; Lip sync in scenes is on until then, as its default.
 
 ## The monitor
 
@@ -231,7 +290,8 @@ The bridge tells you on screen what the server does, one line per model, from th
 - when lines are back on the server after such a note, at most once a minute: "BFA Remote Bridge: a2f3_fp16.onnx:
   lines are back on the server." (without the model when another model's line came back);
 - once per session: no server found on the local network, SkyrimNet missing, the bridge unable to attach, or a
-  runtime it can't serve.
+  runtime it can't serve; once for each call the bridge can't send to the server; and once for each model whose data
+  BFA puts in this PC's graphics memory.
 
 A server's detail (such as ONNX Runtime's message for a model that failed to load) is put on one line, loses any
 folder and memory address, and is cut at about 160 characters on screen; the log keeps the whole line.
@@ -258,9 +318,12 @@ every 30 seconds) with the reason in its client string.
   none answered;
 - the server's first answer at start-up (its name and device, such as "PandorumLLM ... A2F" on "DirectML 0: ..." or
   "CPU: ...", and the protocol version it answered in), and, once, that a server speaks protocol version 1 only;
-- each model BFA loads: its size, SHA-256 and overrides, and whether the server serves it ("is served by ...;
-  nothing of it runs on this PC") or why not, with the server's note when it runs another model in that role's place;
-  a refusal BFA meets again on its retries is logged once;
+- each model BFA loads: its size, SHA-256 and overrides (for BFA 5.0.6, the sizes of BFA's GPU mode the bridge
+  lists, said as such), and whether the server serves it ("is served by ...; nothing of it runs on this PC") or why
+  not, with the server's note when it runs another model in that role's place; a refusal BFA meets again on its
+  retries is logged once;
+- for BFA 5.0.6, at start-up, its `Batch` setting, which sets its Legacy model's sizes (when the bridge attached);
+- BFA's mode as the bridge set it or put it back, or why it left it as it is;
 - each line the server didn't answer: the model, the reason (no connection, connect timed out, RUN timed out, ERROR
   with its code and text, not ready, connection lost) and the time it took, as "a2f3_fp16.onnx: not answered (RUN
   timed out: no answer within 1000 ms) after 1001.2 ms; its line gets the game's own lip sync". Lines answered at
@@ -275,11 +338,12 @@ every 30 seconds) with the reason in its client string.
 With Log detail set to Detailed it also logs one line per run, each connection opened or closed and why, each answer
 to HELLO, each unanswered PING, each late answer discarded, each background reconnection attempt and each status
 check sent for a fallback or NOTICE, each search sent and each datagram ignored, BFA's GPU mode, once, as a fact,
-and, at most once a minute, a line kept in a scene: the speaker's form ID, the scene faction, and how many lines were
-kept since the last such log line. The checks BFA makes every frame are never logged.
+and, at most once a minute, a line whose scene check the bridge answered: the speaker's form ID, the scene faction,
+and how many such lines since the last such log line. BFA's own settings and BFA 5's mouth-gear rule can still keep
+such a line on the game's face. The checks BFA makes every frame are never logged.
 
-The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.4.0
-(answered 1250, fallbacks 0, timeouts 0, BFA 4.3.2.3, ORT 1.24.4)", and every 5 minutes, when they changed, it sends
+The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.5.0
+(answered 1250, fallbacks 0, timeouts 0, BFA 5.0.6.3, ORT 1.24.4)", and every 5 minutes, when they changed, it sends
 them on a short connection of its own, so PandorumLLM's panel shows them.
 
 ## Troubleshooting
@@ -295,8 +359,9 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | "couldn't attach to Better Facial Animations" | This BFA looks ONNX Runtime up in a way the bridge doesn't know, or another mod loaded it first: the log says which. BFA runs on this PC as usual; update the bridge. |
 | "uses ONNX Runtime ..., which the bridge can't serve" | BFA's model isn't loaded and lip sync is the game's own. For a runtime newer than the bridge knows, update the bridge; for one older than 1.10, update BFA. |
 | "runtime entry ... which the bridge doesn't know" | This BFA's runtime is newer than the bridge knows: update the bridge. |
+| "... which the bridge can't send to the server" or "... which the bridge doesn't forward" | This BFA asks the runtime for something the bridge can't pass to the server (graphics memory, say): BFA gets an error for it. Update the bridge. |
 | Lips on the game's own animation now and then | The notes and the log's "not answered" lines and summaries say why. |
-| No lip sync in an OStim or SexLab scene | Check that **Lip sync in scenes** is on. The log's "Lip sync in scenes" line at load says whether it was set up, or why not. BFA's own settings still apply: someone BFA doesn't animate elsewhere isn't animated in a scene either. |
+| No lip sync in an OStim or SexLab scene | Check that **Lip sync in scenes** is on. The log's "Lip sync in scenes" line at load says whether it was set up, or why not. BFA's own settings still apply: someone BFA doesn't animate elsewhere isn't animated in a scene either, BFA 5's Potato Mode animates only the player and the one they are talking to, and BFA 5 leaves a speaker wearing ZaZ mouth gear to the game. |
 
 ## Building
 

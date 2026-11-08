@@ -278,8 +278,11 @@ TEST(SceneLogTexts) {
     const std::string one = KeptText(0x000A2C94, 1, 1);
     CHECK(one.find("000A2C94") != std::string::npos);
     CHECK(one.find("OStim.esp 0xECA") != std::string::npos);
-    CHECK(one.find("lines kept since") == std::string::npos);
-    CHECK(KeptText(0x14, 0, 4).find("4 lines kept since the last such log line") != std::string::npos);
+    CHECK(one.find("answered BFA's scene check") != std::string::npos);
+    CHECK(one.find("kept BFA's lip sync") == std::string::npos);  // BFA may still decline the line (its settings, mouth gear)
+    CHECK(one.find("lines so since") == std::string::npos);
+    CHECK(KeptText(0x14, 0, 4).find("4 lines so since the last such log line") != std::string::npos);
+    CHECK(installed.find("will be answered") != std::string::npos);
 }
 
 TEST(SceneSettingIsOnByDefaultAndRead) {

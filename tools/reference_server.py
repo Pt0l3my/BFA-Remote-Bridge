@@ -11,7 +11,7 @@ of zeros, and one lock per session around its runs.
 
 It prints "LISTENING <port>" once it accepts connections (with --port 0 the system picks the port). The test
 options --delay-ms, --fault and --run-error make it slow or wrong on purpose (--fault-count limits them to the first
-runs). Needs onnxruntime and numpy.
+runs), and --hello-log FILE appends each HELLO's models and overrides as a JSON line. Needs onnxruntime and numpy.
 
 As PandorumLLM's server does: each connection's requests are answered in order, late ones too; PING is answered with
 PONG only after HELLO (before it, ERROR 1); after ERROR 1, 2, 5, 6 or 7 the connection is closed.
@@ -64,8 +64,7 @@ MAX_NAME = 255  # bytes of a model or tensor name; longer is malformed
 
 DTYPES = {1: np.dtype("<f4"), 6: np.dtype("<i4"), 7: np.dtype("<i8"), 10: np.dtype("<f2"), 11: np.dtype("<f8")}
 CODES = {v: k for k, v in DTYPES.items()}
-# BFA's own CPU sessions use "extended", never "all": the full level's layout fusions fail on the casts the CPU provider
-# inserts around network_fp16.onnx's operators.
+# BFA's own CPU sessions use "extended", never "all": at "all", network_fp16.onnx won't load on the CPU provider.
 OPTIMIZATION = {
     "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
     "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
@@ -380,6 +379,8 @@ class Handler(socketserver.StreamRequestHandler):
                 ready[name] = key
             out += pack_str(name) + struct.pack("<B", status) + pack_str(detail)
         self.server.log("HELLO from %s (runtime %s, version %d): %d models" % (client, ort_version, self.version, len(models)))
+        self.server.record_hello({"client": client, "version": self.version,
+                                  "models": [{"name": n, "overrides": [[d, v] for d, v in o]} for n, _, _, o in models]})
         self.send(HELLO_OK, out)
         return ready
 
@@ -454,6 +455,13 @@ class Server(socketserver.ThreadingTCPServer):
             return
         with self.notice_lock, open(self.cfg.notice_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(notice) + "\n")
+
+    def record_hello(self, hello):
+        """Test option: each HELLO's client and models, with the overrides as listed."""
+        if not self.cfg.hello_log:
+            return
+        with self.notice_lock, open(self.cfg.hello_log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(hello) + "\n")
 
     def take_fault(self):
         """Whether this RUN gets the test options' delay, fault or error (all of them, or the first --fault-count)."""
@@ -540,6 +548,8 @@ def main(argv=None):
     p.add_argument("--remote-ip", default="",
                    help="answer FIND (UDP, on the same port) from this address alone, as PandorumLLM's Remote IP (empty: no FIND)")
     p.add_argument("--notice-log", default="", help="append each NOTICE to this file, one JSON object a line")
+    p.add_argument("--hello-log", default="", help="test option: append each HELLO's models and their overrides to this file, "
+                                                    "one JSON object a line")
     p.add_argument("--fill-sizes", action="append", default=[], metavar="SHA256:DIM=VALUE[,DIM=VALUE]",
                    help="the sizes rule, for test files: a HELLO that lists no overrides for the file of this SHA-256 (hex) "
                         "gets these, and the row's detail says so; repeatable")

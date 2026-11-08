@@ -2,12 +2,15 @@
 // Lip sync in scenes: what the plugin's hook of Actor::IsInFaction decides, written without the game so it is tested
 // on Linux.
 //
-// Better Facial Animations leaves the face of anyone it thinks is in a SexLab or OStim scene to the scene: it asks
+// Better Facial Animations leaves the face of anyone it takes to be in an OStim or SexLab scene to the scene: it asks
 // the game whether the actor is in one of three factions, by the actor's virtual IsInFaction, from one function of
-// its own, which it calls from seven places (the provider's actor check, a line's start, the face's update every
-// frame, its morphs, its gaze). With the setting on, the hook answers "no" to exactly those questions: one of the
-// three factions, asked from inside BFA's own module (the call's return address lies in its image). Every other
-// caller, OStim, SexLab, SkyrimNet, the engine and every other plugin, gets the game's own answer.
+// its own, which it calls from seven places in 4.3.2.3 (the provider's actor check, a line's start, the face's update
+// every frame, its morphs, its gaze) and six in 5.0.6.3, where the same function also asks about ZaZ mouth gear (BFA's own
+// rule, left alone). In 5.0.6.3 CommonLib's IsInFaction reads the vtable slot and jumps to it, called from that one
+// function, so the game's function still returns into BFA's image. With the setting on, the hook answers "no" to
+// exactly those questions: one of the three factions, asked from inside BFA's own module (the call's return address
+// lies in its image). Every other caller, OStim, SexLab, SkyrimNet, the engine and every other plugin, gets the game's
+// own answer.
 //
 // The plugin side (src/plugin/SceneHook.cpp) finds the factions at the data-loaded message, by plugin and local ID,
 // checks the vtable slots and writes them, or installs nothing.
@@ -29,7 +32,7 @@ struct SceneFaction {
     const char* editorId;
 };
 
-// BFA 4.3.2's three: SexLab's, and OStim Standalone's and OStim NG's two.
+// BFA 4.3.2's three, and 5.0.6's (the same): SexLab's, and OStim Standalone's and OStim NG's two.
 inline constexpr std::array<SceneFaction, 3> kSceneFactions{{
     {"SexLab.esm", 0xE50F, "SexLabAnimatingFaction"},
     {"OStim.esp", 0xECA, "OStimActorCountFaction"},

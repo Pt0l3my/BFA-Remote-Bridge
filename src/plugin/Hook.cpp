@@ -3,9 +3,10 @@
 // name) in a module whose file is onnxruntime.dll gets the bridge's OrtGetApiBase (core/Bridge.h). BFA's files are never
 // changed; the patch lives in memory for the session.
 //
-// BFA loads onnxruntime.dll only after a save loads (BFA 4.3.2's LoadApi, on its worker thread), so SKSE's post-load
-// message, when every plugin is loaded, is early enough. Any BFA version is tried: what doesn't work shows by what
-// happens (the attach, the runtime API it asks for, the models the server matches), never by a version number.
+// BFA loads onnxruntime.dll only after a save loads (BFA 4.3.2's and 5.0.6's LoadApi, on its worker thread), so
+// SKSE's post-load message, when every plugin is loaded, is early enough. Any BFA version is tried: what doesn't work
+// shows by what happens (the attach, the runtime API it asks for, the models the server matches), never by a version
+// number.
 
 #include "plugin/Plugin.h"
 

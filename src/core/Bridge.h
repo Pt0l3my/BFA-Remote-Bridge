@@ -18,16 +18,19 @@
 // With the bridge, no BFA model runs on this PC: every model load is the server's or is refused.
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
-//                   taken, and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
+//                   taken (none set, as BFA's CPU route sets none: for BFA 5.0.6, the sizes its GPU route sets,
+//                   core/BfaSizes.h), and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
 //                   bridge's own. Not, or no server found, or the settings not read yet: BFA gets an error
 //                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
 //                   get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
-//                   in full, the call still succeeds, with each requested output a one-element float tensor holding
-//                   NaN: BFA's output check then drops that line only (its own comment: "A failed validation fails the
-//                   line only: the session and device stay"), where an error status would make it drop the model. A
-//                   connection failure pauses the bridge (src/core/Client.h): runs answer so at once until the
-//                   background thread's HELLO is answered. Every run is counted once, answered or by its reason.
+//                   in full, the call still succeeds (a tensor in graphics memory aside, below), with each requested
+//                   output a one-element float tensor holding NaN: BFA checks every answer it reads back. For its
+//                   facial models one that fails costs it that line alone, the model kept loaded, where an error
+//                   status would make it drop the model; an emotion model is dropped and loaded again later either
+//                   way. A connection failure pauses the bridge (src/core/Client.h): runs answer so at once
+//                   until the background thread's HELLO is answered. Every run is counted once, answered or by its
+//                   reason.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.
 //
 // AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;
@@ -35,10 +38,13 @@
 // SessionOptionsAppendExecutionProvider_DML entries wrapped) and SessionOptionsAppendExecutionProvider ("DML") only
 // to see that BFA is set to use the graphics card, which the bridge logs at Detailed, as a fact: the hardware is
 // PandorumLLM's choice, and the bridge advises nothing about it. Every one of these passes the call
-// through unchanged. Every other entry that takes a session answers a bridge session with an error status. The
-// runtime's other session makers (CreateSessionFromArray, the two with prepacked weights, the model editor's three)
-// answer with an error status naming them, since a model loaded so would run on this PC. Everything else is the real
-// runtime.
+// through unchanged. Every other entry that takes a session answers a bridge session with an error status, logged
+// once with a note to update the bridge (BFA 4.3.2 and 5.0.6 call none of them). The runtime's other session makers
+// (CreateSessionFromArray, the two with prepacked weights, the model editor's three) answer with an error status
+// naming them, since a model loaded so would run on this PC; so do the DirectML table's three entries for graphics
+// memory (CreateGPUAllocationFromD3DResource, FreeGPUAllocation, GetD3D12ResourceFromAllocation), since a tensor in
+// this PC's graphics memory can't be sent byte for byte. A run handed such a tensor gets an error status too, so BFA
+// doesn't load that model (or drops it), logged and noted once a model. Everything else is the real runtime.
 
 #include <atomic>
 #include <chrono>
@@ -122,6 +128,8 @@ public:
     // no server address.
     void Apply(const Settings& settings);
     void ExpectSettings(bool skyrimNet);
+    // BFA 5.0.6's [General] Batch, the Legacy model's frames per run (core/BfaSizes.h); 2 until set.
+    void SetBfaBatch(int batch) noexcept;
     Settings CurrentSettings() const;
     Client& Connection() noexcept { return client_; }
     Monitor& Notes() noexcept { return monitor_; }
@@ -140,6 +148,9 @@ public:
     void OnNewerEntry(std::size_t index);
     void OnCantServe(const std::string& runtime, const std::string& why, bool newer);
     void OnUnservedEntry(const std::string& name);
+    // A call the bridge can't forward byte for byte (on a bridge session, or for graphics memory): logged once, a
+    // note to update the bridge, and the status check's fallback.
+    void OnUnservedCall(const std::string& name, const std::string& what, const std::string& shown);
     OrtStatus* CreateSession(const OrtApi* real, const OrtEnv* env, const ORTCHAR_T* path, const OrtSessionOptions* options,
                              OrtSession** out) noexcept;
     void ReleaseSession(const OrtApi* real, OrtSession* session) noexcept;
@@ -174,10 +185,11 @@ private:
     std::vector<proto::ModelEntry> LiveModelsLocked() const;
     void Log(Level level, const std::string& line) const;
     void NanAnswer(const OrtApi* real, std::size_t outputCount, OrtValue** outputs) noexcept;
+    OrtStatus* RefuseGraphicsRun(const OrtApi* real, const std::string& model, const std::string& why, Clock::time_point start) noexcept;
     // A run the server didn't answer: counted (and logged unless quiet) by the client, told to the monitor and the
     // server (unless quiet), then the NaN answer.
     void FallBack(const OrtApi* real, const std::string& model, const Fallback& fallback, Reason reason, Clock::time_point start,
-                  std::size_t outputCount, OrtValue** outputs) noexcept;
+                  std::size_t outputCount, OrtValue** outputs, const std::string& words = {}) noexcept;
     void OnStates(const std::string& server, const std::string& device, const std::vector<ModelState>& models);
 
     LogSink log_;
@@ -188,6 +200,7 @@ private:
     Settings settings_;
     std::atomic<bool> settingsRead_{false};
     std::atomic<bool> skyrimNet_{false};
+    std::atomic<int> bfaBatch_{2};
 
     std::mutex hashMutex_;
     std::map<std::string, HashEntry> hashes_;

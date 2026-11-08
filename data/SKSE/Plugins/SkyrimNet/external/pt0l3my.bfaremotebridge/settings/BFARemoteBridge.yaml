@@ -10,7 +10,7 @@
 
 plugin:
   name: "BFARemoteBridge"
-  version: "1.4.0"
+  version: "1.5.0"
   description: "Sends Better Facial Animations' lip-sync model runs to PandorumLLM's A2F server on another PC of your network, and shows what the server does."
 
 schema:
@@ -49,7 +49,7 @@ schema:
     - name: "Log detail"
       path: "logDetail"
       type: "select"
-      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and a line kept in a scene at most once a minute."
+      description: "Detailed also logs every call's round trip, each connection opened or closed and why, each answer to HELLO, each unanswered PING, each reconnection attempt, and, at most once a minute, a line whose scene check the bridge answered."
       defaultValue: "Normal"
       options:
         - Normal
