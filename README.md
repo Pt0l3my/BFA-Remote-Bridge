@@ -27,9 +27,10 @@ mode (see [BFA's mode](#bfas-mode)).
 
 - **Better Facial Animations 7.0.0.** The bridge serves BFA 7.0.0 (made for its 7.0.0.1 build) beside 5.0.6 and
   4.3.2.3: its four facial models, V3 (`a2f3_fp16.onnx`), the new Performance model (`performance.onnx`), Ultra
-  Performance (`ultra-performance.onnx`, 5.0.6's Performance model under a new name) and Legacy (`network_fp16.onnx`),
-  and both its emotion models. Copy BFA 7.0.0's folder to the server (see [On PandorumLLM's PC](#on-pandorumllms-pc)).
-  The protocol is unchanged. BFA 7.0.0 hasn't yet been tried with PandorumLLM's server, nor in game.
+  Performance (`ultra-performance.onnx`, which BFA describes as its original Performance model) and Legacy
+  (`network_fp16.onnx`), and both its emotion models. Copy BFA 7.0.0's folder to the server (see
+  [On PandorumLLM's PC](#on-pandorumllms-pc)). The protocol is unchanged. BFA 7.0.0 hasn't yet been tried with
+  PandorumLLM's server, nor in game.
 - **BFA 7.0.0's mode** is set as 5.0.6's: both keys, `ForceCPU=1` and `EmotionDevice=-1`, with a server that speaks
   protocol version 2, read through BFA 7.0.0's installer files (sixteen of them now). See [BFA's mode](#bfas-mode).
 - **The new Performance model carries each line's state** in and out of every run, so a run is larger: about 15 MB in

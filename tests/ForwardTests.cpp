@@ -1711,10 +1711,11 @@ OrtValue* LongTensor(Harness& h, std::int64_t& value) {
 }  // namespace
 
 // BFA 7.0.0's new Performance model (never committed): BFARB_BFA7_PERFORMANCE names its performance.onnx. Every
-// dimension is fixed; the bridge lists its batch at 1 as BFA sets it, a dimension the model lacks. Each run carries its line's state: past_k and past_v in, next_k and
-// next_v out ([6, 1, 4, 256, 152] float each, 3,735,552 bytes). A first run from an empty state and a second fed the
-// first's next_k and next_v (90 frames kept, as BFA's JSON describes) answer through the bridge exactly as local runs
-// do, byte for byte, so the state round-trips through the bridge unchanged. The run's wall time on loopback is logged.
+// dimension is fixed; the bridge lists its batch at 1 as BFA sets it, a dimension the model lacks. Each run carries
+// its line's state: past_k and past_v in, next_k and next_v out ([6, 1, 4, 256, 152] float each, 3,735,552 bytes).
+// A first run from an empty state and a second fed the first's next_k and next_v (90 frames kept, as BFA's JSON
+// describes) answer through the bridge exactly as local runs do, byte for byte, so the state round-trips through the
+// bridge unchanged. The run's wall time on loopback is logged.
 TEST(ForwardBfa700Performance) {
     Need();
     const fs::path model = Env("BFARB_BFA7_PERFORMANCE");

@@ -355,7 +355,7 @@ is marked so.
   |---|---|---|
   | `a2f3_fp16.onnx` | V3 | named by the DLL; the file wasn't among those read |
   | `performance.onnx` | Performance (its default) | **a new model under the old name**: 22,359,897 parameters, 48,157,105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22 |
-  | `ultra-performance.onnx` | Ultra Performance | 5.0.6's `performance.onnx` (Thin120, 80,729 parameters) under a new name: 329,557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff; `mel` [batch, frames, 80] f32, `identity` [batch] int64, `emotion` [batch, frames, 10] f32 in, `normalized_motion` [batch, frames, 73] f32 out |
+  | `ultra-performance.onnx` | Ultra Performance | the original Performance model by BFA's README and its JSON (Thin120, 80,729 parameters; not compared with 5.0.6's file): 329,557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff; `mel` [batch, frames, 80] f32, `identity` [batch] int64, `emotion` [batch, frames, 10] f32 in, `normalized_motion` [batch, frames, 73] f32 out |
   | `network_fp16.onnx` | Legacy (`UseOldModel=1`) | named by the DLL, sized by `[General] Batch`; the file wasn't among those read |
   | `emotion_fp16.onnx` | Audio2Emotion Full | named by the DLL; the file wasn't among those read |
   | `emotion_performance.onnx` | Audio2Emotion Performance | named by the DLL; BFA's `emotion_performance.json` gives 5.0.6's SHA-256; the file wasn't among those read |

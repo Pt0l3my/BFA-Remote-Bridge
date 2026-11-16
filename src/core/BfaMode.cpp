@@ -104,8 +104,8 @@ int Bfa5Batch(IniStore& store, const std::string& version) {
     return static_cast<int>(std::clamp<long>(batch, 1, INT_MAX));
 }
 
-// As BFA 5.0.6's LoadIni: ForceCPU over the legacy GPU=0; EmotionDevice over -1 (with ForceCPU) or GpuAdapter, at
-// least 0. The defaults' keys are read only when needed.
+// As BFA 5.0.6's LoadIni: ForceCPU over the legacy GPU=0; EmotionDevice over -1 (with ForceCPU) or GpuAdapter (at
+// least 0), the result at least -1. The defaults' keys are read only when needed.
 //
 // BFA 7.0.0 the same, by its DLL's code (7.0.0.1's, its source not being available): its load reads the legacy GPU
 // and GpuAdapter (at least 0), then [General] ForceCPU with the legacy GPU=0 as its default; EmotionDevice's default
