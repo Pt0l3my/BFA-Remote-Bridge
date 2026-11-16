@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.6.0
+
+Better Facial Animations 7.0.0 (checked against its 7.0.0.1 build's files), beside 5.0.6 and 4.3.2.3. Protocol
+versions 1 and 2 are unchanged: nothing in the wire format changes, so PandorumLLM's side needs nothing new. BFA
+7.0.0's source wasn't available: its DLL, INI, installer, README, model files and their JSON files were read for facts
+only, and what follows from them rather than from code is marked as inferred, in the code's comments too. Not yet
+tried in game.
+
+- **BFA 7.0.0's mode, as 5.0.6's** (`src/core/BfaMode.h`). BFA 7.0.0 keeps 5.0.6's two keys with their meanings,
+  `[General] ForceCPU` for its facial models and `[General] EmotionDevice` for its emotion model, and adds
+  `GpuAdapter` for the facial models' card. With BFA 7.0.0 (7.0.0 or any 7.0.0.N) and a server that answered in
+  protocol version 2, the bridge does what it does for 5.0.6: `ForceCPU=1` and `EmotionDevice=-1` in BFA's own INI,
+  the same records, the same put-back, the start that clears the EmotionDevice record, and SimpleIni's reading.
+  `BfaHasBothKeys` names the two versions; `IsBfa506` and the new `IsBfa700` each one. BFA 7.0.0's installer writes
+  sixteen choice files, 5.0.6's fourteen and `FaceGraphFusion` and `EmotionGraphFusion`
+  (`kBfa700InstallerChoices`; 5.0.6's list is now `kBfa506InstallerChoices`, and the reads take a version's list,
+  `InstallerChoicesFor`). The order of the two new files isn't known; neither holds a key the bridge reads, and the
+  comment says so. One difference, inferred from 7.0.0's INI comments and README: an `EmotionDevice` missing
+  everywhere is read as graphics card 0 for 7.0.0 (5.0.6 follows ForceCPU or GpuAdapter there); 7.0.0's installer
+  always writes the key. `GpuAdapter`, `IndependentGpuDevice`, `GraphFusion` and `EmotionGraphFusion` are never
+  written. The set line names no graphics device for 7.0.0: that BFA makes none with both keys on the CPU is known
+  from 5.0.6's source only. The records are shared by 5.0.6 and 7.0.0 and mean the same under either. Another
+  version's log line now names 4.3.2.3, 5.0.6 and 7.0.0. BFA 4 and any other version are as in 1.5.0.
+- **BFA 7.0.0's sizes, listed by the bridge** (`src/core/BfaSizes.h`), from a table per version, inferred from 7.0.0's
+  models and the dimension names its DLL carries (the same as 5.0.6.3's): V3, Legacy (at BFA's `Batch`) and both
+  emotion models as for 5.0.6; `ultra-performance.onnx`, 5.0.6's Thin120 Performance model under a new name, `batch`
+  at 1, as 5.0.6 set on it; the new `performance.onnx`, whose every dimension is fixed, none. 5.0.6's table is
+  unchanged. `Batch` is read at post-load for both versions, through that version's layers (`src/plugin/Main.cpp`).
+- **The new Performance model's state.** BFA 7.0.0's `performance.onnx` (22,359,897 parameters) carries each line's
+  state in its run: `past_k` and `past_v` in, `next_k` and `next_v` out, [6, 1, 4, 256, 152] float each. A run is
+  15,011,704 bytes of tensor data in all (about 7.5 MB each way) for 90 frames, under the 64 MiB payload limit; the
+  bridge forwards it as any run, and the server keeps nothing per line.
+- **The version** is 1.6.0 (CMake, SkyrimNet's manifest and the settings page's file).
+- **Docs.** README: what's new in 1.6.0; BFA 7.0.0, 5.0.6 or 4.3.2 required; the server's folder needs 7.0.0's own
+  files, its new `performance.onnx` and `ultra-performance.onnx` among them; BFA's mode for 7.0.0; the new model's run
+  size; SkyrimNet 1.2.0's hand-over of its lines to BFA 7.0.0, whose lines then go through the bridge; VR and Skyrim
+  1.7.x not tried; Lip sync in scenes on 7.0.0 not yet seen in game (its DLL names the same scene plugins and holds
+  one load at the scene check's vtable offset, as 5.0.6.3's does). The README now says that only BFA 5.0.6 and 7.0.0 write `added`: with BFA 4.3.2.3 a missing
+  `ForceCPU` is noted as `ForceCPUSetByBridge=1` and put back as 0. PROTOCOL: section 1 gives BFA 7.0.0's facts
+  beside 5.0.6's, section 3 the sizes listed for 7.0.0 and the new model's run size.
+- **Tests:** the 7.0.0 version gate; 7.0.0's size table and 5.0.6's beside it; 7.0.0's mode set and put back (the
+  installer's layout and the archive's own INI), the EmotionDevice record cleared at a 7.0.0 start, the sixteen
+  layers (each file read, 5.0.6 reading its fourteen alone) and the missing EmotionDevice; Mod Organizer 2 profiles
+  switching between 5.0.6 and 7.0.0 over shared records, and BFA updated in place either way; the fake store now
+  refuses a write to any key but ForceCPU and EmotionDevice; the listed sizes on the wire under 7.0.0's file names.
+  With BFA's own files (never committed): `BFARB_BFA7_DLL` (7.0.0.1 read as the plugin reads it, the `GetProcAddress`
+  import, the `BFA_QueryInterface` export), `BFARB_BFA7_PERFORMANCE` (the new model through the bridge and the
+  reference server, three runs each answered byte for byte as a local run, each fed the previous run's `next_k` and
+  `next_v`; the run's wall time on loopback is printed) and `BFARB_BFA7_ULTRA` (served with its listed batch of 1, as
+  a local run).
+
 ## 1.5.0
 
 Better Facial Animations 5.0.6 (checked against its 5.0.6.3 build), beside 4.3.2.3. Protocol versions 1 and 2 are
