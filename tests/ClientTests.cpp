@@ -2199,7 +2199,14 @@ TEST(ClientReplayCountsEveryRunAndAnswer) {
     CHECK(reply.bytesBack > proto::kHeaderSize + reply.payload.size());  // more than the last answer alone
     // a send into a connection the server had closed counts up, with no answer back; then the new connection's
     HeldRig c;
+    std::vector<std::size_t> cback;  // each RUN's answer frame the server sent, in order
+    c.script->answer = [&, s = c.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3) cback.push_back(mine.size());
+        return mine;
+    };
     for (int w = 0; w < 3; ++w) CHECK(c.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    const std::size_t before = cback.size();
     c.script->closeBeforeAnswer = true;
     CHECK(c.RunWindow(3, Frames(3), reply, fb) == Client::Outcome::Forwarded);
     const auto again = c.script->Runs();
@@ -2207,6 +2214,9 @@ TEST(ClientReplayCountsEveryRunAndAnswer) {
     up = proto::kHeaderSize + again[3].bytes;  // the send that went nowhere: the same RUN but its request id
     for (std::size_t i = 3; i < 8; ++i) up += proto::kHeaderSize + again[i].bytes;
     CHECK_EQ(reply.bytesUp, up);
+    std::size_t cdown = 0;  // only answers that came back: the send that went nowhere has none
+    for (std::size_t i = before; i < cback.size(); ++i) cdown += cback[i];
+    CHECK_EQ(reply.bytesBack, cdown);
     CHECK_EQ(reply.replayed, 3);
 }
 

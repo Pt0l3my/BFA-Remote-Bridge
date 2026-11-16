@@ -55,7 +55,7 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   says "its line's state kept on the server" for a model held 1; the Detailed run line says whether a run was a start
   or a continue held on the server, and how many windows were replayed first ("1 window", "4 windows"). A held run
   never makes the carried RUN's payload (`proto::CheckRun` checks it before the network, as before): for BFA 7.0.0's
-  Performance model, no 7.5 MB copy a run that is never sent.
+  Performance model, no 7.5 MB copy of a RUN that is never sent.
 - **A run's bytes, up and back, count the same exchanges** (`Client::Reply`; the statistics and the Detailed run
   line): up, every RUN the call sent; back, every answer read to them. So a replay counts each replayed window both
   ways, and a send into a connection the server had closed, sent again on a new one, counts twice up and once back.

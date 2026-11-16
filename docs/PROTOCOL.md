@@ -512,7 +512,7 @@ is marked so.
   and `past_v` are all exactly 0.0. BFA makes every input and pre-binds every output over its own buffers
   (`CreateTensorWithDataAsOrtValue`), unless an output buffer overlaps an input's: then it lets the runtime make the
   outputs and copies them (read from the DLL, disassembled as data: the overlap check at about 0x180066f0e to
-  0x180067266, the outputs made at 0x1800672fa). After a run it checks each output (its element count, float type,
+  0x180067266, the outputs pre-bound at 0x1800672fa, a call skipped on an overlap). After a run it checks each output (its element count, float type,
   every value finite; a failure ends the line, the model kept), then swaps its past and next state buffers whole and
   passes them back unchanged; nothing else reads `next_k` or `next_v`. A run that returns an error status makes BFA
   release the session, load the model again (a new warm-up) and run the line again, at most two attempts in all (read

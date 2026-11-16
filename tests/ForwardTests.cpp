@@ -701,7 +701,7 @@ TEST(ForwardFindsTheServerOnTheLocalNetwork) {
     h.api->ReleaseSession(session);
 }
 
-// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the version 2 HELLO with ERROR 6 framed in version 1:
+// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the bridge's version 3 HELLO with ERROR 6 framed in version 1:
 // the bridge connects again in version 1, says so once, and stays on version 1 for it. A fallback is told by the
 // status check (`fallback REASON`), never by NOTICE.
 TEST(ForwardVersionOneServer) {

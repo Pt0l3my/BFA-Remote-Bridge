@@ -700,7 +700,7 @@ def main(argv=None):
     p.add_argument("--fault-count", type=int, default=0,
                    help="test option: --delay-ms, --fault and --run-error apply to the first this many RUNs only (0: all)")
     p.add_argument("--v1-only", action="store_true",
-                   help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a version 2 HELLO gets ERROR 6, "
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a newer version's HELLO (2 or 3) gets ERROR 6, "
                         "read whole first and closed cleanly, as patch7 does")
     p.add_argument("--p6", action="store_true",
                    help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a newer version's HELLO (2 or 3) "
