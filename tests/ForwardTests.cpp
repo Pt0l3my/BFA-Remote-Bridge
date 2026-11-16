@@ -1645,6 +1645,185 @@ TEST(ForwardBfa506PerformanceEmotion) {
     fs::remove_all(dir);
 }
 
+// ---- BFA 7.0.0 (1.6.0)
+
+// BFA 7.0.0 in its CPU mode: the bridge lists its table's sizes (core/BfaSizes.h, inferred), so ultra-performance.onnx
+// gets its batch at 1 and the new performance.onnx none, and the HELLO says so on the wire.
+TEST(ForwardBfa700ListsItsGpuSizes) {
+    Need();
+    const fs::path dir = TempFolder("bfa700");
+    const char* names[] = {"a2f3_fp16.onnx", "network_fp16.onnx", "performance.onnx", "ultra-performance.onnx", "emotion_fp16.onnx",
+                           "emotion_performance.onnx"};
+    for (const char* name : names) fs::copy_file(Models() / "tiny.onnx", dir / name);
+    const fs::path hellos = dir / "hellos.jsonl";
+    {
+        Server server(dir, {"--hello-log", hellos.string()});
+        Harness h(On(server.Port()));
+        h.bridge.Connection().SetBfaVersion("7.0.0.1");
+        h.bridge.SetBfaBatch(3);
+        std::vector<OrtSession*> sessions;
+        for (const char* name : names) {
+            OrtSession* s = nullptr;
+            Ok(h.Create(dir / name, {}, &s));
+            CHECK(h.bridge.IsBridgeSession(s));
+            sessions.push_back(s);
+        }
+        CHECK_EQ(h.CountLogged("(BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"), 5);
+        CHECK(h.Logged(", overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge)"));
+        CHECK(h.Logged(", overrides input_dynamic_axes_1 = 3, emotion_dynamic_axes_1 = 3 (BFA 7.0.0.1's"));
+        CHECK_EQ(h.CountLogged(", no overrides; asking the server"), 1);  // performance.onnx
+        // the tiny model's batch of 2: free under performance.onnx's (none listed), fixed at 1 under ultra-performance's
+        TinyInputs in(h.api, h.cpu, 7);
+        {
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(sessions[2], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+            CHECK(!IsNanAnswer(h.api, out.v[0]));
+        }
+        {
+            Outputs out(h.api, 5);
+            Ok(h.api->Run(sessions[3], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+            CHECK(IsNanAnswer(h.api, out.v[0]));
+        }
+        for (OrtSession* s : sessions) h.api->ReleaseSession(s);
+    }
+    const auto seven = HelloLines(hellos);
+    CHECK(CountWith(seven, "{\"name\": \"performance.onnx\", \"overrides\": []}") >= 1);
+    CHECK(CountWith(seven, "{\"name\": \"ultra-performance.onnx\", \"overrides\": [[\"batch\", 1]]}") >= 1);
+    CHECK(CountWith(seven, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 3], [\"emotion_dynamic_axes_1\", 3]]}") >= 1);
+    CHECK(CountWith(seven, "{\"name\": \"emotion_performance.onnx\", \"overrides\": [[\"batch_size\", 1], [\"seq_len\", 60000], [\"batch\", 1]]}") >= 1);
+    CHECK_EQ(CountWith(seven, "BFA 7.0.0.1"), static_cast<int>(seven.size()));  // the client string reports it
+    fs::remove_all(dir);
+}
+
+namespace {
+
+// A float tensor over data, made the way BFA makes its inputs.
+OrtValue* FloatTensor(Harness& h, std::vector<float>& data, std::vector<std::int64_t> shape) {
+    OrtValue* v = nullptr;
+    Ok(h.api->CreateTensorWithDataAsOrtValue(h.cpu, data.data(), data.size() * 4, shape.data(), shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &v));
+    return v;
+}
+OrtValue* LongTensor(Harness& h, std::int64_t& value) {
+    OrtValue* v = nullptr;
+    const std::int64_t shape[] = {1};
+    Ok(h.api->CreateTensorWithDataAsOrtValue(h.cpu, &value, 8, shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &v));
+    return v;
+}
+
+}  // namespace
+
+// BFA 7.0.0's new Performance model (never committed): BFARB_BFA7_PERFORMANCE names its performance.onnx. Every
+// dimension is fixed, so the bridge lists no sizes. Each run carries its line's state: past_k and past_v in, next_k and
+// next_v out ([6, 1, 4, 256, 152] float each, 3,735,552 bytes). A first run from an empty state and a second fed the
+// first's next_k and next_v (90 frames kept, as BFA's JSON describes) answer through the bridge exactly as local runs
+// do, byte for byte, so the state round-trips through the bridge unchanged. The run's wall time on loopback is logged.
+TEST(ForwardBfa700Performance) {
+    Need();
+    const fs::path model = Env("BFARB_BFA7_PERFORMANCE");
+    if (model.empty()) SKIP("BFARB_BFA7_PERFORMANCE isn't set");
+    const fs::path dir = TempFolder("bfa700-performance");
+    fs::create_symlink(fs::absolute(model), dir / "performance.onnx");
+    Server server(dir);
+    Settings s = On(server.Port());
+    s.timeoutMs = 5000;  // the wall time is logged against kRunTimeoutMs, not made to fit it
+    Harness h(s);
+    h.bridge.Connection().SetBfaVersion("7.0.0.1");
+    OrtSession* session = nullptr;
+    const auto t0 = Clock::now();
+    Ok(h.Create(dir / "performance.onnx", {}, &session));
+    const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+    CHECK(h.Logged("Model performance.onnx: 48157105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22, no "
+                   "overrides; asking the server"));
+    CHECK(!h.Logged("listed by the bridge"));
+
+    constexpr std::size_t kState = 6 * 1 * 4 * 256 * 152;  // 933,888 floats
+    const std::vector<std::int64_t> stateShape = {6, 1, 4, 256, 152};
+    std::mt19937 rng(23);
+    std::normal_distribution<float> n(0.f, 1.f);
+    std::vector<float> pastK(kState, 0.f), pastV(kState, 0.f);
+    std::int64_t pastFrames = 0;
+    const char* in[] = {"mel", "identity", "emotion", "past_k", "past_v", "past_frames"};
+    const char* out[] = {"normalized_motion", "next_k", "next_v"};
+    std::vector<double> runMs;
+    std::size_t runBytes = 0;
+    for (int call = 0; call < 3; ++call) {
+        std::vector<float> mel(120 * 80), emo(120 * 10);
+        for (auto& v : mel) v = n(rng);
+        for (auto& v : emo) v = std::fabs(n(rng)) * 0.1f;
+        std::int64_t identity = call % 2;  // Claire, Mark
+        std::vector<OrtValue*> values = {FloatTensor(h, mel, {1, 120, 80}), LongTensor(h, identity), FloatTensor(h, emo, {1, 120, 10}),
+                                         FloatTensor(h, pastK, stateShape), FloatTensor(h, pastV, stateShape), LongTensor(h, pastFrames)};
+        Outputs o(h.api, 3);
+        const auto r0 = Clock::now();
+        Ok(h.api->Run(session, nullptr, in, values.data(), values.size(), out, 3, o.v.data()));
+        runMs.push_back(std::chrono::duration<double, std::milli>(Clock::now() - r0).count());
+        std::vector<std::int64_t> motionDims, kDims, vDims;
+        const auto motion = Bytes(h.api, o.v[0], &motionDims);
+        const auto nextK = Bytes(h.api, o.v[1], &kDims);
+        const auto nextV = Bytes(h.api, o.v[2], &vDims);
+        CHECK(motionDims == (std::vector<std::int64_t>{1, 90, 73}));
+        CHECK(kDims == stateShape);
+        CHECK(vDims == stateShape);
+        CHECK_EQ(nextK.size(), kState * 4);
+        const auto local = LocalRun(dir / "performance.onnx", {}, in, values, out, 3, 1);
+        CHECK(motion == local[0]);
+        CHECK(nextK == local[1]);
+        CHECK(nextV == local[2]);
+        if (call == 0) runBytes = (mel.size() + emo.size() + 2 * kState) * 4 + 16 + motion.size() + nextK.size() + nextV.size();
+        // the next run carries this one's state, as BFA's does within a line
+        std::memcpy(pastK.data(), nextK.data(), nextK.size());
+        std::memcpy(pastV.data(), nextV.data(), nextV.size());
+        pastFrames = std::min<std::int64_t>(256, pastFrames + 90);
+        for (auto* v : values) h.api->ReleaseValue(v);
+    }
+    CHECK_EQ(pastFrames, 256);
+    std::printf("        performance.onnx (7.0.0): admitted in %lld ms; %zu bytes per run (in and out); runs through the bridge on "
+                "loopback: %.1f, %.1f and %.1f ms (the game's limit: %d ms), each answered as a local run, its state carried\n",
+                static_cast<long long>(loadMs), runBytes, runMs[0], runMs[1], runMs[2], kRunTimeoutMs);
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
+// BFA 7.0.0's Ultra Performance model (never committed): BFARB_BFA7_ULTRA names its ultra-performance.onnx, 5.0.6's
+// Thin120 under a new name. The bridge lists its batch at 1, and it answers as a local run with that size does.
+TEST(ForwardBfa700UltraPerformance) {
+    Need();
+    const fs::path model = Env("BFARB_BFA7_ULTRA");
+    if (model.empty()) SKIP("BFARB_BFA7_ULTRA isn't set");
+    const fs::path dir = TempFolder("bfa700-ultra");
+    fs::create_symlink(fs::absolute(model), dir / "ultra-performance.onnx");
+    Server server(dir);
+    Harness h(On(server.Port()));
+    h.bridge.Connection().SetBfaVersion("7.0.0.1");
+    OrtSession* session = nullptr;
+    Ok(h.Create(dir / "ultra-performance.onnx", {}, &session));
+    CHECK(h.Logged("Model ultra-performance.onnx: 329557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff, "
+                   "overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"));
+    std::mt19937 rng(29);
+    std::normal_distribution<float> n(0.f, 1.f);
+    const int frames = 124;  // any length: the model's frames are free
+    for (int call = 0; call < 3; ++call) {
+        std::vector<float> mel(frames * 80), emo(frames * 10);
+        for (auto& v : mel) v = call ? n(rng) : 0.f;
+        for (auto& v : emo) v = call ? std::fabs(n(rng)) * 0.1f : 0.f;
+        std::int64_t identity = call % 2;
+        std::vector<OrtValue*> values = {FloatTensor(h, mel, {1, frames, 80}), LongTensor(h, identity), FloatTensor(h, emo, {1, frames, 10})};
+        const char* in[] = {"mel", "identity", "emotion"};
+        const char* out[] = {"normalized_motion"};
+        Outputs o(h.api, 1);
+        Ok(h.api->Run(session, nullptr, in, values.data(), values.size(), out, 1, o.v.data()));
+        std::vector<std::int64_t> dims;
+        const auto got = Bytes(h.api, o.v[0], &dims);
+        CHECK(dims == (std::vector<std::int64_t>{1, frames, 73}));
+        const auto local = LocalRun(dir / "ultra-performance.onnx", {{"batch", 1}}, in, values, out, 1, 1);
+        CHECK(got == local[0]);
+        for (auto* v : values) h.api->ReleaseValue(v);
+    }
+    std::printf("        ultra-performance.onnx (7.0.0): served with batch 1, 3 runs answered as a local run\n");
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
 namespace {
 
 // A DirectML table of the runtime's (1.24.4's layout), each entry counting its calls.

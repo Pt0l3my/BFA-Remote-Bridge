@@ -1,11 +1,12 @@
-// The plugin's IniStore (core/BfaMode.h): BFA's INI, BFA 5's installer choice files and the bridge's own state, with
-// the relative paths BFA itself uses, from the game's folder. BFA 4.3.2 reads its file with GetPrivateProfileIntA, and
-// so does ReadForceCpu. BFA 5.0.6 reads its files with SimpleIni, so ReadBfaValue reads each file's text and finds the
-// key by SimpleIni's rules (core/IniText.h). Writes and removals go through Windows' profile calls, each checked
-// afterwards by reading the file again as BFA 5 does. Called on the game's main thread only: at a task the client's
-// version sink queued, at SKSE's save message, and at its post-load message (the start's records, BFA 5's Batch);
-// never from DllMain or at the process's exit. The mode asks BfaIni first and changes nothing while BFA's INI can't be
-// read; a read that fails in the moment after that answer still reads as the key's absence.
+// The plugin's IniStore (core/BfaMode.h): BFA's INI, BFA 5's installer choice files (5.0.6's and 7.0.0's, in the same
+// folder) and the bridge's own state, with the relative paths BFA itself uses, from the game's folder. BFA 4.3.2 reads
+// its file with GetPrivateProfileIntA, and so does ReadForceCpu. BFA 5.0.6 reads its files with SimpleIni, so
+// ReadBfaValue reads each file's text and finds the key by SimpleIni's rules (core/IniText.h). Writes and removals go
+// through Windows' profile calls, each checked afterwards by reading the file again as BFA 5 does. Called on the game's
+// main thread only: at a task the client's version sink queued, at SKSE's save message, and at its post-load message
+// (the start's records, BFA 5's Batch); never from DllMain or at the process's exit. The mode asks BfaIni first and
+// changes nothing while BFA's INI can't be read; a read that fails in the moment after that answer still reads as the
+// key's absence.
 //
 // BFA 5's own saves start its INI with a UTF-8 byte-order mark, which Windows' profile calls are known to take as part
 // of the first line (not checked on Windows here). A file whose first line is [General] would then hide that section

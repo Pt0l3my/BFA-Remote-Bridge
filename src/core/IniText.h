@@ -18,6 +18,9 @@
 //   quotes        part of the value: "0" is not the number 0
 //
 // Numbers (core/BfaMode.h, Bfa5Number) are read as BFA's GetLongValue reads them, on Windows, where a long has 32 bits.
+//
+// BFA 7.0.0 ships SimpleIni's licence among its own (licenses/SimpleIni-MIT.txt); that it reads its files with these
+// same rules is inferred, since its source wasn't read, and the bridge reads 7.0.0's files with them.
 
 #include <optional>
 #include <string>

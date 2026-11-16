@@ -869,7 +869,8 @@ OrtStatus* Bridge::CreateSession(const OrtApi* real, const OrtEnv* env, const OR
             return status;
         }
 
-        // BFA's CPU route sets no sizes: for a BFA whose GPU route's sizes the bridge knows (5.0.6), it lists them
+        // BFA's CPU route sets no sizes: for a BFA whose GPU route's sizes the bridge knows (5.0.6, 7.0.0), it lists
+        // them
         std::string listed;
         if (overrides.empty()) {
             const std::string bfa = client_.CurrentVersions().bfa;

@@ -581,6 +581,39 @@ TEST(PeReadsBetterFacialAnimations506Dll) {
                 version.c_str());
 }
 
+// BFA 7.0.0's DLL (never committed): BFARB_BFA7_DLL names it. Its version read as the plugin reads it (SKSEPlugin_Version),
+// 7.0.0.1, which the bridge's rules take as 7.0.0, a BFA with both keys; it still imports GetProcAddress from KERNEL32
+// by name, which the bridge's hook patches; and it exports BFA_QueryInterface, its provider interface.
+TEST(PeReadsBetterFacialAnimations700Dll) {
+    const char* path = std::getenv("BFARB_BFA7_DLL");
+    if (!path || !*path) SKIP("BFARB_BFA7_DLL isn't set");
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<std::uint8_t> image;
+    CHECK(pe::MapFile(file, image));
+    std::size_t slot = 0;
+    CHECK(pe::FindImportSlot(image.data(), image.size(), "KERNEL32.dll", "GetProcAddress", slot));
+    std::uint32_t rva = 0;
+    CHECK(pe::FindExport(image.data(), image.size(), "SKSEPlugin_Version", rva));
+    pe::SksePluginVersion v{};
+    CHECK(rva + sizeof v <= image.size());
+    std::memcpy(&v, image.data() + rva, sizeof v);
+    CHECK_EQ(v.dataVersion, 1u);
+    const std::string version = pe::UnpackVersion(v.pluginVersion);
+    CHECK_EQ(version, std::string("7.0.0.1"));
+    CHECK(IsBfa700(version));
+    CHECK(!IsBfa506(version));
+    CHECK(BfaHasBothKeys(version));
+    CHECK(ListsSizesFor(version));
+    CHECK_EQ(InstallerChoicesFor(version).size(), std::size_t{16});
+    CHECK_EQ(std::string(v.pluginName), std::string("BetterFacialAnimations"));
+    CHECK_EQ(pe::ImageSize(image.data(), 0x1000), image.size());
+    std::uint32_t provider = 0;
+    CHECK(pe::FindExport(image.data(), image.size(), "BFA_QueryInterface", provider));
+    std::printf("        BFA 7's DLL: GetProcAddress's IAT slot at RVA 0x%zx, SKSEPlugin_Version at RVA 0x%x, version %s\n", slot, rva,
+                version.c_str());
+}
+
 // ---- paths out of other programs' messages
 
 // A server's detail as PandorumLLM sent it in the owner's Force CPU test: ONNX Runtime's raw message, with addresses
@@ -700,6 +733,7 @@ public:
         CHECK(ini_->present);  // never created
         CHECK(ini_->readable);
         CHECK(std::string(key) != "IndependentGpuDevice");  // left as it is
+        CHECK(std::string(key) == "ForceCPU" || std::string(key) == "EmotionDevice");  // GpuAdapter, GraphFusion and the rest too
         if (Fails(key, err)) return false;
         if (std::string(key) == "ForceCPU") {
             ini_->forceCpu = std::stoi(value);
@@ -713,6 +747,7 @@ public:
     bool RemoveBfaValue(const char* key, std::string& err) override {
         CHECK(ini_->present);
         CHECK(ini_->readable);
+        CHECK(std::string(key) == "ForceCPU" || std::string(key) == "EmotionDevice");
         if (Fails(key, err)) return false;
         if (std::string(key) == "ForceCPU")
             ini_->forceCpuInIni = false;
@@ -782,6 +817,31 @@ struct Mode5Rig : ModeRig {
 // BFA 5.0.6 once its menu has saved: every key in its own INI too (Audio2Face on a card, Audio2Emotion on card 2).
 struct Mode5Saved : Mode5Rig {
     Mode5Saved() { ini->BfaSaves(0, 2); }
+};
+
+// BFA 7.0.0 as its installer leaves it (7.0.0.1's fomod and option files): 5.0.6's choices, and its two new files,
+// Installer\FaceGraphFusion.ini and Installer\EmotionGraphFusion.ini; ForceCPU, GpuAdapter and EmotionDevice
+// commented out in its own INI, Batch=2 there.
+struct Mode7Rig : Mode5Rig {
+    explicit Mode7Rig(const char* bfa = "7.0.0.1") : Mode5Rig(bfa) {
+        ini->Set("FaceGraphFusion", "GraphFusion", "0");
+        ini->Set("EmotionGraphFusion", "EmotionGraphFusion", "0");
+        ini->Set("", "IniVersion", "10");
+        ini->Set("", "Batch", "2");
+    }
+};
+
+// One Mod Organizer 2 profile's BFA, its own INI and installer files, held aside while another profile runs. The
+// bridge's records are one file (Overwrite), shared: they stay in the FakeIni. Switch swaps the BFA files in.
+struct BfaFiles {
+    int forceCpu = 0;
+    bool forceCpuInIni = false;
+    std::map<std::string, std::string> values;
+    void Switch(FakeIni& ini) {
+        std::swap(forceCpu, ini.forceCpu);
+        std::swap(forceCpuInIni, ini.forceCpuInIni);
+        std::swap(values, ini.values);
+    }
 };
 
 }  // namespace
@@ -1159,8 +1219,8 @@ TEST(Bfa5ModeSetsBothKeysOnVersionTwo) {
         if (k.rfind("/", 0) != 0) CHECK_EQ(r.ini->values[k], v);  // the installer's files: never written
     CHECK_EQ(r.ini->Own("IndependentGpuDevice"), std::string("(absent)"));
     FakeIniStore reader(r.ini);
-    CHECK_EQ(ReadBfa5Devices(reader).forceCpu, 1);
-    CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, -1L);
+    CHECK_EQ(ReadBfa5Devices(reader, "5.0.6.3").forceCpu, 1);
+    CHECK_EQ(ReadBfa5Devices(reader, "5.0.6.3").emotionDevice, -1L);
     // BFA's menu picks graphics card 1 for Audio2Emotion in this session (BFA's save writes every key): the next save
     // writes -1 again, silently, and the record names card 1, as BFA's own INI held it
     r.ini->BfaSaves(0, 1);
@@ -1190,7 +1250,7 @@ TEST(Bfa5ModeReadsBfasLayers) {
         ini->forceCpuInIni = false;
         setUp(*ini);
         FakeIniStore store(ini);
-        const Bfa5Devices d = ReadBfa5Devices(store);
+        const Bfa5Devices d = ReadBfa5Devices(store, "5.0.6.3");
         return std::make_pair(d.forceCpu, d.emotionDevice);
     };
     using P = std::pair<int, long>;
@@ -1245,17 +1305,17 @@ TEST(Bfa5ModeReadsBfasLayers) {
     // BFA 5's Batch: 2 by default, at least 1, from its layers too
     auto ini = std::make_shared<FakeIni>();
     FakeIniStore store(ini);
-    CHECK_EQ(Bfa5Batch(store), 2);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 2);
     ini->Set("FaceModel", "Batch", "3");
-    CHECK_EQ(Bfa5Batch(store), 3);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 3);
     ini->Set("", "Batch", "4");
-    CHECK_EQ(Bfa5Batch(store), 4);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 4);
     ini->Set("", "Batch", "0");
-    CHECK_EQ(Bfa5Batch(store), 1);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 1);
     ini->Set("", "Batch", "-3");
-    CHECK_EQ(Bfa5Batch(store), 1);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 1);
     ini->Set("", "Batch", "\"4\"");
-    CHECK_EQ(Bfa5Batch(store), 2);
+    CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), 2);
 }
 
 // BFA 5's own choices are kept: both on the CPU already, nothing is recorded or written; one of them, only the other.
@@ -1316,8 +1376,8 @@ TEST(Bfa5ModePutBackOnVersionOne) {
     CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
     FakeIniStore reader(r.ini);
-    CHECK_EQ(ReadBfa5Devices(reader).forceCpu, 0);
-    CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, -1L);  // the installer's choice
+    CHECK_EQ(ReadBfa5Devices(reader, "5.0.6.3").forceCpu, 0);
+    CHECK_EQ(ReadBfa5Devices(reader, "5.0.6.3").emotionDevice, -1L);  // the installer's choice
     CHECK_EQ(r.Logged("Removed the bridge's [General] ForceCPU from BetterFacialAnimations.ini, which had none before the bridge set "
                       "it, so BFA's installer choice applies again: the server speaks protocol version 1"),
              1);
@@ -1459,7 +1519,7 @@ TEST(Bfa5ModeOnlyFor506) {
     CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
     CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
     FakeIniStore reader(r.ini);
-    CHECK_EQ(ReadBfa5Devices(reader).emotionDevice, 0L);
+    CHECK_EQ(ReadBfa5Devices(reader, "5.0.6.3").emotionDevice, 0L);
     // BFA's INI missing: never created, nothing recorded
     Mode5Rig absent;
     absent.ini->present = false;
@@ -1573,14 +1633,275 @@ TEST(Bfa5ModeReadsTheFilesText) {
     TextStore* files = store.get();
     files->files[""] = "\xEF\xBB\xBF[General]\nForceCPU=1\nEmotionDevice=-1\nEmotionDevice=0\n";
     files->files["EmotionDevice"] = "[General]\nEmotionDevice=-1\n";
-    CHECK_EQ(ReadBfa5Devices(*files).emotionDevice, 0L);
+    CHECK_EQ(ReadBfa5Devices(*files, "5.0.6.3").emotionDevice, 0L);
     BfaCpuMode mode(std::move(store), nullptr);
     mode.SetBfaVersion("5.0.6.3");
     mode.OnServerVersion(2);
     CHECK_EQ(files->records[kEmotionDeviceRecord], std::string("0"));
-    CHECK_EQ(ReadBfa5Devices(*files).emotionDevice, -1L);
-    CHECK_EQ(ReadBfa5Devices(*files).forceCpu, 1);
+    CHECK_EQ(ReadBfa5Devices(*files, "5.0.6.3").emotionDevice, -1L);
+    CHECK_EQ(ReadBfa5Devices(*files, "5.0.6.3").forceCpu, 1);
     CHECK(!files->records.count(kForceCpuRecord));
+}
+
+// ---- BFA 7.0.0's mode: as 5.0.6's, both keys, through 7.0.0's sixteen layers
+
+// The versions the bridge takes as BFA 7.0.0: 7.0.0 and its builds, and nothing else; both keys for 5.0.6 and 7.0.0
+// alone.
+TEST(Bfa700VersionGate) {
+    for (const char* v : {"7.0.0", "7.0.0.1", "7.0.0.12"}) {
+        CHECK(IsBfa700(v));
+        CHECK(!IsBfa506(v));
+        CHECK(BfaHasBothKeys(v));
+        CHECK(ListsSizesFor(v));
+        CHECK_EQ(InstallerChoicesFor(v).size(), std::size_t{16});
+    }
+    for (const char* v : {"7.0", "7.0.1", "7.0.0x", "70.0.0", "7.0.00", "", "7", "7.0.1.0", "6.0.0", "5.0.6.3", "4.3.2.3"}) {
+        CHECK(!IsBfa700(v));
+        CHECK_EQ(InstallerChoicesFor(v).size(), std::size_t{14});
+    }
+    for (const char* v : {"7.0", "7.0.1", "7.0.0x", "70.0.0", "7.0.00", "", "4.3.2.3", "5.1.0.1"}) {
+        CHECK(!BfaHasBothKeys(v));
+        CHECK(!ListsSizesFor(v));
+    }
+    CHECK(BfaHasBothKeys("5.0.6.3"));
+    // 7.0.0's sixteen: 5.0.6's fourteen in their order, then the two new files
+    for (std::size_t i = 0; i < kBfa506InstallerChoices.size(); ++i)
+        CHECK_EQ(std::string(kBfa700InstallerChoices[i]), std::string(kBfa506InstallerChoices[i]));
+    CHECK_EQ(std::string(kBfa700InstallerChoices[14]), std::string("FaceGraphFusion"));
+    CHECK_EQ(std::string(kBfa700InstallerChoices[15]), std::string("EmotionGraphFusion"));
+}
+
+// Version 2 with BFA 7.0.0 as its installer leaves it: both keys set in its own INI, recorded as added, one log line
+// (which claims nothing about a graphics device: that is known for 5.0.6 alone); GpuAdapter, IndependentGpuDevice,
+// GraphFusion, EmotionGraphFusion and the installer's files left as they are. A game save writes them again after
+// BFA's menu saved; a card picked there is recorded; a version 1 server gets them back, and the next start clears the
+// records.
+TEST(Bfa700ModeSetsBothKeysAndPutsThemBack) {
+    Mode7Rig r;
+    const auto installer = r.ini->values;
+    r.mode.OnServerVersion(0);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
+    r.mode.OnServerVersion(2);
+    CHECK(r.mode.Set());
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("1"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) and EmotionDevice to -1 (it was 0) in BetterFacialAnimations.ini: the "
+                      "server speaks protocol version 2, so BFA runs Audio2Face and Audio2Emotion in its CPU mode from the next game "
+                      "start. The model still runs on the server."),
+             1);
+    CHECK_EQ(r.Logged("graphics device"), 0);
+    for (const auto& [k, v] : installer)
+        if (k.rfind("/", 0) != 0) CHECK_EQ(r.ini->values[k], v);  // the installer's files: never written
+    for (const char* key : {"GpuAdapter", "IndependentGpuDevice", "GraphFusion", "EmotionGraphFusion"})
+        CHECK_EQ(r.ini->Own(key), std::string("(absent)"));
+    CHECK_EQ(r.ini->Own("Batch"), std::string("2"));
+    FakeIniStore reader(r.ini);
+    CHECK_EQ(ReadBfa5Devices(reader, "7.0.0.1").forceCpu, 1);
+    CHECK_EQ(ReadBfa5Devices(reader, "7.0.0.1").emotionDevice, -1L);
+    // BFA's menu saves with Audio2Emotion on card 1: the next game save writes -1 again, silently, and records card 1
+    r.ini->BfaSaves(0, 1);
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("1"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("1"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("1"));
+    CHECK_EQ(r.log.size(), std::size_t{1});
+    r.mode.OnServerVersion(1);
+    CHECK(!r.mode.Set());
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("1"));
+    CHECK_EQ(r.Logged("Put BFA's [General] EmotionDevice back to 1 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
+                      "version 1 only"),
+             1);
+    r.NextStart("7.0.0.1");
+    CHECK(r.ini->records.empty());
+    // added keys removed at version 1, so the installer's files decide again
+    Mode7Rig added;
+    added.mode.OnServerVersion(2);
+    added.mode.OnServerVersion(1);
+    CHECK_EQ(added.ini->Own("ForceCPU"), std::string("(absent)"));
+    CHECK_EQ(added.ini->Own("EmotionDevice"), std::string("(absent)"));
+    CHECK_EQ(added.Logged("Removed the bridge's [General] EmotionDevice from BetterFacialAnimations.ini"), 1);
+    // BFA 7.0.0's own INI without its installer (the archive's INI holds both keys, on card 0): written back as held
+    Mode7Rig manual;
+    manual.ini->values.clear();
+    manual.ini->forceCpuInIni = true;
+    manual.ini->forceCpu = 0;
+    manual.ini->Set("", "GpuAdapter", "0");
+    manual.ini->Set("", "EmotionDevice", "0");
+    manual.mode.OnServerVersion(2);
+    CHECK_EQ(manual.ini->Record(kForceCpuRecord), std::string("1"));
+    CHECK_EQ(manual.ini->Record(kEmotionDeviceRecord), std::string("0"));
+    manual.mode.OnServerVersion(1);
+    CHECK_EQ(manual.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(manual.ini->Own("EmotionDevice"), std::string("0"));
+    // both on the CPU by its installer: nothing recorded or written
+    Mode7Rig cpu;
+    cpu.ini->Set("Startup", "ForceCPU", "1");
+    cpu.ini->Set("EmotionDevice", "EmotionDevice", "-1");
+    cpu.mode.OnServerVersion(2);
+    cpu.mode.OnServerVersion(1);
+    CHECK_EQ(cpu.ini->iniWrites + cpu.ini->recordWrites, 0);
+}
+
+// A start of BFA 7.0.0 is a start of a BFA with both keys: the EmotionDevice record goes when its own INI no longer
+// holds the bridge's -1 (a card picked in BFA's menu after the last game save), ForceCPU's stays while it holds 1; a
+// start without BFA's INI, or with one it can't read, leaves both.
+TEST(Bfa700ModeStartClearsTheEmotionDeviceRecord) {
+    Mode7Rig r;
+    r.mode.OnServerVersion(2);
+    r.ini->Set("", "EmotionDevice", "1");  // BFA's menu, after the last game save
+    r.ini->present = false;
+    r.NextStart("7.0.0.1");
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    r.ini->present = true;
+    r.ini->readable = false;
+    r.NextStart("7.0.0.1");
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    r.ini->readable = true;
+    auto next = r.NextStart("7.0.0.1");
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
+    next->OnServerVersion(1);  // the card stays as picked; ForceCPU's added key goes
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("1"));
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
+    // under BFA 4.3.2.3 (another profile) the same start would leave the EmotionDevice record
+    Mode7Rig four;
+    four.mode.OnServerVersion(2);
+    four.ini->Set("", "EmotionDevice", "1");
+    four.NextStart(kCpuModeBfaVersion);
+    CHECK_EQ(four.ini->Record(kEmotionDeviceRecord), std::string("added"));
+}
+
+// BFA 7.0.0's layers: each of its sixteen choice files is read, its own INI wins over them, and BFA 5.0.6 reads its
+// fourteen alone. A missing EmotionDevice is graphics card 0 under 7.0.0, whatever ForceCPU and GpuAdapter say (its
+// files' default), where 5.0.6 follows them; so with the facial model on the CPU and no EmotionDevice anywhere, the
+// bridge sets EmotionDevice=-1 for 7.0.0 and not for 5.0.6. Batch through the layers as 5.0.6's.
+TEST(Bfa700ModeReadsSixteenLayers) {
+    for (const char* choice : kBfa700InstallerChoices) {
+        auto ini = std::make_shared<FakeIni>();
+        ini->forceCpuInIni = false;
+        ini->Set(choice, "EmotionDevice", "2");
+        ini->Set(choice, "Batch", "3");
+        FakeIniStore store(ini);
+        CHECK_EQ(ReadBfa5Devices(store, "7.0.0.1").emotionDevice, 2L);
+        CHECK_EQ(Bfa5Batch(store, "7.0.0.1"), 3);
+        const bool fiveReads = std::string(choice) != "FaceGraphFusion" && std::string(choice) != "EmotionGraphFusion";
+        CHECK_EQ(ReadBfa5Devices(store, "5.0.6.3").emotionDevice, fiveReads ? 2L : 0L);
+        CHECK_EQ(Bfa5Batch(store, "5.0.6.3"), fiveReads ? 3 : 2);
+        ini->Set("", "EmotionDevice", "1");  // its own INI wins
+        CHECK_EQ(ReadBfa5Devices(store, "7.0.0.1").emotionDevice, 1L);
+    }
+    const auto devices = [](const char* bfa, const std::function<void(FakeIni&)>& setUp) {
+        auto ini = std::make_shared<FakeIni>();
+        ini->forceCpuInIni = false;
+        setUp(*ini);
+        FakeIniStore store(ini);
+        const Bfa5Devices d = ReadBfa5Devices(store, bfa);
+        return std::make_pair(d.forceCpu, d.emotionDevice);
+    };
+    using P = std::pair<int, long>;
+    CHECK(devices("7.0.0.1", [](FakeIni&) {}) == P(0, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, 0));
+    CHECK(devices("5.0.6.3", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, -1));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 0));
+    CHECK(devices("5.0.6.3", [](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 3));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "EmotionDevice", "x"); }) == P(0, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "GPU", "0"); }) == P(1, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); i.Set("EmotionDevice", "EmotionDevice", "-1"); }) == P(1, -1));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "EmotionDevice", "-7"); }) == P(0, -1));
+    // the mode: the facial model on the CPU by the installer, EmotionDevice nowhere
+    Mode7Rig seven;
+    seven.ini->Set("Startup", "ForceCPU", "1");
+    seven.ini->values.erase("EmotionDevice/General/EmotionDevice");
+    seven.mode.OnServerVersion(2);
+    CHECK(!seven.ini->SetByBridge());
+    CHECK_EQ(seven.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(seven.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    seven.mode.OnServerVersion(1);
+    CHECK_EQ(seven.ini->Own("EmotionDevice"), std::string("(absent)"));
+    Mode5Rig five;
+    five.ini->Set("Startup", "ForceCPU", "1");
+    five.ini->values.erase("EmotionDevice/General/EmotionDevice");
+    five.mode.OnServerVersion(2);
+    CHECK_EQ(five.ini->iniWrites + five.ini->recordWrites, 0);
+}
+
+// Two Mod Organizer 2 profiles, one with BFA 5.0.6 and one with BFA 7.0.0, each with its own BFA files, share the
+// bridge's records (one file in Overwrite). A record means the same under either: a start of either clears what its
+// own INI doesn't hold (EmotionDevice's included), a version 1 answer under either puts back what is recorded, and
+// nothing is put back without a record.
+TEST(BfaModeProfilesSwitchBetween506And700) {
+    Mode5Rig r;  // the 5.0.6 profile runs first
+    BfaFiles seven;  // the 7.0.0 profile's files, as its installer left them
+    {
+        Mode7Rig fresh;
+        seven.forceCpu = fresh.ini->forceCpu;
+        seven.forceCpuInIni = fresh.ini->forceCpuInIni;
+        seven.values = fresh.ini->values;
+    }
+    r.mode.OnServerVersion(2);
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    // to the 7.0.0 profile: its own INI holds neither of the bridge's values, so its start clears both records (the
+    // limit the README names: 5.0.6's values are then not put back), and its answer sets and records its own
+    seven.Switch(*r.ini);
+    auto s7 = r.NextStart("7.0.0.1");
+    CHECK(r.ini->records.empty());
+    s7->OnServerVersion(2);
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("1"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    // back to 5.0.6: its own INI holds the bridge's values, so the records stay, and a version 1 answer removes both
+    // keys there, as "added" means for either
+    seven.Switch(*r.ini);
+    auto s5 = r.NextStart("5.0.6.3");
+    CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
+    CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
+    s5->OnServerVersion(1);
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("(absent)"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("(absent)"));
+    r.NextStart("5.0.6.3");
+    CHECK(r.ini->records.empty());
+    // the 7.0.0 profile keeps the bridge's values with no record left: a version 1 answer there puts nothing back, and
+    // a version 2 answer writes and records nothing (both already on the CPU)
+    seven.Switch(*r.ini);
+    auto again = r.NextStart("7.0.0.1");
+    const int writes = r.ini->iniWrites + r.ini->recordWrites;
+    again->OnServerVersion(1);
+    again->OnServerVersion(2);
+    CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, writes);
+    CHECK_EQ(r.ini->Own("ForceCPU"), std::string("1"));
+    CHECK_EQ(r.ini->Own("EmotionDevice"), std::string("-1"));
+
+    // BFA updated from 5.0.6 to 7.0.0 over the same INI (its saved INI kept, in Overwrite, say): the records made
+    // under 5.0.6 stay at 7.0.0's start, and a version 1 answer under 7.0.0 writes back the values 5.0.6's INI held;
+    // and the way back, from 7.0.0 to 5.0.6, alike
+    Mode5Saved up;
+    up.mode.OnServerVersion(2);
+    CHECK_EQ(up.ini->Record(kEmotionDeviceRecord), std::string("2"));
+    up.ini->Set("FaceGraphFusion", "GraphFusion", "0");
+    up.ini->Set("EmotionGraphFusion", "EmotionGraphFusion", "0");
+    auto updated = up.NextStart("7.0.0.1");
+    CHECK_EQ(up.ini->Record(kForceCpuRecord), std::string("1"));
+    CHECK_EQ(up.ini->Record(kEmotionDeviceRecord), std::string("2"));
+    updated->OnServerVersion(2);
+    CHECK_EQ(up.ini->Record(kEmotionDeviceRecord), std::string("2"));
+    updated->OnServerVersion(1);
+    CHECK_EQ(up.ini->Own("ForceCPU"), std::string("0"));
+    CHECK_EQ(up.ini->Own("EmotionDevice"), std::string("2"));
+    Mode7Rig down;
+    down.ini->Set("", "EmotionDevice", "3");
+    down.mode.OnServerVersion(2);
+    CHECK_EQ(down.ini->Record(kEmotionDeviceRecord), std::string("3"));
+    auto older = down.NextStart("5.0.6.3");
+    CHECK_EQ(down.ini->Record(kEmotionDeviceRecord), std::string("3"));
+    older->OnServerVersion(1);
+    CHECK_EQ(down.ini->Own("EmotionDevice"), std::string("3"));
+    CHECK_EQ(down.ini->Own("ForceCPU"), std::string("(absent)"));
 }
 
 // ---- the sizes the bridge lists for BFA 5.0.6 (core/BfaSizes.h)
@@ -1609,5 +1930,37 @@ TEST(Bfa506GpuRouteSizes) {
         CHECK(!ListsSizesFor(v));
         CHECK_EQ(sizes(v, "a2f3_fp16.onnx"), std::string());
         CHECK_EQ(sizes(v, "performance.onnx"), std::string());
+    }
+}
+
+// BFA 7.0.0's table, inferred from its models and its DLL's dimension names: V3, Legacy and both emotion models as
+// 5.0.6's; ultra-performance.onnx (5.0.6's Thin120 under a new name) its batch at 1; the new performance.onnx, whose
+// every dimension is fixed, nothing. 5.0.6's table is unchanged, and has no ultra-performance.onnx.
+TEST(Bfa700GpuRouteSizes) {
+    const auto sizes = [](const std::string& bfa, const std::string& file, int batch = 2) {
+        std::string s;
+        for (const auto& o : GpuRouteSizes(bfa, file, batch)) s += (s.empty() ? "" : ",") + o.name + "=" + std::to_string(o.value);
+        return s;
+    };
+    for (const char* v : {"7.0.0", "7.0.0.1", "7.0.0.12"}) {
+        CHECK(ListsSizesFor(v));
+        CHECK_EQ(sizes(v, "a2f3_fp16.onnx"),
+                 std::string("window_dynamic_axes_1=1,identity_dynamic_axes_1=1,emotion_dynamic_axes_1=1,input_latents_dynamic_axes_1=1"));
+        CHECK_EQ(sizes(v, "network_fp16.onnx"), std::string("input_dynamic_axes_1=2,emotion_dynamic_axes_1=2"));
+        CHECK_EQ(sizes(v, "network_fp16.onnx", 5), std::string("input_dynamic_axes_1=5,emotion_dynamic_axes_1=5"));
+        CHECK_EQ(sizes(v, "network_fp16.onnx", 0), std::string("input_dynamic_axes_1=1,emotion_dynamic_axes_1=1"));
+        CHECK_EQ(sizes(v, "ultra-performance.onnx"), std::string("batch=1"));
+        CHECK_EQ(sizes(v, "performance.onnx"), std::string());
+        CHECK_EQ(sizes(v, "emotion_fp16.onnx"), std::string("batch_size=1,seq_len=60000,batch=1"));
+        CHECK_EQ(sizes(v, "emotion_performance.onnx"), std::string("batch_size=1,seq_len=60000,batch=1"));
+        CHECK_EQ(sizes(v, "Ultra-Performance.onnx"), std::string());  // BFA's names, exactly
+        CHECK_EQ(sizes(v, "tiny.onnx"), std::string());
+    }
+    CHECK_EQ(sizes("5.0.6.3", "performance.onnx"), std::string("batch=1"));
+    CHECK_EQ(sizes("5.0.6.3", "ultra-performance.onnx"), std::string());
+    for (const char* v : {"7.0", "7.0.1", "7.0.0x", "70.0.0", "7.0.00", ""}) {
+        CHECK(!ListsSizesFor(v));
+        CHECK_EQ(sizes(v, "a2f3_fp16.onnx"), std::string());
+        CHECK_EQ(sizes(v, "ultra-performance.onnx"), std::string());
     }
 }

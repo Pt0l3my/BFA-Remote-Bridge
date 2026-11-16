@@ -64,15 +64,27 @@ std::optional<std::string> EmotionPutBack(const std::string& text) {
 
 }  // namespace
 
-bool IsBfa506(const std::string& version) noexcept {
-    const std::string v = kCpuModeBfa5Version;
+// "base" or "base.N": a build of that version.
+static bool IsBuildOf(const std::string& version, const char* base) {
+    const std::string v = base;
     return version == v || version.rfind(v + ".", 0) == 0;
 }
 
+bool IsBfa506(const std::string& version) noexcept { return IsBuildOf(version, kCpuModeBfa5Version); }
+
+bool IsBfa700(const std::string& version) noexcept { return IsBuildOf(version, kCpuModeBfa7Version); }
+
+bool BfaHasBothKeys(const std::string& version) noexcept { return IsBfa506(version) || IsBfa700(version); }
+
+InstallerChoices InstallerChoicesFor(const std::string& version) noexcept {
+    if (IsBfa700(version)) return kBfa700InstallerChoices;
+    return kBfa506InstallerChoices;
+}
+
 // The last layer that holds the key wins: BFA's own INI first, then the choice files from the last back.
-std::optional<std::string> Bfa5Value(IniStore& store, const char* section, const char* key) {
+std::optional<std::string> Bfa5Value(IniStore& store, InstallerChoices choices, const char* section, const char* key) {
     if (auto v = store.ReadBfaValue(nullptr, section, key)) return v;
-    for (auto it = kBfa5InstallerChoices.rbegin(); it != kBfa5InstallerChoices.rend(); ++it)
+    for (auto it = choices.rbegin(); it != choices.rend(); ++it)
         if (auto v = store.ReadBfaValue(*it, section, key)) return v;
     return std::nullopt;
 }
@@ -87,21 +99,33 @@ std::optional<long> Bfa5Number(const std::optional<std::string>& value) {
 
 long Bfa5Long(const std::optional<std::string>& value, long def) { return Bfa5Number(value).value_or(def); }
 
-int Bfa5Batch(IniStore& store) {
-    const long batch = Bfa5Long(Bfa5Value(store, "General", "Batch"), 2);
+int Bfa5Batch(IniStore& store, const std::string& version) {
+    const long batch = Bfa5Long(Bfa5Value(store, InstallerChoicesFor(version), "General", "Batch"), 2);
     return static_cast<int>(std::clamp<long>(batch, 1, INT_MAX));
 }
 
 // As BFA 5.0.6's LoadIni: ForceCPU over the legacy GPU=0; EmotionDevice over -1 (with ForceCPU) or GpuAdapter, at
 // least 0. The defaults' keys are read only when needed.
-Bfa5Devices ReadBfa5Devices(IniStore& store) {
+//
+// BFA 7.0.0 (its source wasn't read, so this is inferred from its files): ForceCPU and the legacy GPU=0 are taken as
+// 5.0.6 reads them. A missing EmotionDevice is taken as graphics card 0 whatever ForceCPU and GpuAdapter say: its
+// INI's comment gives EmotionDevice's default as 0, independent of Audio2Face, and its README has each model default
+// to GPU 0 and keep its own device choice. Its installer always writes EmotionDevice (Installer\EmotionDevice.ini), so
+// this counts only where the key is missing or not a number everywhere. Taking the card is the safe side: should BFA
+// 7.0.0 in fact take the CPU there, the bridge's EmotionDevice=-1 changes nothing BFA does, and its put-back removes
+// it again; taking the CPU where BFA takes the card would leave Audio2Emotion's device as it is.
+Bfa5Devices ReadBfa5Devices(IniStore& store, const std::string& version) {
+    const InstallerChoices choices = InstallerChoicesFor(version);
     Bfa5Devices d;
-    const auto forceCpu = Bfa5Number(Bfa5Value(store, "General", "ForceCPU"));
-    const bool legacyCpu = !forceCpu && Bfa5Long(Bfa5Value(store, "General", "GPU"), 1) == 0;
+    const auto forceCpu = Bfa5Number(Bfa5Value(store, choices, "General", "ForceCPU"));
+    const bool legacyCpu = !forceCpu && Bfa5Long(Bfa5Value(store, choices, "General", "GPU"), 1) == 0;
     d.forceCpu = forceCpu ? (*forceCpu != 0 ? 1 : 0) : (legacyCpu ? 1 : 0);
-    const auto emotion = Bfa5Number(Bfa5Value(store, "General", "EmotionDevice"));
+    const auto emotion = Bfa5Number(Bfa5Value(store, choices, "General", "EmotionDevice"));
     long fallback = -1;
-    if (!d.forceCpu && !emotion) fallback = std::max(0L, Bfa5Long(Bfa5Value(store, "General", "GpuAdapter"), 0));
+    if (IsBfa700(version))
+        fallback = 0;
+    else if (!d.forceCpu && !emotion)
+        fallback = std::max(0L, Bfa5Long(Bfa5Value(store, choices, "General", "GpuAdapter"), 0));
     d.emotionDevice = std::max(-1L, emotion.value_or(fallback));
     return d;
 }
@@ -166,8 +190,8 @@ void BfaCpuMode::OnStart() {
     std::lock_guard lock(mutex_);
     if (!store_) return;
     const bool force = ForceCpuPutBack(store_->ReadRecord(kForceCpuRecord)).has_value();
-    // EmotionDevice is BFA 5.0.6's key: another BFA loaded nothing of it at this start
-    const bool emotion = IsBfa506(bfaVersion_) && EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord)).has_value();
+    // EmotionDevice is the key of a BFA with both keys (5.0.6, 7.0.0): another BFA loaded nothing of it at this start
+    const bool emotion = BfaHasBothKeys(bfaVersion_) && EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord)).has_value();
     if (!force && !emotion) return;
     // BFA's INI not there: BFA loaded nothing of it, and the records wait for its return. Unreadable: what BFA loaded
     // can't be told. Either way both records stay.
@@ -202,8 +226,8 @@ void BfaCpuMode::FailOnceLocked(const std::string& key, const std::string& line)
 // BFA 4 (4.3.2.3 or any other 4.x) has no EmotionDevice key.
 static bool IsBfa4(const std::string& version) { return version.rfind("4.", 0) == 0; }
 
-// Every value the bridge set goes back, each by its own record. BFA 4 has no EmotionDevice: that record, made for
-// BFA 5.0.6's INI, is left as it is under any BFA 4.
+// Every value the bridge set goes back, each by its own record. BFA 4 has no EmotionDevice: that record, made for the
+// INI of a BFA with both keys (5.0.6, 7.0.0), is left as it is under any BFA 4.
 void BfaCpuMode::PutBackLocked(const std::string& because) {
     const auto force = ForceCpuPutBack(store_->ReadRecord(kForceCpuRecord));
     const auto emotion = IsBfa4(bfaVersion_) ? std::nullopt : EmotionPutBack(store_->ReadRecord(kEmotionDeviceRecord));
@@ -255,15 +279,14 @@ void BfaCpuMode::PutBackKeyLocked(const char* record, const char* key, const std
 
 void BfaCpuMode::SetLocked() {
     if (Bfa4Locked()) return SetBfa4Locked();
-    if (IsBfa506(bfaVersion_)) return SetBfa5Locked();
+    if (BfaHasBothKeys(bfaVersion_)) return SetBothKeysLocked();
+    const std::string versions = std::string(kCpuModeBfaVersion) + ", " + kCpuModeBfa5Version + " and " + kCpuModeBfa7Version;
     if (!otherLogged_)
         Log(Level::Info, "BFA's mode is left as it is: this is Better Facial Animations " +
                              (bfaVersion_.empty() ? std::string("of an unknown version") : bfaVersion_) +
-                             ", and the bridge sets BFA's CPU mode only for " + kCpuModeBfaVersion + " and " + kCpuModeBfa5Version +
-                             ", the versions it is made for");
+                             ", and the bridge sets BFA's CPU mode only for " + versions + ", the versions it is made for");
     otherLogged_ = true;
-    PutBackLocked(std::string("the bridge sets BFA's CPU mode only for Better Facial Animations ") + kCpuModeBfaVersion + " and " +
-                  kCpuModeBfa5Version);
+    PutBackLocked("the bridge sets BFA's CPU mode only for Better Facial Animations " + versions);
 }
 
 // ForceCPU=1 over a 0, recorded first; for BFA 4.3.2.3, with its INI there.
@@ -287,12 +310,13 @@ void BfaCpuMode::SetBfa4Locked() {
                      "still runs on the server.");
 }
 
-// BFA 5.0.6: ForceCPU=1 over a 0 and EmotionDevice=-1 over a card, as BFA 5 reads them (its layers), each recorded
-// first by how to put it back; written in BFA's own INI, which wins over the installer's files. The record follows
-// what BFA's own INI holds each time, so a card picked in BFA's menu since replaces the one recorded.
-void BfaCpuMode::SetBfa5Locked() {
+// A BFA with both keys (5.0.6, 7.0.0): ForceCPU=1 over a 0 and EmotionDevice=-1 over a card, as that BFA reads them
+// (its layers), each recorded first by how to put it back; written in BFA's own INI, which wins over the installer's
+// files. The record follows what BFA's own INI holds each time, so a card picked in BFA's menu since replaces the one
+// recorded.
+void BfaCpuMode::SetBothKeysLocked() {
     if (!PresentLocked()) return;
-    const Bfa5Devices now = ReadBfa5Devices(*store_);
+    const Bfa5Devices now = ReadBfa5Devices(*store_, bfaVersion_);
     std::vector<std::string> changed;
     std::string err;
     if (now.forceCpu == 0) {
@@ -326,13 +350,15 @@ void BfaCpuMode::SetBfa5Locked() {
     for (const auto& key : changed)
         what += (what.empty() ? "" : " and ") + key + (key == "ForceCPU" ? " to 1 (it was 0)" : " to -1 (it was " + card + ")");
     // what BFA reads now, so the line claims no more than was written
-    const Bfa5Devices after = ReadBfa5Devices(*store_);
+    const Bfa5Devices after = ReadBfa5Devices(*store_, bfaVersion_);
     const bool face = after.forceCpu == 1, emotion = after.emotionDevice == -1;
     if (!face && !emotion) return;
     const std::string models = face && emotion ? "Audio2Face and Audio2Emotion" : face ? "Audio2Face" : "Audio2Emotion";
+    // that no graphics device is made with both on the CPU is known from 5.0.6's source; 7.0.0's wasn't read
+    const bool noDevice = face && emotion && IsBfa506(bfaVersion_);
     Log(Level::Info, "Set BFA's [General] " + what + " in BetterFacialAnimations.ini: the server speaks protocol version 2, so BFA runs " +
-                         models + " in its CPU mode from the next game start" +
-                         (face && emotion ? " and creates no graphics device on this PC" : "") + ". The model still runs on the server.");
+                         models + " in its CPU mode from the next game start" + (noDevice ? " and creates no graphics device on this PC" : "") +
+                         ". The model still runs on the server.");
 }
 
 }  // namespace bfarb
