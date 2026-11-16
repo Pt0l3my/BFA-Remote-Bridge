@@ -189,6 +189,7 @@ const char* ErrorCodeName(std::uint16_t code) noexcept {
         case ErrorCode::TooLarge: return "too large";
         case ErrorCode::VersionNotSupported: return "protocol version not supported";
         case ErrorCode::Busy: return "busy or shutting down";
+        case ErrorCode::State: return "the line's state isn't held";
     }
     return "unknown error";
 }
@@ -213,10 +214,11 @@ bool ValidModelName(std::string_view name) noexcept {
 }
 
 bool KnownType(std::uint16_t version, std::uint16_t type, bool datagram) noexcept {
-    if (version != kVersion1 && version != kVersion2) return false;
+    if (version < kVersion1 || version > kVersion3) return false;
+    // FIND and FOUND stay version 2 datagrams: version 3 changes nothing on UDP
     if (datagram) return version == kVersion2 && (type == static_cast<std::uint16_t>(MsgType::Find) || type == static_cast<std::uint16_t>(MsgType::Found));
     if (type >= static_cast<std::uint16_t>(MsgType::Hello) && type <= static_cast<std::uint16_t>(MsgType::Pong)) return true;
-    return version == kVersion2 && type == static_cast<std::uint16_t>(MsgType::Notice);
+    return version >= kVersion2 && type == static_cast<std::uint16_t>(MsgType::Notice);
 }
 
 bool ElementCount(const std::vector<std::int64_t>& dims, std::uint64_t& count) noexcept {
@@ -266,7 +268,7 @@ bool DecodeHeader(const std::uint8_t* bytes, Header& header, std::string& err, H
     r.U16(header.version);
     r.U16(header.type);
     r.U32(header.length);
-    if (header.version != kVersion1 && header.version != kVersion2) {
+    if (header.version < kVersion1 || header.version > kVersion3) {
         if (check) check->versionRefused = true;
         return Fail(err, "protocol version " + std::to_string(header.version) + " not supported");
     }
@@ -354,7 +356,7 @@ bool DecodeHello(const std::uint8_t* p, std::size_t n, Hello& m, std::string& er
 
 // ---- HELLO_OK
 
-bool EncodeHelloOk(const HelloOk& m, std::vector<std::uint8_t>& out, std::string& err) {
+bool EncodeHelloOk(const HelloOk& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version) {
     out.clear();
     Writer w(out);
     if (!w.Str(m.server) || !w.Str(m.device)) return Fail(err, "string longer than 65,535 bytes");
@@ -364,11 +366,17 @@ bool EncodeHelloOk(const HelloOk& m, std::vector<std::uint8_t>& out, std::string
         if (!w.Str(e.name)) return Fail(err, "model name longer than 65,535 bytes");
         w.U8(e.status);
         if (!w.Str(e.detail)) return Fail(err, "detail longer than 65,535 bytes");
+        if (version >= kVersion3) {
+            if (e.held > 1) return Fail(err, "held is 0 or 1");
+            w.U8(e.held);
+        } else if (e.held != 0) {
+            return Fail(err, "held is version 3's");
+        }
     }
     return Finish(out, err);
 }
 
-bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string& err) {
+bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string& err, std::uint16_t version) {
     Reader r(p, n);
     std::uint16_t count = 0;
     if (!r.Str(m.server) || !r.Str(m.device) || !r.U16(count)) return Fail(err, "truncated HELLO_OK");
@@ -376,6 +384,10 @@ bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string
     for (std::uint16_t i = 0; i < count; ++i) {
         ModelReply e;
         if (!r.Str(e.name) || !r.U8(e.status) || !r.Str(e.detail)) return Fail(err, "truncated HELLO_OK model");
+        if (version >= kVersion3) {
+            if (!r.U8(e.held)) return Fail(err, "truncated HELLO_OK model");
+            if (e.held > 1) return Fail(err, "a HELLO_OK row's held is " + std::to_string(e.held) + ", not 0 or 1");
+        }
         m.models.push_back(std::move(e));
     }
     if (!r.Done()) return Fail(err, "trailing bytes after HELLO_OK");
@@ -384,22 +396,44 @@ bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string
 
 // ---- RUN
 
-std::uint64_t RunPayloadSize(const RunRequest& m) noexcept {
-    std::uint64_t n = 4 + 2 + m.model.size() + 2;
+std::uint64_t RunPayloadSize(const RunRequest& m, std::uint16_t version) noexcept {
+    std::uint64_t n = 4 + (version >= kVersion3 ? 9 : 0) + 2 + m.model.size() + 2;
     for (const TensorView& t : m.inputs) n += TensorSize(t);
     n += 2;
     for (const std::string_view o : m.outputs) n += 2 + o.size();
     return n;
 }
 
-bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err) {
+bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version) {
     out.clear();
-    if (RunPayloadSize(m) > kMaxPayload) return Fail(err, "payload above 64 MiB");
+    if (RunPayloadSize(m, version) > kMaxPayload) return Fail(err, "payload above 64 MiB");
     if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
     if (m.inputs.size() > 0xFFFF || m.outputs.size() > 0xFFFF) return Fail(err, "more than 65,535 tensors");
-    out.reserve(static_cast<std::size_t>(RunPayloadSize(m)));
+    // nothing of version 3 to a server that hasn't answered in it; and never a RUN the agreement refuses as malformed
+    if (version < kVersion3 && (m.mode != 0 || m.stream != 0)) return Fail(err, "a held run is version 3's");
+    if (version >= kVersion3 && m.mode != 0) {
+        std::vector<std::string_view> inputs, outputs(m.outputs.begin(), m.outputs.end());
+        const std::int64_t* pastFrames = nullptr;
+        std::int64_t frames = 0;
+        for (const TensorView& t : m.inputs) {
+            inputs.push_back(t.name);
+            std::uint64_t count = 0;
+            if (t.name == kPastFrames && t.dtype == static_cast<std::uint8_t>(DType::Int64) && ElementCount(t.dims, count) && count == 1 &&
+                t.data && t.bytes == 8) {
+                std::memcpy(&frames, t.data, 8);
+                pastFrames = &frames;
+            }
+        }
+        const std::string problem = HeldRunProblem(m.mode, inputs, outputs, pastFrames);
+        if (!problem.empty()) return Fail(err, problem);
+    }
+    out.reserve(static_cast<std::size_t>(RunPayloadSize(m, version)));
     Writer w(out);
     w.U32(m.requestId);
+    if (version >= kVersion3) {
+        w.U64(m.stream);
+        w.U8(m.mode);
+    }
     w.Str(m.model);
     w.U16(static_cast<std::uint16_t>(m.inputs.size()));
     for (const TensorView& t : m.inputs)
@@ -410,10 +444,17 @@ bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string&
     return Finish(out, err);
 }
 
-bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err) {
+bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err, std::uint16_t version) {
     Reader r(p, n);
     std::uint16_t inputs = 0;
-    if (!r.U32(m.requestId) || !r.Str(m.model) || !r.U16(inputs)) return Fail(err, "truncated RUN");
+    m.stream = 0;
+    m.mode = 0;
+    if (!r.U32(m.requestId)) return Fail(err, "truncated RUN");
+    if (version >= kVersion3) {
+        if (!r.U64(m.stream) || !r.U8(m.mode)) return Fail(err, "truncated RUN");
+        if (m.mode > kLastRunMode) return Fail(err, "RUN's mode is " + std::to_string(m.mode) + ", not 0, 1 or 2");
+    }
+    if (!r.Str(m.model) || !r.U16(inputs)) return Fail(err, "truncated RUN");
     if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
     m.inputs.clear();
     for (std::uint16_t i = 0; i < inputs; ++i) {
@@ -496,6 +537,75 @@ bool DecodeNotice(const std::uint8_t* p, std::size_t n, Notice& m, std::string& 
     if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
     if (!r.Done()) return Fail(err, "trailing bytes after NOTICE");
     return true;
+}
+
+// ---- a line's state (version 3)
+
+namespace {
+
+bool StartsWith(std::string_view s, std::string_view prefix) { return s.size() > prefix.size() && s.substr(0, prefix.size()) == prefix; }
+
+// past_X's X (never past_frames), or empty
+std::string_view PastName(std::string_view input) {
+    if (input == kPastFrames || !StartsWith(input, kPastPrefix)) return {};
+    return input.substr(kPastPrefix.size());
+}
+std::string_view NextName(std::string_view output) { return StartsWith(output, kNextPrefix) ? output.substr(kNextPrefix.size()) : std::string_view{}; }
+
+}  // namespace
+
+LineState DescribeLineState(const RunRequest& m) {
+    LineState s;
+    s.stateInput.assign(m.inputs.size(), false);
+    s.pairedInput.assign(m.outputs.size(), -1);
+    bool frames = false;
+    for (std::size_t i = 0; i < m.inputs.size(); ++i) {
+        const TensorView& t = m.inputs[i];
+        if (t.name == kPastFrames) {
+            std::uint64_t count = 0;
+            if (frames || t.dtype != static_cast<std::uint8_t>(DType::Int64) || !ElementCount(t.dims, count) || count != 1 || !t.data || t.bytes != 8)
+                return LineState{};
+            std::memcpy(&s.pastFrames, t.data, 8);
+            if (s.pastFrames < 0) return LineState{};
+            frames = true;
+        }
+    }
+    if (!frames) return LineState{};
+    std::size_t pairs = 0;
+    for (std::size_t i = 0; i < m.inputs.size(); ++i) {
+        const std::string_view x = PastName(m.inputs[i].name);
+        if (x.empty()) continue;
+        int found = -1;
+        for (std::size_t o = 0; o < m.outputs.size(); ++o)
+            if (NextName(m.outputs[o]) == x) {
+                if (found >= 0 || s.pairedInput[o] >= 0) return LineState{};  // asked twice, or paired twice
+                found = static_cast<int>(o);
+            }
+        if (found < 0) return LineState{};  // a past_X without its next_X
+        s.stateInput[i] = true;
+        s.pairedInput[static_cast<std::size_t>(found)] = static_cast<int>(i);
+        ++pairs;
+    }
+    for (std::size_t o = 0; o < m.outputs.size(); ++o)
+        if (!NextName(m.outputs[o]).empty() && s.pairedInput[o] < 0) return LineState{};  // a next_X without its past_X
+    if (pairs == 0) return LineState{};
+    s.stateful = true;
+    return s;
+}
+
+std::string HeldRunProblem(std::uint8_t mode, const std::vector<std::string_view>& inputs, const std::vector<std::string_view>& outputs,
+                           const std::int64_t* pastFrames) {
+    if (mode > kLastRunMode) return "RUN's mode is " + std::to_string(mode) + ", not 0, 1 or 2";
+    if (mode == 0) return {};
+    const char* which = mode == static_cast<std::uint8_t>(RunMode::Start) ? "a start (mode 1)" : "a continue (mode 2)";
+    if (!pastFrames) return std::string(which) + " without past_frames";
+    if (mode == static_cast<std::uint8_t>(RunMode::Start) && *pastFrames != 0) return "a start (mode 1) with past_frames " + std::to_string(*pastFrames);
+    if (mode == static_cast<std::uint8_t>(RunMode::Continue) && *pastFrames <= 0) return "a continue (mode 2) with past_frames " + std::to_string(*pastFrames);
+    for (const std::string_view i : inputs)
+        if (!PastName(i).empty()) return std::string(which) + " carrying " + std::string(i);
+    for (const std::string_view o : outputs)
+        if (!NextName(o).empty()) return std::string(which) + " asking for " + std::string(o);
+    return {};
 }
 
 // ---- FIND and FOUND

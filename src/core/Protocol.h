@@ -1,7 +1,10 @@
 #pragma once
-// Protocol versions 1 and 2 between the bridge and an A2F server (docs/PROTOCOL.md): framing, every message's
+// Protocol versions 1, 2 and 3 between the bridge and an A2F server (docs/PROTOCOL.md): framing, every message's
 // encoding and decoding, and every limit. Platform-neutral, no I/O. All integers little-endian. Version 2 is version
 // 1 with NOTICE (one-way, on TCP) and FIND and FOUND (UDP datagrams) added; every other payload is the same in both.
+// Version 3 (docs/AGREEMENT-1.7.md) is version 2 with a line's state kept on the server: HELLO_OK's rows gain `u8 held`
+// and RUN gains `u64 stream` and `u8 mode` after its request id; every other payload is version 2's, and FIND and
+// FOUND stay version 2 datagrams.
 //
 // Decoders never trust a length: each read is bounds-checked, each payload must be consumed exactly, and a
 // tensor's byte length must equal its element count times its type's size. Encoders refuse what the decoder
@@ -19,7 +22,8 @@ namespace bfarb::proto {
 constexpr std::uint8_t kMagic[4] = {'B', 'F', 'A', 'R'};
 constexpr std::uint16_t kVersion1 = 1;
 constexpr std::uint16_t kVersion2 = 2;  // version 1 with NOTICE, FIND and FOUND
-constexpr std::uint16_t kNewestVersion = kVersion2;
+constexpr std::uint16_t kVersion3 = 3;  // version 2 with a line's state held on the server
+constexpr std::uint16_t kNewestVersion = kVersion3;
 constexpr std::size_t kHeaderSize = 12;
 constexpr std::uint32_t kMaxPayload = 64u * 1024u * 1024u;  // 64 MiB; larger is refused
 constexpr std::size_t kMaxRank = 255;                       // a u8
@@ -35,11 +39,11 @@ enum class MsgType : std::uint16_t {
     Pong = 7,
     Find = 8,     // version 2, UDP only
     Found = 9,    // version 2, UDP only
-    Notice = 10,  // version 2, one-way
+    Notice = 10,  // version 2 and 3, one-way
 };
 
-// Whether a frame of `type` exists in `version` on TCP (1 to 7; 2 adds NOTICE), or as a datagram (FIND and FOUND,
-// version 2).
+// Whether a frame of `type` exists in `version` on TCP (1 to 7; 2 and 3 add NOTICE), or as a datagram (FIND and FOUND,
+// version 2 only: version 3 changes nothing on UDP).
 bool KnownType(std::uint16_t version, std::uint16_t type, bool datagram = false) noexcept;
 
 enum class ModelStatus : std::uint8_t {
@@ -58,7 +62,17 @@ enum class ErrorCode : std::uint16_t {
     TooLarge = 5,
     VersionNotSupported = 6,
     Busy = 7,
+    State = 8,  // version 3: a continue whose stream holds no state, or another model's, or another count; the
+                // connection stays open
 };
+
+// A RUN's mode, version 3 (mode 0 is version 2's run, exactly).
+enum class RunMode : std::uint8_t {
+    Carried = 0,   // the run carries its state, if any, as in version 2; the server neither reads nor changes a held state
+    Start = 1,     // past_frames 0: the server starts from zeros and holds next_X for the stream
+    Continue = 2,  // past_frames above 0: the server fills past_X from its held copy for the stream
+};
+constexpr std::uint8_t kLastRunMode = 2;
 
 // ONNX TensorProto codes. BFA uses only float and int64.
 enum class DType : std::uint8_t {
@@ -120,6 +134,7 @@ struct ModelReply {
     std::string name;
     std::uint8_t status = 0;
     std::string detail;
+    std::uint8_t held = 0;  // version 3 only: 1 when the server keeps this model's line state
 };
 
 struct HelloOk {
@@ -148,6 +163,8 @@ struct TensorRef {
 
 struct RunRequest {
     std::uint32_t requestId = 0;
+    std::uint64_t stream = 0;  // version 3 only
+    std::uint8_t mode = 0;     // version 3 only (RunMode); a version 1 or 2 RUN is always carried
     std::string model;
     std::vector<TensorView> inputs;
     std::vector<std::string_view> outputs;
@@ -155,6 +172,8 @@ struct RunRequest {
 
 struct DecodedRun {
     std::uint32_t requestId = 0;
+    std::uint64_t stream = 0;
+    std::uint8_t mode = 0;
     std::string model;
     std::vector<TensorRef> inputs;
     std::vector<std::string> outputs;
@@ -210,11 +229,15 @@ bool DecodeDatagram(const std::uint8_t* p, std::size_t n, Header& header, std::v
 bool EncodeHello(const Hello& m, std::vector<std::uint8_t>& out, std::string& err);
 bool DecodeHello(const std::uint8_t* p, std::size_t n, Hello& m, std::string& err);
 
-bool EncodeHelloOk(const HelloOk& m, std::vector<std::uint8_t>& out, std::string& err);
-bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string& err);
+// HELLO_OK and RUN take the version of the frame they go in: version 3's rows carry `held`, and its RUN `stream` and
+// `mode`. Versions 1 and 2 share one layout.
+bool EncodeHelloOk(const HelloOk& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version = kVersion1);
+bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string& err, std::uint16_t version = kVersion1);
 
-bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err);
-bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err);
+// A RUN in versions 1 and 2 is always carried: a mode or stream other than 0 is refused there. In version 3 a mode
+// other than 0, 1 or 2 is refused, and so is a held run the agreement refuses as malformed (HeldRunProblem).
+bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version = kVersion1);
+bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err, std::uint16_t version = kVersion1);
 
 bool EncodeRunOk(const RunOk& m, std::vector<std::uint8_t>& out, std::string& err);
 bool DecodeRunOk(const std::uint8_t* p, std::size_t n, DecodedRunOk& m, std::string& err);
@@ -232,6 +255,31 @@ bool EncodeFound(const std::string& server, std::vector<std::uint8_t>& out, std:
 bool DecodeFound(const std::uint8_t* p, std::size_t n, std::string& server, std::string& err);
 
 // The size of the RUN payload EncodeRun would make, without making it (for the 64 MiB check before copying).
-std::uint64_t RunPayloadSize(const RunRequest& m) noexcept;
+std::uint64_t RunPayloadSize(const RunRequest& m, std::uint16_t version = kVersion1) noexcept;
+
+// ---- a line's state (version 3)
+
+constexpr std::string_view kPastFrames = "past_frames";
+constexpr std::string_view kPastPrefix = "past_";
+constexpr std::string_view kNextPrefix = "next_";
+
+// A run's line state, by its names: inputs past_X paired with outputs next_X (BFA 7.0.0's past_k/next_k and
+// past_v/next_v), and the int64 past_frames, one element, 0 or more. Stateful only when every past_X input (but
+// past_frames) has its next_X among the outputs, every next_X output its past_X among the inputs, there is at least
+// one pair, and past_frames reads; anything else is a run like any other.
+struct LineState {
+    bool stateful = false;
+    std::int64_t pastFrames = 0;
+    std::vector<bool> stateInput;  // per input: a past_X of a pair (never past_frames)
+    std::vector<int> pairedInput;  // per output: the index of the past_X input its next_X pairs with, else -1
+};
+LineState DescribeLineState(const RunRequest& m);
+
+// Why the agreement refuses a version 3 RUN as malformed, given what the request alone shows (the server's held 0 for
+// the model aside); empty when it doesn't: a mode other than 0, 1 or 2; mode 1 with past_frames other than 0, or none;
+// mode 2 with past_frames 0, or none; mode 1 or 2 with a past_X (but past_frames) among the inputs or a next_X among the
+// outputs asked for.
+std::string HeldRunProblem(std::uint8_t mode, const std::vector<std::string_view>& inputs, const std::vector<std::string_view>& outputs,
+                           const std::int64_t* pastFrames);
 
 }  // namespace bfarb::proto

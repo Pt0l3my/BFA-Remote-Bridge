@@ -1,4 +1,4 @@
-// Protocol versions 1 and 2: every message's round trip, and the refusals (docs/PROTOCOL.md).
+// Protocol versions 1, 2 and 3: every message's round trip, and the refusals (docs/PROTOCOL.md).
 
 #include <cstring>
 
@@ -158,9 +158,11 @@ TEST(ProtocolHeaderRefusals) {
     bad[0] = 'X';
     CHECK(!DecodeHeader(bad.data(), h, err, &check));  // bad magic
     bad = f;
-    bad[4] = 3;  // version 3
+    bad[4] = 4;  // version 4
     CHECK(!DecodeHeader(bad.data(), h, err, &check));
     CHECK(check.versionRefused);
+    bad[4] = 3;  // version 3 is known
+    CHECK(DecodeHeader(bad.data(), h, err, &check));
     bad[4] = 0;
     CHECK(!DecodeHeader(bad.data(), h, err, &check));
     CHECK(check.versionRefused);
@@ -325,10 +327,10 @@ TEST(ProtocolVersion2Frames) {
         CHECK(KnownType(2, t, true));
     }
     CHECK(!KnownType(2, 11));
-    CHECK(!KnownType(3, 1));
+    CHECK(!KnownType(4, 1));
     CHECK(!EncodeFrame(MsgType::Notice, {}, f, err, kVersion1));  // nothing of version 2 in a version 1 frame
     CHECK(!EncodeFrame(MsgType::Find, {}, f, err, kVersion2));
-    CHECK(!EncodeFrame(MsgType::Hello, {}, f, err, 3));
+    CHECK(!EncodeFrame(MsgType::Hello, {}, f, err, 4));
     CHECK(EncodeFrame(MsgType::Pong, {}, f, err, kVersion2));
     auto bad = f;
     bad[6] = 10;  // NOTICE
@@ -408,4 +410,196 @@ TEST(ProtocolFindAndFoundDatagrams) {
     bad = d;
     bad[0] = 'X';
     CHECK(!DecodeDatagram(bad.data(), bad.size(), h, payload, err));
+}
+
+// ---- version 3
+
+namespace {
+
+// A run laid out as BFA 7.0.0's Performance model's, the state small.
+struct HeldRun {
+    float mel[4] = {1, 2, 3, 4};
+    std::int64_t identity[1] = {1};
+    float k[6] = {0}, v[6] = {0};
+    std::int64_t frames[1] = {0};
+    RunRequest Request(bool withState = true) const {
+        RunRequest r;
+        r.requestId = 5;
+        r.model = "performance.onnx";
+        r.inputs = {{"mel", 1, {1, 4}, mel, sizeof mel}, {"identity", 7, {1}, identity, sizeof identity}};
+        if (withState) {
+            r.inputs.push_back({"past_k", 1, {1, 6}, k, sizeof k});
+            r.inputs.push_back({"past_v", 1, {1, 6}, v, sizeof v});
+        }
+        r.inputs.push_back({"past_frames", 7, {1}, frames, sizeof frames});
+        r.outputs = {"normalized_motion"};
+        if (withState) r.outputs = {"normalized_motion", "next_k", "next_v"};
+        return r;
+    }
+};
+
+}  // namespace
+
+// Version 3 adds two fields to RUN (u64 stream, u8 mode, after the request id) and one to HELLO_OK's rows (u8 held);
+// every other message keeps version 2's payload, NOTICE included, and only the frame's version says 3. FIND and FOUND
+// stay version 2 datagrams.
+TEST(ProtocolVersion3Frames) {
+    for (std::uint16_t t = 1; t <= 7; ++t) {
+        CHECK(KnownType(3, t));
+        CHECK(!KnownType(3, t, true));
+    }
+    CHECK(KnownType(3, 10));
+    for (std::uint16_t t : {8, 9, 11}) CHECK(!KnownType(3, t));
+    CHECK(!KnownType(3, 8, true));
+    CHECK(!KnownType(3, 9, true));
+    CHECK_EQ(kNewestVersion, kVersion3);
+    CHECK_EQ(std::string(ErrorCodeName(8)), std::string("the line's state isn't held"));
+    CHECK(!ErrorClosesConnection(8));
+    CHECK(!ErrorEndsConnection(8));  // the connection stays open, as after 3 and 4
+    std::vector<std::uint8_t> p, f;
+    std::string err;
+    CHECK(EncodeHello(SampleHello(), p, err));
+    CHECK(EncodeFrame(MsgType::Hello, p, f, err, kVersion3));
+    CHECK_EQ(int(f[4]), 3);
+    CHECK(EncodeFrame(MsgType::Notice, p, f, err, kVersion3));
+    // a datagram is version 2's whatever the connection speaks
+    CHECK(EncodeFind("c", p, err));
+    CHECK(EncodeDatagram(MsgType::Find, p, f, err));
+    CHECK_EQ(int(f[4]), 2);
+    f[4] = 3;
+    Header h;
+    std::vector<std::uint8_t> payload;
+    CHECK(!DecodeDatagram(f.data(), f.size(), h, payload, err));
+
+    // HELLO_OK: held after each row's detail, in version 3 alone
+    HelloOk m;
+    m.server = "s";
+    m.device = "d";
+    m.models = {{"a.onnx", 0, "", 0}, {"performance.onnx", 0, "x", 1}};
+    std::vector<std::uint8_t> v2, v3;
+    CHECK(!EncodeHelloOk(m, v2, err, kVersion2));  // held is version 3's
+    m.models[1].held = 0;
+    CHECK(EncodeHelloOk(m, v2, err, kVersion2));
+    m.models[1].held = 1;
+    CHECK(EncodeHelloOk(m, v3, err, kVersion3));
+    CHECK_EQ(v3.size(), v2.size() + 2);
+    CHECK_EQ(int(v3.back()), 1);
+    HelloOk back;
+    CHECK(DecodeHelloOk(v3.data(), v3.size(), back, err, kVersion3));
+    CHECK_EQ(int(back.models[0].held), 0);
+    CHECK_EQ(int(back.models[1].held), 1);
+    CHECK_EQ(back.models[1].detail, std::string("x"));
+    CHECK(!DecodeHelloOk(v3.data(), v3.size(), back, err, kVersion2));  // trailing bytes
+    CHECK(!DecodeHelloOk(v2.data(), v2.size(), back, err, kVersion3));  // truncated
+    auto two = v3;
+    two.back() = 2;
+    CHECK(!DecodeHelloOk(two.data(), two.size(), back, err, kVersion3));  // held is 0 or 1
+    m.models[1].held = 2;
+    CHECK(!EncodeHelloOk(m, v3, err, kVersion3));
+
+    // RUN: stream and mode after the request id, then version 2's layout
+    HeldRun run;
+    RunRequest r = run.Request();
+    std::vector<std::uint8_t> carried2, carried3;
+    CHECK(EncodeRun(r, carried2, err, kVersion2));
+    CHECK(EncodeRun(r, carried3, err, kVersion3));
+    CHECK_EQ(carried3.size(), carried2.size() + 9);
+    CHECK_EQ(carried3.size(), static_cast<std::size_t>(RunPayloadSize(r, kVersion3)));
+    CHECK(std::equal(carried2.begin(), carried2.begin() + 4, carried3.begin()));
+    CHECK(std::equal(carried2.begin() + 4, carried2.end(), carried3.begin() + 13));
+    for (int i = 4; i < 13; ++i) CHECK_EQ(int(carried3[static_cast<std::size_t>(i)]), 0);  // mode 0, stream 0
+    DecodedRun d;
+    CHECK(DecodeRun(carried3.data(), carried3.size(), d, err, kVersion3));
+    CHECK_EQ(d.mode, 0);
+    CHECK_EQ(d.inputs.size(), std::size_t{5});
+    CHECK(!DecodeRun(carried3.data(), carried3.size(), d, err, kVersion2));
+    RunRequest start = run.Request(false);
+    start.stream = 0x0102030405060708ull;
+    start.mode = 1;
+    CHECK(!EncodeRun(start, p, err, kVersion2));  // nothing of version 3 in a version 2 RUN
+    start.mode = 0;
+    CHECK(!EncodeRun(start, p, err, kVersion2));
+    start.mode = 1;
+    CHECK(EncodeRun(start, p, err, kVersion3));
+    CHECK_EQ(int(p[4]), 8);
+    CHECK_EQ(int(p[11]), 1);
+    CHECK_EQ(int(p[12]), 1);
+    CHECK(DecodeRun(p.data(), p.size(), d, err, kVersion3));
+    CHECK_EQ(d.stream, 0x0102030405060708ull);
+    CHECK_EQ(int(d.mode), 1);
+    CHECK_EQ(d.model, std::string("performance.onnx"));
+    CHECK_EQ(d.inputs.size(), std::size_t{3});
+    CHECK(d.outputs == (std::vector<std::string>{"normalized_motion"}));
+    p[12] = 3;
+    CHECK(!DecodeRun(p.data(), p.size(), d, err, kVersion3));  // a mode other than 0, 1 or 2
+    CHECK(!DecodeRun(p.data(), 12, d, err, kVersion3));
+}
+
+// The agreement's refusals as malformed are never encoded: a mode other than 0, 1 or 2; mode 1 with past_frames other
+// than 0, mode 2 with 0 (or either without past_frames); mode 1 or 2 carrying past_X or asking for next_X.
+TEST(ProtocolHeldRunRefusals) {
+    HeldRun run;
+    std::vector<std::uint8_t> p;
+    std::string err;
+    const auto held = [&](std::uint8_t mode, std::int64_t frames, bool withState) {
+        run.frames[0] = frames;
+        RunRequest r = run.Request(withState);
+        r.stream = 1;
+        r.mode = mode;
+        return EncodeRun(r, p, err, kVersion3);
+    };
+    CHECK(held(1, 0, false));
+    CHECK(held(2, 90, false));
+    CHECK(held(0, 90, true));  // carried: as version 2
+    CHECK(!held(3, 0, false));
+    CHECK(!held(1, 90, false));
+    CHECK(!held(2, 0, false));
+    CHECK(!held(1, 0, true));
+    CHECK(!held(2, 90, true));
+    RunRequest r = run.Request(false);
+    r.mode = 1;
+    r.inputs.pop_back();  // no past_frames
+    CHECK(!EncodeRun(r, p, err, kVersion3));
+    r = run.Request(false);
+    r.mode = 2;
+    run.frames[0] = 180;
+    r.outputs = {"normalized_motion", "next_v"};
+    CHECK(!EncodeRun(r, p, err, kVersion3));
+    CHECK_EQ(HeldRunProblem(2, {"mel", "past_frames"}, {"normalized_motion", "next_k"}, run.frames), std::string("a continue (mode 2) asking for next_k"));
+    CHECK(HeldRunProblem(0, {"past_k"}, {"next_k"}, nullptr).empty());
+}
+
+// A run's line state, by its names: past_X with next_X, and an int64 past_frames of one element.
+TEST(ProtocolDescribesALinesState) {
+    HeldRun run;
+    run.frames[0] = 90;
+    LineState s = DescribeLineState(run.Request());
+    CHECK(s.stateful);
+    CHECK_EQ(s.pastFrames, 90);
+    CHECK(s.stateInput == (std::vector<bool>{false, false, true, true, false}));
+    CHECK(s.pairedInput == (std::vector<int>{-1, 2, 3}));
+    // the outputs in another order pair the same way
+    RunRequest r = run.Request();
+    r.outputs = {"next_v", "normalized_motion", "next_k"};
+    s = DescribeLineState(r);
+    CHECK(s.pairedInput == (std::vector<int>{3, -1, 2}));
+    // anything else is a run like any other
+    r = run.Request();
+    r.outputs = {"normalized_motion", "next_k"};  // past_v without next_v
+    CHECK(!DescribeLineState(r).stateful);
+    r = run.Request();
+    r.outputs.push_back("next_q");  // next_q without past_q
+    CHECK(!DescribeLineState(r).stateful);
+    r = run.Request();
+    r.inputs.pop_back();  // no past_frames
+    CHECK(!DescribeLineState(r).stateful);
+    r = run.Request();
+    r.inputs.back().dtype = 1;  // past_frames not int64
+    r.inputs.back().bytes = 4;
+    CHECK(!DescribeLineState(r).stateful);
+    run.frames[0] = -1;
+    CHECK(!DescribeLineState(run.Request()).stateful);
+    run.frames[0] = 0;
+    CHECK(!DescribeLineState(run.Request(false)).stateful);  // no pair
+    CHECK(DescribeLineState(run.Request()).stateful);
 }
