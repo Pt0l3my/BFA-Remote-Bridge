@@ -1,12 +1,13 @@
 #pragma once
 // BFA's mode, set by the bridge (the owner's rule for 1.3.0, extended to BFA 5.0.6 in 1.5.0 and to BFA 7.0.0 in
-// 1.6.0): with a server that answered in protocol version 2 this session, BFA 4.3.2.3, 5.0.6 and 7.0.0 run in their CPU
-// modes from the next game start (BFA 4.3.2.3 opening nothing on this PC's graphics card, BFA 5.0.6 creating no
-// graphics device there; BFA 7.0.0 is set the same way as 5.0.6); the model runs on the server either way. A version 2
-// server fills in BFA 4.3.2.3's sizes (the sizes rule, docs/PROTOCOL.md); for BFA 5.0.6 and 7.0.0 the bridge lists
-// them itself (core/BfaSizes.h). A version 1 server (every PandorumLLM release before the one that speaks version 2,
-// patch7 included) gets BFA's own values back: the bridge tells a server's version by its frames alone, and sets BFA's
-// CPU mode only for a version 2 server. A version 3 server (1.7.0) speaks version 2 too, and counts as one here.
+// 1.6.0, and to version 3 servers in 1.7.0): with a server that answered in protocol version 2 or 3 this session, BFA
+// 4.3.2.3, 5.0.6 and 7.0.0 run in their CPU modes from the next game start (BFA 4.3.2.3 opening nothing on this PC's
+// graphics card, BFA 5.0.6 creating no graphics device there; BFA 7.0.0 is set the same way as 5.0.6); the model runs on
+// the server either way. A version 2 server fills in BFA 4.3.2.3's sizes (the sizes rule, docs/PROTOCOL.md), and the
+// bridge assumes a version 3 server keeps that rule (the agreement doesn't say; PandorumLLM's side is asked to
+// confirm); for BFA 5.0.6 and 7.0.0 the bridge lists them itself (core/BfaSizes.h). A version 1 server (every
+// PandorumLLM release before the one that speaks version 2, patch7 included) gets BFA's own values back: the bridge
+// tells a server's version by its frames alone, and sets BFA's CPU mode only for a version 2 or 3 server.
 //
 // From BFA 4.3.2's source (read for facts only): BFA reads Data\SKSE\Plugins\BetterFacialAnimations.ini once, in its
 // SKSE load; its CPU mode is [General] ForceCPU=1 (the legacy form [General] GPU=0, read when ForceCPU isn't there);
@@ -43,7 +44,7 @@
 //                        with both keys (5.0.6 or 7.0.0), whose key it is. A start without BFA's INI leaves both: BFA
 //                        loaded nothing of it (its mod disabled for a while, say), and the records wait for the
 //                        file's return
-//   version 2 answered   with BFA 4.3.2.3 and its INI there: ForceCPU=1 written when it was 0, and the bridge's own
+//   version 2 or 3       with BFA 4.3.2.3 and its INI there: ForceCPU=1 written when it was 0, and the bridge's own
 //                        state records that it set it (only then: a 1 the bridge found is the player's, or one it set
 //                        whose record was lost, and either way nothing is put back for it); logged once, at info
 //                        level.
@@ -190,7 +191,7 @@ public:
     void OnServerVersion(std::uint16_t version);
     // A game save: what the last answer of this session did, done again where BFA's own INI no longer shows it.
     void OnGameSave();
-    bool Set() const;  // a server answered in version 2 this session (and not version 1 since)
+    bool Set() const;  // a server answered in version 2 or 3 this session (and not version 1 since)
 
 private:
     BfaIniState StateLocked();
@@ -212,7 +213,7 @@ private:
     LogSink log_;
     mutable std::mutex mutex_;
     std::string bfaVersion_;
-    std::uint16_t answered_ = 0;  // the last answer's version this session: 0 none, 1 or 2
+    std::uint16_t answered_ = 0;  // the last answer's version this session: 0 none, 1, or 2 (for version 2 or 3)
     std::set<std::string> setLogged_, failLogged_;  // by key: logged once a session
     std::set<std::string> putBack_;  // the keys put back this session (and logged so, once)
     bool absentLogged_ = false;

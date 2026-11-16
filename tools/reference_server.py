@@ -703,8 +703,9 @@ def main(argv=None):
                    help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a version 2 HELLO gets ERROR 6, "
                         "read whole first and closed cleanly, as patch7 does")
     p.add_argument("--p6", action="store_true",
-                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a version 2 HELLO's header alone is "
-                        "read, ERROR 6 sent, and the connection closed with the payload unread (which can reset it)")
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a newer version's HELLO (2 or 3) "
+                        "has its header alone read, ERROR 6 sent, and the connection closed with the payload unread (which can "
+                        "reset it)")
     p.add_argument("--v2-only", action="store_true",
                    help="speak protocol versions 1 and 2 alone, as a released version 2 panel (PandorumLLM v3.97 Beta patch8 to "
                         "v3.98 Beta patch26): a version 3 HELLO is read whole, answered with ERROR 6 framed in version 2, and closed")

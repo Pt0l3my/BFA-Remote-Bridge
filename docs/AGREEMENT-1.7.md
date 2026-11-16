@@ -1,7 +1,8 @@
 # Bridge 1.7: protocol version 3, as agreed
 
-The bridge's side and PandorumLLM's side agreed protocol version 3 on 2026-11-16, and the owner approved it: a line's
-state kept on the server. PandorumLLM's side is in its v3.98 Beta patch27; the bridge's is bridge 1.7.0.
+The bridge's side and PandorumLLM's side agreed protocol version 3 on 2026-11-16: a line's state kept on the server.
+PandorumLLM's side wrote the agreement, the owner sent its text to the bridge, and the bridge confirmed it on
+2026-11-16. PandorumLLM's side is in its v3.98 Beta patch27; the bridge's is bridge 1.7.0.
 [CHANGELOG.md](../CHANGELOG.md) says what the release does; [PROTOCOL.md](PROTOCOL.md), "Version 3", says how. The text
 below is the agreement as both sides wrote it, in its final version of 2026-11-16 with the bridge's three additions.
 

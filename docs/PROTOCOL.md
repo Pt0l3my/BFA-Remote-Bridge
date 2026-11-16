@@ -257,7 +257,7 @@ get no sizes of the server's own, nor does any other file, and a HELLO that list
 listed. So BFA's CPU route, which lists none, is served for those two models ([AGREEMENT-1.2.md](AGREEMENT-1.2.md),
 measurement 5, which names the two files' SHA-256). PandorumLLM's v3.97 Beta patch7 does the same in version 1. The bridge never reads a detail as a sign of the
 server's version or abilities: it knows the version by the frames alone, and sets BFA's CPU mode only for a server
-that answered in version 2 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
+that answered in version 2 or 3 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
 stands in for one with the test files. For BFA 5.0.6 the bridge lists the sizes itself (section 3, "A model load"), so
 its HELLOs list overrides, to be served exactly as listed, and nothing on the wire changes: a server should need no
 table of 5.0.6's files. Two of those lists name dimensions the model lacks (`batch` for `emotion_fp16.onnx`, all three
@@ -266,7 +266,9 @@ override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6).
 reaches BFA 7.0.0's `a2f3_fp16.onnx` and `emotion_fp16.onnx` too: they are 4.3.2.3's files, byte for byte (PandorumLLM's
 hashes of the owner's 7.0.0.1 copies against its record of 4.3.2.3's set). Bridges 1.6.0 and later list their own sizes
 for BFA 7.0.0 (section 3), so the rule, which applies only to a HELLO that lists none, isn't used with them; it would be
-with bridge 1.5.0 and BFA 7.0.0.
+with bridge 1.5.0 and BFA 7.0.0. **In version 3** the bridge assumes the same: a version 3 server keeps version 2's
+sizes rule, which BFA 4.3.2.3's CPU mode relies on. The agreement doesn't say so (it changes only HELLO_OK's rows and
+RUN), so this is the bridge's assumption, not a fact of the agreement: PandorumLLM's side is asked to confirm.
 
 **The version rule.** Each side answers in the version the other opened with.
 
@@ -459,7 +461,8 @@ stream, the count from the model's own shapes, error 8 in its three cases, the f
 stream used least recently, and the states freed by a HELLO that drops their model and by the connection's close.
 `--no-held` marks every model held 0 (the panel's setting off), `--v2-only` answers as a released version 2 panel, and
 two test options drop held state to force error 8: `--drop-held-on FILE` (when the file appears) and
-`--drop-held-every N` (every Nth continue of a line not just rebuilt after an error 8).
+`--drop-held-every N` (every Nth continue of a line not rebuilt after an error 8: a line rebuilt by a replay is spared
+for the rest of that line, until its next start).
 
 ### BFA 7.0.0
 
@@ -507,11 +510,14 @@ is marked so.
   from its first window. `past_frames` (int64 [1]) is 0 exactly on a line's first run (a start, or a restart) and on a
   session's warm-up, never on a later window: 0, 90, 180, 256, 256... (min(previous + 90, 256)). At a start `past_k`
   and `past_v` are all exactly 0.0. BFA makes every input and pre-binds every output over its own buffers
-  (`CreateTensorWithDataAsOrtValue`), unless an output overlaps an input: then it lets the runtime make the outputs
-  and copies them. After a run it checks each output (its element count, float type, every value finite; a failure ends
-  the line, the model kept), then swaps its past and next state buffers whole and passes them back unchanged; nothing
-  else reads `next_k` or `next_v`. A run that returns an error status makes BFA release the session, load the model
-  again (a new warm-up) and run the whole line again, at most twice. The model shifts its own state
+  (`CreateTensorWithDataAsOrtValue`), unless an output buffer overlaps an input's: then it lets the runtime make the
+  outputs and copies them (read from the DLL, disassembled as data: the overlap check at about 0x180066f0e to
+  0x180067266, the outputs made at 0x1800672fa). After a run it checks each output (its element count, float type,
+  every value finite; a failure ends the line, the model kept), then swaps its past and next state buffers whole and
+  passes them back unchanged; nothing else reads `next_k` or `next_v`. A run that returns an error status makes BFA
+  release the session, load the model again (a new warm-up) and run the line again, at most two attempts in all (read
+  from the DLL, disassembled as data: `NetKeeper::Run` at about 0x18006c664 to 0x18006c6bb, the failed flag set at
+  0x1800673e8). The model shifts its own state
   (`next_k[..., :166, :]` is `past_k[..., 90:, :]`), and its answer at `past_frames` 0 ignores the state's contents
   (for moderate finite values; checked with runs on ONNX Runtime 1.24.4).
 - **The overrides (read from its DLL's code).** The DLL calls `AddFreeDimensionOverrideByName` in one place, its GPU
@@ -674,11 +680,14 @@ PandorumLLM's choice; the bridge reports it.
     its own, read in order like any other. The log says so once a replay, at the normal level. The answers are then
     byte for byte those of a carried line, since the server rebuilds exactly the state BFA would have sent.
   - **A replay that can't finish** (the deadline passes, the line wasn't kept, or a replayed window gets an ERROR) is
-    answered as a timeout is: the NaN answer, never an error status, so BFA drops that line and keeps its model, and
-    the game's own lip sync plays it. It is counted and noted as any fallback is (a timeout's reason when the time ran
-    out), and a version 2 or 3 server is told by NOTICE. A replayed RUN that times out with no byte of its answer
-    arrived is owed like any other (its late answer discarded before the next), and a held run that falls back ends
-    its line: a continue of it gets the NaN answer too (BFA starts a new line instead).
+    answered as a timeout is: the NaN answer, never an error status, so BFA drops that line and keeps its model, and the
+    game's own lip sync plays it. It is counted and noted as any fallback is, and a version 2 or 3 server is told by
+    NOTICE. Its reason is a timeout's both when the deadline passed between two of the replay's runs and when the bridge
+    didn't keep the line for a replay (longer than `kLineWindows` or `kLineBytes`, or no window kept), and neither
+    counts toward the pause after two timeouts in a row, since nothing failed on the connection; a replayed window
+    answered with an ERROR gives that ERROR's reason, as any ERROR does. A replayed RUN that times out with no byte of
+    its answer arrived is owed like any other (its late answer discarded before the next), and a held run that falls
+    back ends its line: a continue of it gets the NaN answer too (BFA starts a new line instead).
   - **A reconnect mid-line** (a connection the server closed, or a lost one) meets a connection that holds no state:
     its continue gets ERROR 8, and the line is replayed there, within the same call.
 - **The version rule** (["Version 3"](#version-3), ["Version 2"](#version-2)): every connection, the main one, each

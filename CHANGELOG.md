@@ -2,10 +2,11 @@
 
 ## 1.7.0
 
-Protocol version 3: a line's state kept on the server, as agreed between the bridge's side and PandorumLLM's and
-approved by the owner ([docs/AGREEMENT-1.7.md](docs/AGREEMENT-1.7.md), written into
-[docs/PROTOCOL.md](docs/PROTOCOL.md), "Version 3"). PandorumLLM's side is in v3.98 Beta patch27, not public until the
-owner has tried the two together in game; versions 1 and 2 are unchanged, and older servers are served as by 1.6.0.
+Protocol version 3: a line's state kept on the server, as agreed between the bridge's side and PandorumLLM's: the owner
+sent the agreement's text, and the bridge confirmed it on 2026-11-16 ([docs/AGREEMENT-1.7.md](docs/AGREEMENT-1.7.md),
+written into [docs/PROTOCOL.md](docs/PROTOCOL.md), "Version 3"). PandorumLLM's side is in v3.98 Beta patch27, not public
+until the owner has tried the two together in game; versions 1 and 2 are unchanged, and older servers are served as by
+1.6.0.
 BFA 7.0.0.1's facts behind it were read from its DLL's code (disassembled as data, for facts only) and checked with
 runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
 
@@ -23,7 +24,11 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   changes, logged once ("The server speaks protocol versions 1 and 2 only ..." or "... version 1 only ..."). A HELLO
   with no frame back goes once more in its version, then in the version below, whose own rule then applies: 3, 3, 2,
   2, 1 at most. Nothing of version 3 goes to a server that hasn't answered in 3; NOTICE goes on a connection answered in
-  version 2 or 3. One rule for every version, in place of 1.6.0's version 2 special case.
+  version 2 or 3. One rule for every version, in place of 1.6.0's version 2 special case. A version learnt from HELLOs
+  that got no frame back is spoken at once, but BFA's mode (`Client::OnVersion`) hears a version only once a frame came
+  back in it (a HELLO_OK, or an ERROR 6 framed in it): a version 3 server whose first two HELLOs were reset, then
+  answered in version 2, sets BFA's CPU mode at that answer, and a p6 server (3, 3, 2, 2, then 1) is reported as
+  version 1 alone, never 2.
 - **Held mode.** A run of a model whose row in the main connection's version 3 HELLO_OK says held 1, and whose names
   show a line's state, goes as a start (mode 1) when `past_frames` is 0 and a continue (mode 2) above, with its
   `past_X` left out of the inputs and its `next_X` out of the outputs asked for, on one stream per stateful model per
@@ -39,18 +44,28 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   call's start: window 0 as a start, each earlier window as a continue with its answer discarded, then the current
   window again, each a RUN with a request id of its own. Logged once a replay, at the normal level. A replay that can't
   finish (the deadline, a line longer than kept, an ERROR to a replayed window) is answered as a timeout is: the NaN
-  answer, never an error status, counted, noted and told by NOTICE as any fallback (a timeout's reason when the time
-  ran out). A held run that falls back ends its line, as BFA does: a continue of it gets the NaN answer too.
+  answer, never an error status, counted, noted and told by NOTICE as any fallback. Its reason is a timeout's when the
+  deadline passed between the replay's runs and also when the bridge didn't keep the line for a replay (longer than
+  kept, or no window kept), neither counted toward the pause after two timeouts in a row; an ERROR to a replayed window
+  gives that ERROR's reason. A held run that falls back ends its line, as BFA does: a continue of it gets the NaN
+  answer too.
 - **Robustness.** A replayed RUN that times out is owed like any other, and its late answer discarded in order before
   the next; a reconnect within a run meets a connection that holds nothing, gets ERROR 8 there and replays there. The
   pause, PING, NOTICE and the status checks work on version 3 connections as on version 2's. The log's status line
   says "its line's state kept on the server" for a model held 1; the Detailed run line says whether a run was a start
-  or a continue held on the server, and how many windows were replayed first.
+  or a continue held on the server, and how many windows were replayed first ("1 window", "4 windows"). A held run
+  never makes the carried RUN's payload (`proto::CheckRun` checks it before the network, as before): for BFA 7.0.0's
+  Performance model, no 7.5 MB copy a run that is never sent.
+- **A run's bytes, up and back, count the same exchanges** (`Client::Reply`; the statistics and the Detailed run
+  line): up, every RUN the call sent; back, every answer read to them. So a replay counts each replayed window both
+  ways, and a send into a connection the server had closed, sent again on a new one, counts twice up and once back.
+  This changes the counts for version 1 and 2 servers too: 1.6.0 counted only the last RUN sent and its answer.
 - **Measured** with BFA 7.0.0's `performance.onnx` through the bridge and the reference server on loopback: a held run
   is 69,758 bytes of frames and payloads both ways (43,407 up, 26,351 back), a carried run 15,012,198 (7,514,635 up,
   7,497,563 back); every motion the same as a local run's, byte for byte, a lost state replayed included.
 - **BFA's mode** counts a version 3 answer as a version 2 one (`BfaCpuMode::OnServerVersion`): a version 3 server
-  speaks version 2 too, its sizes rule included.
+  speaks version 2 too. That it keeps version 2's sizes rule, which BFA 4.3.2.3's CPU mode relies on, is the bridge's
+  assumption (the agreement doesn't say), stated as such in PROTOCOL; PandorumLLM's side is asked to confirm.
 - **The reference server** (`tools/reference_server.py`) speaks version 3 as agreed: held state per connection and
   stream, its count min(p + F, W) from the model's own shapes, error 8 in its three cases, the four refusals as ERROR
   1, at most 8 held streams freeing the one used least recently, and the states freed by a start, by a HELLO that no
@@ -66,7 +81,10 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   PandorumLLM's answer on BFA 7.0.0: `ultra-performance.onnx` is 4.3.2.3's `performance.onnx`, the same file, by
   PandorumLLM's record of 4.3.2.3's set (README and PROTOCOL had hedged); and version 2's sizes rule does reach 7.0.0's
   `a2f3_fp16.onnx` and `emotion_fp16.onnx`, which are 4.3.2.3's files by SHA-256, though bridges 1.6.0 and later list
-  their own sizes for 7.0.0, so the rule isn't used with them (PROTOCOL's table had them as files not read).
+  their own sizes for 7.0.0, so the rule isn't used with them (PROTOCOL's table had them as files not read). 1.6.0's
+  own notes in the README are left as released. PROTOCOL cites the addresses in BFA 7.0.0.1's DLL behind two facts:
+  BFA reruns a line after a `Run` error status (at most two attempts in all), and pre-binds its outputs unless one
+  overlaps an input.
 - **The version** is 1.7.0 (CMake, SkyrimNet's manifest, the settings page's file and the client string's example).
   No new setting.
 - **Tests:** the version 3 frames, HELLO_OK's held, RUN's stream and mode, the refusals and the line state's names;
@@ -81,9 +99,14 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   BFA 7.0.0's layout (`tests/make_test_model.py`, `stateful.onnx`): held against carried (held 0, and a version 2
   server) byte for byte over a chained line, the placeholders left finite (pre-bound untouched, or zeros made), a lost
   state replayed byte for byte (on demand, and every 4th continue over three lines), a reconnect mid-line replayed, and
-  a replay that can't finish answered as a timeout; with `BFARB_BFA7_PERFORMANCE`, BFA 7.0.0's own model held against
+  a replay that can't finish answered as a timeout (the deadline, and a line too long to replay, never an error
+  status); with `BFARB_BFA7_PERFORMANCE`, BFA 7.0.0's own model held against
   carried byte for byte with a lost state replayed, its sizes and loopback times printed. The reference server's own
-  tests cover held, error 8, the refusals, the cap, the freeing, the version 2 panel and the test options.
+  tests cover held, error 8, the refusals, the cap, the freeing, the version 2 panel and the test options. Also: the
+  version sink after HELLOs with no frame back (a p6 server, two and four resets, and a run's own connect); an ERROR to
+  a replayed window (its reason, no pause, not counted toward the two timeouts); the deadline passing between a
+  replay's runs; the 4 MiB cap on a line's kept windows; a replayed answer to another request; a run's bytes up and
+  back over a replay and a reconnect; and `proto::CheckRun` against `EncodeRun`.
 
 ## 1.6.0
 
