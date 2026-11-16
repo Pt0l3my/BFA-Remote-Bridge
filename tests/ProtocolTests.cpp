@@ -243,6 +243,36 @@ TEST(ProtocolPayloadRefusals) {
     huge.model = "tiny.onnx";
     huge.inputs = {{"x", 1, {static_cast<std::int64_t>(kMaxPayload / 4 + 1)}, x, kMaxPayload + 4}};
     CHECK(!EncodeRun(huge, p, err));
+    // CheckRun: EncodeRun's answer and words, without the payload
+    {
+        const auto same = [&](const RunRequest& q, std::uint16_t v) {
+            std::vector<std::uint8_t> made;
+            std::string e1, e2;
+            const bool encoded = EncodeRun(q, made, e1, v);
+            const bool checked = CheckRun(q, e2, v);
+            CHECK_EQ(encoded, checked);
+            CHECK_EQ(e1, e2);
+        };
+        RunRequest q;
+        q.model = "tiny.onnx";
+        for (const std::uint16_t v : {kVersion1, kVersion2, kVersion3}) {
+            q.inputs = {{"x", 1, {3}, x, sizeof x}};
+            same(q, v);
+            q.inputs = {{"x", 2, {2}, x, sizeof x}};
+            same(q, v);
+            q.inputs = {{"x", 1, {2}, nullptr, sizeof x}};
+            same(q, v);
+            q.inputs = {{"x", 1, {2}, x, sizeof x}};
+            q.model = "../tiny.onnx";
+            same(q, v);
+            q.model = "tiny.onnx";
+            same(q, v);
+            q.mode = 1;  // a held run: version 3's alone, and refused without past_frames 0
+            same(q, v);
+            q.mode = 0;
+            same(huge, v);
+        }
+    }
     std::uint64_t bytes = 0;
     CHECK(!ByteLength(1, {static_cast<std::int64_t>(kMaxPayload / 4 + 1)}, bytes));
     CHECK(!ByteLength(1, {INT64_MAX, INT64_MAX}, bytes));  // overflow

@@ -1672,7 +1672,7 @@ TEST(ClientVersionRuleFollowsTheAddressFound) {
 
 // The version the server answered in goes to the sink each time it changes (BFA's mode follows it, core/BfaMode.h):
 // nothing before an answer, 3 once however many answers, and again after the address changes; 2 from a version 2
-// server, 1 from a version 1 server.
+// server, 1 from a version 1 server. A version learnt from HELLOs that got no frame back waits for a frame in a version.
 TEST(ClientTellsTheServersVersion) {
     Rig r;
     std::vector<std::uint16_t> told;
@@ -1696,6 +1696,40 @@ TEST(ClientTellsTheServersVersion) {
     CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
     CHECK(told == (std::vector<std::uint16_t>{3, 1, 2}));
     r.c.OnVersion(nullptr);
+    // a version learnt from HELLOs that got no frame back isn't told until a frame comes back in a version: a p6 server
+    // (3, 3, 2, 2, then version 1's HELLO_OK) is told 1 alone, never 2
+    {
+        Rig p6;
+        std::vector<std::uint16_t> heard;
+        p6.c.OnVersion([&](std::uint16_t v) { heard.push_back(v); });
+        p6.script->speaks = 1;
+        p6.script->p6 = true;
+        CHECK(p6.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK_EQ(p6.script->Connections().size(), std::size_t{5});
+        CHECK(heard == (std::vector<std::uint16_t>{1}));
+        p6.c.OnVersion(nullptr);
+    }
+    // two version 3 HELLOs reset (a server restarting, say), then version 2's HELLO_OK: 2 is told only once that answer
+    // came, on the third connection; four resets, then version 1's HELLO_OK: 1 alone
+    {
+        Rig reset;
+        std::vector<std::pair<std::uint16_t, std::size_t>> heard;  // the version, and the connections made by then
+        reset.c.OnVersion([&](std::uint16_t v) { heard.emplace_back(v, reset.script->Connections().size()); });
+        reset.script->resetHellos = 2;
+        CHECK(reset.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK(heard == (std::vector<std::pair<std::uint16_t, std::size_t>>{{2, 3}}));
+        CHECK(VersionsOf(reset.script->Connections().back()) == (std::vector<std::uint16_t>{2}));
+        reset.c.OnVersion(nullptr);
+    }
+    {
+        Rig reset;
+        std::vector<std::uint16_t> heard;
+        reset.c.OnVersion([&](std::uint16_t v) { heard.push_back(v); });
+        reset.script->resetHellos = 4;
+        CHECK(reset.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK(heard == (std::vector<std::uint16_t>{1}));
+        reset.c.OnVersion(nullptr);
+    }
 }
 
 // A HELLO that gets no frame back (the connection reset, as PandorumLLM v3.97-p6 and earlier can on Windows, closing
@@ -1750,6 +1784,8 @@ TEST(ClientNoFrameTwiceIsTheVersionBelow) {
     // a run that makes the main connection to such a server: all within its own call
     {
         Rig r;
+        std::vector<std::uint16_t> told;  // BFA's mode hears only the version a frame came back in
+        r.c.OnVersion([&](std::uint16_t v) { told.push_back(v); });
         r.script->speaks = 1;
         r.script->p6 = true;
         const auto m = Model("a.onnx");
@@ -1761,6 +1797,8 @@ TEST(ClientNoFrameTwiceIsTheVersionBelow) {
         CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{1, 1}));
         CHECK_EQ(r.c.ServerVersion(), 1);
         CHECK(!r.c.Paused());
+        CHECK(told == (std::vector<std::uint16_t>{1}));
+        r.c.OnVersion(nullptr);
     }
 }
 
@@ -2131,6 +2169,158 @@ TEST(ClientReplayThatCantFinishIsATimeout) {
         CHECK(r.RunWindow(7, 0) == Client::Outcome::Forwarded);  // the late answer is discarded first
         CHECK(!r.c.Paused());
     }
+}
+
+// A run's bytes, up and back, count the same exchanges: every RUN the call sent (the window that got ERROR 8, each
+// replayed window and the window again; after a closed connection, the send that went nowhere too) and every answer
+// read to them (ERROR 8 and each replayed window's RUN_OK included).
+TEST(ClientReplayCountsEveryRunAndAnswer) {
+    HeldRig r;
+    std::vector<std::size_t> back;  // each RUN's answer frame, in order
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3) back.push_back(mine.size());
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Forwarded);
+    const auto runs = r.script->Runs();
+    CHECK_EQ(runs.size(), std::size_t{10});
+    std::size_t up = 0, down = 0;
+    for (std::size_t i = 4; i < 10; ++i) {
+        up += proto::kHeaderSize + runs[i].bytes;
+        down += back[i];
+    }
+    CHECK_EQ(reply.bytesUp, up);
+    CHECK_EQ(reply.bytesBack, down);
+    CHECK(reply.bytesBack > proto::kHeaderSize + reply.payload.size());  // more than the last answer alone
+    // a send into a connection the server had closed counts up, with no answer back; then the new connection's
+    HeldRig c;
+    for (int w = 0; w < 3; ++w) CHECK(c.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    c.script->closeBeforeAnswer = true;
+    CHECK(c.RunWindow(3, Frames(3), reply, fb) == Client::Outcome::Forwarded);
+    const auto again = c.script->Runs();
+    CHECK_EQ(again.size(), std::size_t{8});
+    up = proto::kHeaderSize + again[3].bytes;  // the send that went nowhere: the same RUN but its request id
+    for (std::size_t i = 3; i < 8; ++i) up += proto::kHeaderSize + again[i].bytes;
+    CHECK_EQ(reply.bytesUp, up);
+    CHECK_EQ(reply.replayed, 3);
+}
+
+// An ERROR answered to a replayed window ends the replay as the run's answer: BFA gets the NaN answer, as after a
+// timeout, the reason is the ERROR's (ServerError), the connection stays, and it doesn't count toward the pause after
+// two timeouts in a row (a timeout right after it pauses nothing).
+TEST(ClientReplayedWindowAnsweredWithAnError) {
+    HeldRig r;
+    bool timeOut = false;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type != 3) return mine;
+        const auto runs = r.script->Runs();
+        if (runs.size() == 7) return ErrorFrame(runs.back().id, proto::ErrorCode::InferenceFailed);  // the second replayed window
+        if (timeOut) return std::vector<std::uint8_t>{};
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    const int connects = r.c.Reconnects();
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::ServerError);
+    CHECK(ReasonOf(fb) == Reason::ServerError);
+    CHECK(fb.text.find("ERROR 4") != std::string::npos);
+    CHECK(fb.text.find("replaying its line after ERROR 8") != std::string::npos);
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});  // nothing more sent after the ERROR
+    CHECK(!r.c.Paused());
+    CHECK_EQ(r.c.Reconnects(), connects);
+    // the next line's start times out: the first timeout in a row, so no pause
+    timeOut = true;
+    CHECK(r.RunWindow(5, 0, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK(!r.c.Paused());
+}
+
+// The deadline is checked between a replay's runs, not only while one is awaited: a replayed window answered in full
+// but after the run's time has run out (the server took 320 ms of the run's 300) ends the replay there, answered as a
+// timeout, with nothing more sent; nothing failed on the connection, so it doesn't count toward the pause after two
+// timeouts in a row.
+TEST(ClientReplayDeadlineBetweenItsRuns) {
+    HeldRig r;
+    bool timeOut = false;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type != 3) return mine;
+        if (r.script->Runs().size() == 7) std::this_thread::sleep_for(std::chrono::milliseconds(320));  // the second replayed window
+        if (timeOut) return std::vector<std::uint8_t>{};
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK_EQ(fb.text, std::string("the server no longer held its line's state, and its line's replay couldn't finish within the run's "
+                                  "time (2 of 5 runs answered)"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});
+    CHECK(!r.c.Paused());
+    timeOut = true;
+    CHECK(r.RunWindow(5, 0, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK(!r.c.Paused());
+}
+
+// The 4 MiB cap on a line's kept windows (kLineBytes), reached before the 64 windows' (kLineWindows): windows of a
+// little over 1 MiB each are kept three at a time, and the fourth stops the line being kept; its lost state then can't
+// be replayed, and the run is answered as a timeout.
+TEST(ClientLineBytesCap) {
+    HeldRig r;
+    constexpr std::size_t kMel = 1024 * 1024 / 4;  // 1 MiB of floats a window
+    std::vector<float> big(kMel);
+    const auto run = [&](int w, Client::Reply& reply, Fallback& fb) {
+        Window win(w, Frames(w));
+        std::fill(big.begin(), big.end(), static_cast<float>(w));
+        auto req = win.Request(r.m);
+        req.inputs[0] = {"mel", 1, {1, 2, static_cast<std::int64_t>(kMel / 2)}, big.data(), big.size() * 4};
+        return r.c.Run(r.m, req, reply, fb);
+    };
+    const std::size_t window = kMel * 4 + 8 + 16 + 8;  // mel, identity, emotion and past_frames
+    Client::Reply reply;
+    Fallback fb;
+    for (int w = 0; w < 3; ++w) CHECK(run(w, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.c.LineBytes(r.m.name), 3 * window);
+    CHECK(run(3, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.c.LineBytes(r.m.name), std::size_t{0});  // over 4 MiB: nothing kept
+    r.server->lose = true;
+    CHECK(run(4, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK_EQ(fb.text, std::string("the server no longer held its line's state, and its line is longer than the bridge keeps for a replay"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{5});
+    CHECK(!r.c.Paused());
+}
+
+// A replayed window's RUN_OK must answer that window's own request: one with another request id ends the replay as a
+// malformed answer (the connection closed, and a pause), never taken as the replay going on.
+TEST(ClientReplayedAnswerToAnotherRequest) {
+    HeldRig r;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3 && r.script->Runs().size() == 7) return RunOkWithId(RunId(p) + 1000);  // the second replayed window
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::Other);
+    CHECK_EQ(fb.text, std::string("the server's answer to a replayed RUN is malformed or answers another request"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});
+    CHECK(r.c.Paused());
 }
 
 // A late answer to a held run (the existing in-order discard) desynchronises nothing: BFA ends the line at the timeout's

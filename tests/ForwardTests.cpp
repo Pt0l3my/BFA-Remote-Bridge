@@ -769,8 +769,9 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     fs::remove_all(folder);
 }
 
-// A server that closes as PandorumLLM v3.97-p6 and earlier do, with the version 2 HELLO's payload unread (which can
-// reset the connection before its ERROR 6 is read): either way the bridge ends on version 1, and lines go.
+// A server that closes as PandorumLLM v3.97-p6 and earlier do, with a newer version's HELLO payload unread (the bridge's
+// version 3 HELLO, then version 2's), which can reset the connection before its ERROR 6 is read: either way the bridge
+// ends on version 1, and lines go.
 TEST(ForwardP6ServerEndsOnVersionOne) {
     Need();
     for (int i = 0; i < 3; ++i) {
@@ -787,7 +788,9 @@ TEST(ForwardP6ServerEndsOnVersionOne) {
         Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
         CHECK(!IsNanAnswer(h.api, out.v[0]));
         std::printf("        p6 try %d: %s\n", i,
-                    h.Logged("two version 2 HELLOs got no answer") ? "no frame twice" : "ERROR 6 read");
+                    h.Logged("two version 2 HELLOs got no answer")   ? "no frame twice in versions 3 and 2"
+                    : h.Logged("two version 3 HELLOs got no answer") ? "no frame twice in version 3, then ERROR 6 read in version 2"
+                                                                      : "ERROR 6 read in version 3");
         h.api->ReleaseSession(session);
     }
 }
@@ -2416,6 +2419,38 @@ TEST(ForwardHeldReplayThatCantFinishIsATimeout) {
     CHECK(line.Run(95) == local[0]);
     CHECK(line.Run(96) == local[1]);
     CHECK(!h.bridge.Connection().Paused());
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
+// A replay that fails without timing out, through the bridge's run path: the line is longer than the bridge keeps
+// (65 windows, past kLineWindows), the server then loses its state, and the replay can't be made. BFA still gets the
+// non-finite answer, never an error status, counted as a timeout and noted; the connection stays, and the next line is
+// answered as a local run.
+TEST(ForwardHeldLineTooLongToReplayIsATimeout) {
+    Need();
+    const fs::path dir = TempFolder("held-long");
+    const fs::path trigger = dir / "drop";
+    Server server(Models(), {"--drop-held-on", trigger.string()});
+    Harness h(On(server.Port()));
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+    BfaLine line(h, session, kTinyState);
+    for (unsigned seed = 200; seed <= 200 + kLineWindows; ++seed) CHECK(!line.Run(seed).empty());
+    CHECK_EQ(h.bridge.Connection().LineBytes("stateful.onnx"), std::size_t{0});  // past the cap: nothing kept
+    std::ofstream(trigger.string()).put('x');
+    CHECK(line.Run(300).empty());  // Ok() above: the call's status is success, its answer NaN
+    CHECK_EQ(h.bridge.Connection().Replays(), 1);
+    CHECK_EQ(h.bridge.Connection().Totals().timeouts, 1u);
+    CHECK_EQ(h.bridge.Statistics().unanswered, 1u);
+    CHECK(h.Logged("the server no longer held its line's state, and its line is longer than the bridge keeps for a replay"));
+    CHECK_EQ(h.CountNotes("stateful.onnx: lines get the game's own lip sync"), 1);
+    line.Start();
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, {301, 302});
+    CHECK(line.Run(301) == local[0]);
+    CHECK(line.Run(302) == local[1]);
+    CHECK(!h.bridge.Connection().Paused());
+    CHECK_EQ(h.bridge.Connection().Reconnects(), 1);
     h.api->ReleaseSession(session);
     fs::remove_all(dir);
 }

@@ -237,6 +237,8 @@ bool DecodeHelloOk(const std::uint8_t* p, std::size_t n, HelloOk& m, std::string
 // A RUN in versions 1 and 2 is always carried: a mode or stream other than 0 is refused there. In version 3 a mode
 // other than 0, 1 or 2 is refused, and so is a held run the agreement refuses as malformed (HeldRunProblem).
 bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version = kVersion1);
+// EncodeRun's checks alone, with its answer and err, without making or copying the payload.
+bool CheckRun(const RunRequest& m, std::string& err, std::uint16_t version = kVersion1);
 bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err, std::uint16_t version = kVersion1);
 
 bool EncodeRunOk(const RunOk& m, std::vector<std::uint8_t>& out, std::string& err);

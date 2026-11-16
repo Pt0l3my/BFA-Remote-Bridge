@@ -6,17 +6,20 @@
 namespace bfarb::proto {
 namespace {
 
+// With dry set, a Writer writes nothing: EncodeRun's checks alone (CheckRun).
 class Writer {
 public:
-    explicit Writer(std::vector<std::uint8_t>& out) : out_(out) {}
+    explicit Writer(std::vector<std::uint8_t>& out, bool dry = false) : out_(out), dry_(dry) {}
 
-    void U8(std::uint8_t v) { out_.push_back(v); }
+    void U8(std::uint8_t v) {
+        if (!dry_) out_.push_back(v);
+    }
     void U16(std::uint16_t v) { Le(v, 2); }
     void U32(std::uint32_t v) { Le(v, 4); }
     void U64(std::uint64_t v) { Le(v, 8); }
     void I64(std::int64_t v) { Le(static_cast<std::uint64_t>(v), 8); }
     void Bytes(const void* p, std::size_t n) {
-        if (n == 0) return;
+        if (n == 0 || dry_) return;
         const auto* b = static_cast<const std::uint8_t*>(p);
         out_.insert(out_.end(), b, b + n);
     }
@@ -30,9 +33,11 @@ public:
 
 private:
     void Le(std::uint64_t v, int n) {
+        if (dry_) return;
         for (int i = 0; i < n; ++i) out_.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
     }
     std::vector<std::uint8_t>& out_;
+    bool dry_ = false;
 };
 
 class Reader {
@@ -404,7 +409,10 @@ std::uint64_t RunPayloadSize(const RunRequest& m, std::uint16_t version) noexcep
     return n;
 }
 
-bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version) {
+namespace {
+
+// EncodeRun, or with dry its checks alone, out left empty.
+bool RunTo(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version, bool dry) {
     out.clear();
     if (RunPayloadSize(m, version) > kMaxPayload) return Fail(err, "payload above 64 MiB");
     if (!ValidModelName(m.model)) return Fail(err, "model name isn't a plain file name");
@@ -427,8 +435,8 @@ bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string&
         const std::string problem = HeldRunProblem(m.mode, inputs, outputs, pastFrames);
         if (!problem.empty()) return Fail(err, problem);
     }
-    out.reserve(static_cast<std::size_t>(RunPayloadSize(m, version)));
-    Writer w(out);
+    if (!dry) out.reserve(static_cast<std::size_t>(RunPayloadSize(m, version)));
+    Writer w(out, dry);
     w.U32(m.requestId);
     if (version >= kVersion3) {
         w.U64(m.stream);
@@ -442,6 +450,17 @@ bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string&
     for (const std::string_view o : m.outputs)
         if (!w.Str(o)) return Fail(err, "output name longer than 65,535 bytes");
     return Finish(out, err);
+}
+
+}  // namespace
+
+bool EncodeRun(const RunRequest& m, std::vector<std::uint8_t>& out, std::string& err, std::uint16_t version) {
+    return RunTo(m, out, err, version, false);
+}
+
+bool CheckRun(const RunRequest& m, std::string& err, std::uint16_t version) {
+    std::vector<std::uint8_t> none;
+    return RunTo(m, none, err, version, true);
 }
 
 bool DecodeRun(const std::uint8_t* p, std::size_t n, DecodedRun& m, std::string& err, std::uint16_t version) {

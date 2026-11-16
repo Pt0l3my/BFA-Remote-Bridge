@@ -218,7 +218,8 @@ public:
     // The search for the server on the local network (the plugin's: Winsock and the adapter list Windows reports).
     // Without one, an empty address finds nothing.
     void SetDiscovery(DiscoveryFactory discovery);
-    // The protocol version the server answered in, each time it changes (1, 2 or 3; again after the address changes).
+    // The protocol version the server answered in, each time it changes (1, 2 or 3; again after the address changes):
+    // only once a frame came back in it, never a version learnt from HELLOs that got no frame back alone.
     // Called on whichever thread learnt it, maybe with the connection's lock held: the sink must not wait or call the
     // client (the plugin's queues a task for the game's main thread).
     void OnVersion(std::function<void(std::uint16_t)> sink);
@@ -248,7 +249,10 @@ public:
         std::vector<std::uint8_t> payload;
         proto::DecodedRunOk ok;
         std::chrono::microseconds roundTrip{0};
+        // The call's RUN traffic, frames whole, over the same exchanges: up, every RUN it sent (a send again after a
+        // closed connection, and a replay's, included); back, every answer read to them (a replay's included).
         std::size_t bytesUp = 0;
+        std::size_t bytesBack = 0;
         // Version 3: per output asked by the request, the index of the past_X input whose next_X the server held and
         // left out of the answer (ok.outputs then holds only the others, in order); -1 for an output answered. Empty
         // when every output was answered.
@@ -358,8 +362,8 @@ private:
     // the last one's answer in header and answer. False with failure and reason when an exchange failed (its id in
     // sentId), or with failure None and reason when the replay can't finish (no window kept, or the deadline passed).
     bool ReplayLocked(const Line& line, proto::RunRequest current, Clock::time_point deadline, proto::Header& header,
-                      std::vector<std::uint8_t>& answer, std::uint32_t& sentId, std::size_t& bytesUp, ExchangeFailure& failure,
-                      std::string& reason);
+                      std::vector<std::uint8_t>& answer, std::uint32_t& sentId, std::size_t& bytesUp, std::size_t& bytesBack,
+                      ExchangeFailure& failure, std::string& reason);
     Answered* FindAnsweredLocked(const proto::ModelEntry& model);
     bool ToldNotReadyLocked(const Answered& a);
     void AnsweredLocked(std::vector<Answered> fresh);
@@ -372,8 +376,9 @@ private:
     bool Search(const DiscoveryFactory& factory, int port, std::vector<Endpoint>& found, std::string& server, std::string& why);
     void MarkFoundStale();
     std::uint16_t VersionFor(const std::string& key) const;
-    // An older version learnt (ERROR 6 framed in it, or no frame back twice) is logged once, with why.
-    void LearnVersion(const std::string& key, std::uint16_t version, const std::string& why = {});
+    // An older version learnt (ERROR 6 framed in it, or no frame back twice) is logged once, with why. Only a version a
+    // frame was answered in (answered) goes to the version sink, once each time it changes.
+    void LearnVersion(const std::string& key, std::uint16_t version, const std::string& why = {}, bool answered = true);
     // A connection of its own to target, opened with HELLO in the server's version; on an older server's ERROR 6, again
     // in the version it was framed in; on no frame back twice, in the version below.
     Opened OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes);
@@ -426,6 +431,9 @@ private:
     // the version rule: the protocol version the server at versionKey_ answered in (0 while unknown)
     std::string versionKey_;
     std::uint16_t serverVersion_ = 0;
+    // the last version the sink heard, and for which server: only a version a frame came back in
+    std::string reportedKey_;
+    std::uint16_t reportedVersion_ = 0;
     struct Lookup {
         bool done = false;
         bool ok = false;

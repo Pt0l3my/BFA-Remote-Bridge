@@ -1189,7 +1189,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
 
     // answered by the server: what follows only reports
     try {
-        const std::uint64_t down = proto::kHeaderSize + reply.payload.size();
+        const std::uint64_t down = reply.bytesBack;  // with bytesUp, the call's whole RUN traffic (Client::Reply)
         {
             std::lock_guard lock(statsMutex_);
             ++stats_.forwarded;
@@ -1207,7 +1207,8 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
             Log(Level::Info, "RUN " + entry.name + ": round trip " + Ms(static_cast<std::uint64_t>(reply.roundTrip.count())) + " ms, server " +
                                  Ms(reply.ok.serverMicros) + " ms, " + std::to_string(reply.bytesUp) + " bytes up, " + std::to_string(down) +
                                  " bytes back" + held +
-                                 (reply.replayed ? ", after " + std::to_string(reply.replayed) + " windows replayed" : std::string()));
+                                 (reply.replayed ? ", after " + std::to_string(reply.replayed) + (reply.replayed == 1 ? " window" : " windows") + " replayed"
+                                                 : std::string()));
         }
     } catch (...) {
     }
