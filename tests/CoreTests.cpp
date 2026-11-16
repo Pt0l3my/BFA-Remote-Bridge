@@ -876,6 +876,25 @@ TEST(BfaModeSetOnVersionTwo) {
     CHECK(r.ini->SetByBridge());
 }
 
+// A version 3 server speaks version 2 too: its answer sets BFA's CPU mode as a version 2 answer does. A version the
+// bridge doesn't know is ignored.
+TEST(BfaModeSetOnVersionThree) {
+    ModeRig r;
+    r.mode.OnServerVersion(4);
+    CHECK(!r.mode.Set());
+    CHECK_EQ(r.ini->iniWrites, 0);
+    r.mode.OnServerVersion(3);
+    CHECK(r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 1);
+    CHECK(r.ini->SetByBridge());
+    r.ini->forceCpu = 0;
+    r.mode.OnGameSave();
+    CHECK_EQ(r.ini->forceCpu, 1);
+    r.mode.OnServerVersion(1);  // then a version 1 server: put back
+    CHECK(!r.mode.Set());
+    CHECK_EQ(r.ini->forceCpu, 0);
+}
+
 // The record is written once, and only when the bridge changes a 0: a 1 it finds (the player's, or its own whose record
 // was lost) is never recorded, so nothing is put back for it.
 TEST(BfaModeRecordsTheValueFoundOnce) {

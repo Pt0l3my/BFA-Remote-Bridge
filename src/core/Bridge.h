@@ -30,7 +30,10 @@
 //                   status would make it drop the model; an emotion model is dropped and loaded again later either
 //                   way. A connection failure pauses the bridge (src/core/Client.h): runs answer so at once
 //                   until the background thread's HELLO is answered. Every run is counted once, answered or by its
-//                   reason.
+//                   reason. A run whose line state the server holds (protocol version 3, src/core/Client.h) gets
+//                   its other outputs from the server; its next_X stay as the caller bound them (BFA's own finite
+//                   buffers, passed back unread), or, made by the bridge, are zeros of the paired past_X's type and
+//                   shape.
 //   ReleaseSession  a bridge session is freed by the bridge, never passed to the runtime.
 //
 // AddFreeDimensionOverrideByName and ReleaseSessionOptions are wrapped to remember each options object's overrides;

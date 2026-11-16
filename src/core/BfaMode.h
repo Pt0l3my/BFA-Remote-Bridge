@@ -6,7 +6,7 @@
 // server fills in BFA 4.3.2.3's sizes (the sizes rule, docs/PROTOCOL.md); for BFA 5.0.6 and 7.0.0 the bridge lists
 // them itself (core/BfaSizes.h). A version 1 server (every PandorumLLM release before the one that speaks version 2,
 // patch7 included) gets BFA's own values back: the bridge tells a server's version by its frames alone, and sets BFA's
-// CPU mode only for a version 2 server.
+// CPU mode only for a version 2 server. A version 3 server (1.7.0) speaks version 2 too, and counts as one here.
 //
 // From BFA 4.3.2's source (read for facts only): BFA reads Data\SKSE\Plugins\BetterFacialAnimations.ini once, in its
 // SKSE load; its CPU mode is [General] ForceCPU=1 (the legacy form [General] GPU=0, read when ForceCPU isn't there);
@@ -185,8 +185,8 @@ public:
     // A game start, once BFA has loaded its INI and the version is set: the records BFA's own INI no longer shows
     // cleared (EmotionDevice's only for a BFA with both keys); none when the INI isn't there or can't be read.
     void OnStart();
-    // The protocol version the server answered in: 2 sets BFA's CPU mode, 1 puts back the values the bridge set, 0
-    // nothing.
+    // The protocol version the server answered in: 2 or 3 (a version 3 server speaks version 2 too) sets BFA's CPU
+    // mode, 1 puts back the values the bridge set, 0 nothing.
     void OnServerVersion(std::uint16_t version);
     // A game save: what the last answer of this session did, done again where BFA's own INI no longer shows it.
     void OnGameSave();

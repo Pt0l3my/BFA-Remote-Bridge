@@ -3,17 +3,25 @@
 // mutex (BFA may run its sentiment model from another thread while its lip-sync model runs), short-lived connections
 // of their own for model loads and status checks, and one background thread of the bridge's own.
 //
-// - The protocol's version: every connection opens with a version 2 HELLO. A version 1 server answers it with ERROR 6
-//   framed in version 1: the client then connects again at once in version 1, and stays on version 1 for that server
-//   (the address setting and port, or the address found) until the game restarts or the address changes, logged once.
-//   Nothing of version 2 goes to a server that hasn't answered in version 2.
+// - The protocol's version: every connection opens with a version 3 HELLO. An older server answers it with ERROR 6
+//   framed in its newest version (1 or 2): the client then connects again at once in that version, and stays on it
+//   for that server (the address setting and port, or the address found) until the game restarts or the address
+//   changes, logged once. A HELLO that gets no frame back is said once more in its version, then in the version below.
+//   Nothing of version 3 goes to a server that hasn't answered in version 3, nor of version 2 to one that hasn't
+//   answered in 2 or 3.
+// - A line's state on the server (version 3, docs/PROTOCOL.md "Version 3"): for a model whose row in the main
+//   connection's HELLO_OK says held 1, a run whose inputs pair past_X with outputs next_X (proto::DescribeLineState)
+//   goes as a start (past_frames 0) or a continue, past_X and next_X left out, on one stream per model per connection.
+//   The window inputs of the line in progress are kept per model (at most kLineWindows windows and kLineBytes); a
+//   continue answered ERROR 8 replays them from a start within the run's own deadline, then sends itself again. A
+//   replay that can't finish is answered as a timeout is.
 // - The server's address: the setting's, looked up (Resolve); or, when the setting is empty, found on the local network
 //   (FIND to each IPv4 adapter's broadcast address, the first FOUND taken) at start-up and after a lost connection, at
 //   most one search every kFindEvery while none answers. A search runs off the game's threads and off the speech path:
 //   in a model load, a status check or the background thread, never in a run.
-// - NOTICE (version 2): a line that fell back is told to the server on the main connection, at most one a minute, by the
-//   background thread, only while no request there awaits an answer; a version 1 server is told by the status check's
-//   `fallback REASON` instead, as by 1.2.0.
+// - NOTICE (versions 2 and 3): a line that fell back is told to the server on the main connection, at most one a
+//   minute, by the background thread, only while no request there awaits an answer; a version 1 server is told by the
+//   status check's `fallback REASON` instead, as by 1.2.0.
 //
 // - Configure never waits: the settings go to a small mutex of their own with a generation count, and the next Run or
 //   the background thread (which take the connection's lock) applies them: a change to the address, port, key or
@@ -75,12 +83,17 @@ constexpr std::chrono::seconds kFallbackReportEvery{30};  // the prompt status c
 constexpr std::chrono::seconds kNoticeEvery{60};          // NOTICE at most this often: as the fallback note on screen
 constexpr std::chrono::seconds kFindEvery{5};             // one search of the local network at most this often
 constexpr std::chrono::milliseconds kFindWait{1000};      // a search waits this long for FOUND
+// A line kept for a replay (version 3): at most this many windows and bytes per stateful model. BFA 7.0.0's
+// performance.onnx window is 43,216 bytes of inputs for 3 seconds of speech, so 64 windows (about 2.8 MB) keep a line
+// of more than three minutes; a longer line stops being kept, and its state, once gone on the server, isn't rebuilt.
+constexpr std::size_t kLineWindows = 64;
+constexpr std::size_t kLineBytes = 4u * 1024u * 1024u;
 
 // The background thread's wait before its next try, after `failures` failed tries since the pause began (or the last
 // success): 1, 2, 5, 10, 30 s, then 30 s.
 std::chrono::seconds BackoffDelay(int failures) noexcept;
 
-std::string ClientName();  // "BFARemoteBridge 1.6.0"
+std::string ClientName();  // "BFARemoteBridge 1.7.0"
 
 // Why a run got no answer from the server.
 enum class Why : std::uint8_t {
@@ -115,7 +128,7 @@ enum class ExchangeFailure {
     Malformed,    // not a frame of the connection's protocol version, or not the answer expected
     Refused,      // the server answered ERROR
     LateClosing,  // a discarded late answer was an ERROR that ends the connection
-    OlderVersion, // a version 2 HELLO answered with ERROR 6 framed in version 1: a version 1 server
+    OlderVersion, // a HELLO answered with ERROR 6 framed in an older version: a server that speaks only up to that one
 };
 
 struct Fallback {
@@ -140,7 +153,7 @@ struct Versions {
     std::string ort;  // "1.24.4"; empty until BFA loads its runtime
 };
 
-// The HELLO's client string: "BFARemoteBridge 1.6.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
+// The HELLO's client string: "BFARemoteBridge 1.7.0 (answered N, fallbacks N, timeouts N, fallback REASON, BFA V,
 // ORT V)", keys in that order, each of the last three only when known (fallback only in a status check sent for a
 // fallback), new keys only at the end. Longer than max: the trailing keys are dropped until it fits, and the name
 // alone when none fits.
@@ -205,7 +218,7 @@ public:
     // The search for the server on the local network (the plugin's: Winsock and the adapter list Windows reports).
     // Without one, an empty address finds nothing.
     void SetDiscovery(DiscoveryFactory discovery);
-    // The protocol version the server answered in, each time it changes (1 or 2; again after the address changes).
+    // The protocol version the server answered in, each time it changes (1, 2 or 3; again after the address changes).
     // Called on whichever thread learnt it, maybe with the connection's lock held: the sink must not wait or call the
     // client (the plugin's queues a task for the game's main thread).
     void OnVersion(std::function<void(std::uint16_t)> sink);
@@ -236,9 +249,16 @@ public:
         proto::DecodedRunOk ok;
         std::chrono::microseconds roundTrip{0};
         std::size_t bytesUp = 0;
+        // Version 3: per output asked by the request, the index of the past_X input whose next_X the server held and
+        // left out of the answer (ok.outputs then holds only the others, in order); -1 for an output answered. Empty
+        // when every output was answered.
+        std::vector<int> heldFrom;
+        std::uint8_t mode = 0;  // the mode of the run answered (proto::RunMode)
+        int replayed = 0;       // windows replayed first, after ERROR 8
     };
-    // Sends RUN for `model` (one SetModels listed) with request.requestId set here. Anything but Forwarded fills
-    // fallback; the caller records every run once, with RecordAnswered or RecordFallback.
+    // Sends RUN for `model` (one SetModels listed) with request.requestId set here (after a replay, reply.ok answers
+    // the last RUN sent, whose id is its own). Anything but Forwarded fills fallback; the caller records every run once,
+    // with RecordAnswered or RecordFallback.
     Outcome Run(const proto::ModelEntry& model, proto::RunRequest& request, Reply& reply, Fallback& fallback);
 
     // Each run counted once: the counters, the summary line at each 250 runs, and each fallback's log line (its model,
@@ -256,8 +276,8 @@ public:
     ProbeResult Probe(const Reason* fallback = nullptr);
 
     // A line fell back (`model` names it; empty for a model load or a runtime entry, which are no line). To a server
-    // that answered in version 2, a line is told by NOTICE on the main connection alone (its model, reason, detail and
-    // the lines since the last), at most one every kNoticeEvery. Anything else, a line to any other server, or a model
+    // that answered in version 2 or 3, a line is told by NOTICE on the main connection alone (its model, reason, detail
+    // and the lines since the last), at most one every kNoticeEvery. Anything else, a line to any other server, or a model
     // load's refusal or a runtime entry to every server, goes by the background thread's status check with the reason,
     // at once or, within kFallbackReportEvery of the last, when that has passed. NoServer has nowhere to go and is
     // ignored.
@@ -265,7 +285,7 @@ public:
     int FallbackReports() const;  // status checks sent for a fallback, for the tests
     int NoticesSent() const;      // for the tests
     int Searches() const;         // FIND rounds sent, for the tests
-    // The protocol version the server answered in (1 or 2), 0 while unknown; it applies to the current address.
+    // The protocol version the server answered in (1, 2 or 3), 0 while unknown; it applies to the current address.
     std::uint16_t ServerVersion() const;
 
     // The background thread: allowed by StartBackground, it starts once the settings are given (now, or at a later
@@ -281,6 +301,8 @@ public:
     int Reconnects() const;  // main connections opened
     int Pings() const;
     int SideLoadsInFlight() const noexcept;
+    int Replays() const;        // lines replayed after ERROR 8, finished or not
+    std::size_t LineBytes(const std::string& model) const;  // the window inputs kept for a model's line
 
 private:
     struct Listed {
@@ -291,6 +313,23 @@ private:
         proto::ModelEntry entry;
         std::uint8_t status = 0xFF;
         std::string detail;
+        std::uint8_t held = 0;  // version 3: the server keeps the model's line state
+    };
+    // The line in progress of a stateful model (version 3): how it began, and, when its state is held on the server,
+    // its windows' inputs (past_X left out) for a replay.
+    struct StoredTensor {
+        std::string name;
+        std::uint8_t dtype = 0;
+        std::vector<std::int64_t> dims;
+        std::vector<std::uint8_t> data;
+    };
+    struct Line {
+        // Ended: a held line whose run fell back. BFA ends a line at the NaN answer, and its own next_X are
+        // placeholders, so a continue of it can't be carried; it gets the NaN answer too.
+        enum class Kind { None, Carried, Held, Ended } kind = Kind::None;
+        bool full = false;  // longer than kLineWindows or kLineBytes: no longer kept, so it can't be replayed
+        std::size_t bytes = 0;
+        std::vector<std::vector<StoredTensor>> windows;
     };
     struct Snapshot;
     class SideLoad;
@@ -312,6 +351,15 @@ private:
     void EndPauseLocked(const std::string& why);
     void CloseLocked(const std::string& why) noexcept;
     void ScheduleNotReadyLocked();
+    std::uint32_t NextRequestLocked();
+    std::uint64_t StreamLocked(const std::string& model);
+    void KeepWindowLocked(Line& line, const proto::RunRequest& request, const proto::LineState& state);
+    // The line's earlier windows from a start, after ERROR 8, then `current` again, each with a request id of its own:
+    // the last one's answer in header and answer. False with failure and reason when an exchange failed (its id in
+    // sentId), or with failure None and reason when the replay can't finish (no window kept, or the deadline passed).
+    bool ReplayLocked(const Line& line, proto::RunRequest current, Clock::time_point deadline, proto::Header& header,
+                      std::vector<std::uint8_t>& answer, std::uint32_t& sentId, std::size_t& bytesUp, ExchangeFailure& failure,
+                      std::string& reason);
     Answered* FindAnsweredLocked(const proto::ModelEntry& model);
     bool ToldNotReadyLocked(const Answered& a);
     void AnsweredLocked(std::vector<Answered> fresh);
@@ -324,9 +372,10 @@ private:
     bool Search(const DiscoveryFactory& factory, int port, std::vector<Endpoint>& found, std::string& server, std::string& why);
     void MarkFoundStale();
     std::uint16_t VersionFor(const std::string& key) const;
-    void LearnVersion(const std::string& key, std::uint16_t version, const char* why = nullptr);
-    // A connection of its own to target, opened with HELLO in the server's version; on a version 1 server's ERROR 6 to
-    // a version 2 HELLO, once more in version 1.
+    // An older version learnt (ERROR 6 framed in it, or no frame back twice) is logged once, with why.
+    void LearnVersion(const std::string& key, std::uint16_t version, const std::string& why = {});
+    // A connection of its own to target, opened with HELLO in the server's version; on an older server's ERROR 6, again
+    // in the version it was framed in; on no frame back twice, in the version below.
     Opened OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes);
     bool SettingsPending() const;
     bool Detailed() const noexcept { return detailed_.load(); }
@@ -398,7 +447,7 @@ private:
     Settings settings_;
     std::uint64_t appliedGeneration_ = 0;
     std::unique_ptr<Transport> transport_;
-    std::uint16_t mainVersion_ = proto::kVersion2;  // the main connection's protocol version
+    std::uint16_t mainVersion_ = proto::kNewestVersion;  // the main connection's protocol version
     std::string mainKey_;                            // its server's, for the version rule
     bool mainFound_ = false;                         // its address was found on the local network
     bool mainAnswered_ = false;                      // its HELLO was answered, in mainVersion_
@@ -407,6 +456,10 @@ private:
     std::vector<Answered> answered_;    // the connection's last HELLO_OK
     bool helloCurrent_ = false;         // that HELLO listed exactly listed_
     std::vector<std::uint32_t> owed_;   // requests that timed out on this connection, their answers still to come
+    std::vector<std::pair<std::string, std::uint64_t>> streams_;  // version 3: the connection's stream per stateful model
+    std::uint64_t nextStream_ = 1;
+    std::vector<std::pair<std::string, Line>> lines_;  // by model: each stateful model's line in progress
+    int replays_ = 0;
     int timeoutsInARow_ = 0;
     std::uint64_t pauses_ = 0;          // pauses begun: an attempt begun before a pause doesn't end it
     Clock::time_point lastActivity_{};

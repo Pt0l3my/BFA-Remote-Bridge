@@ -4,8 +4,14 @@
 // later (a late answer, held by the script) arrive before the next frame's. Safe to share between threads.
 //
 // The versions, as a server keeps the rule: a connection's version is its first frame's, and the script's answers
-// (encoded in version 1) are framed in it. With `speaks` 1, a version 1 server: a first frame of version 2 gets ERROR
-// 6 framed in version 1, then the connection is closed. NOTICE is one-way: kept in `notices`, never answered.
+// (encoded in version 1) are framed in it. With `speaks` 1 or 2, an older server: a first frame of a newer version
+// gets ERROR 6 framed in the newest it speaks, then the connection is closed. NOTICE is one-way: kept in `notices`,
+// never answered.
+//
+// Version 3, as the agreement has it: the script keeps version 2's layouts. Its HELLO_OK rows get `held` (1 for the
+// models in `held`), and each version 3 RUN is recorded in `runs` (its stream, mode and names) and handed to the
+// script without its stream and mode. A RUN the agreement refuses as malformed (proto::HeldRunProblem, or a held mode
+// for a model marked held 0) is counted in `refused` and answered ERROR 1, and the connection closes.
 //
 // Each connect's timeout and each frame's deadline are recorded, per connection. With `timed` on, the transport keeps
 // time as a socket does: each answer arrives answerDelayMs after its frame (in order), and a receive waits for it until
@@ -19,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +50,20 @@ struct Connection {
     std::vector<Sent> sent;
 };
 
+// A version 3 RUN the server got.
+struct Run3 {
+    std::size_t connection = 0;  // the index of the connection it came on, in the order made
+    std::uint32_t id = 0;
+    std::uint64_t stream = 0;
+    std::uint8_t mode = 0;
+    std::string model;
+    std::vector<std::string> inputs;
+    std::vector<std::string> outputs;
+    std::int64_t pastFrames = -1;  // -1: none sent
+    std::size_t bytes = 0;         // the payload's
+    std::string problem;           // why the agreement refuses it, when it does
+};
+
 struct Script {
     // (type, payload) -> the bytes the server sends back
     std::function<std::vector<std::uint8_t>(std::uint16_t, const std::vector<std::uint8_t>&)> answer;
@@ -52,7 +73,7 @@ struct Script {
     std::atomic<bool> closeBeforeAnswer{false};  // the next frame finds the connection closed (an idle connection the server dropped)
     std::atomic<bool> resetBeforeAnswer{false};  // the next frame finds the connection reset
     std::atomic<bool> failSend{false};           // the next send fails outright
-    std::atomic<int> speaks{2};                  // the newest protocol version the server speaks
+    std::atomic<int> speaks{3};                  // the newest protocol version the server speaks
     std::atomic<bool> p6{false};                 // as PandorumLLM v3.97-p6: a newer version's HELLO reset, no frame back
     std::atomic<int> resetHellos{0};             // the next this many connections reset at their first frame
     std::atomic<int> connects{0};
@@ -65,6 +86,18 @@ struct Script {
     std::vector<int> connectTimeouts;                      // every connect tried, made or not
     std::vector<std::uint16_t> versions;                   // the version of each frame the server got
     std::vector<proto::Notice> notices;                    // each NOTICE the server got
+    std::set<std::string> held;                            // version 3: the models its HELLO_OK marks held 1
+    std::vector<Run3> runs;                                // each version 3 RUN the server got
+    std::atomic<int> refused{0};                           // version 3 RUNs the agreement refuses as malformed
+
+    std::vector<Run3> Runs() const {
+        std::lock_guard lock(mutex);
+        return runs;
+    }
+    void Hold(const std::string& model) {
+        std::lock_guard lock(mutex);
+        held.insert(model);
+    }
 
     std::vector<std::uint16_t> Versions() const {
         std::lock_guard lock(mutex);
@@ -143,7 +176,7 @@ public:
             std::uint16_t type = 0, version = 0;
             std::memcpy(&type, sent_.data() + 6, 2);
             std::memcpy(&version, sent_.data() + 4, 2);
-            const std::vector<std::uint8_t> payload(sent_.begin() + proto::kHeaderSize, sent_.begin() + proto::kHeaderSize + length);
+            std::vector<std::uint8_t> payload(sent_.begin() + proto::kHeaderSize, sent_.begin() + proto::kHeaderSize + length);
             sent_.erase(sent_.begin(), sent_.begin() + proto::kHeaderSize + length);
             {
                 std::lock_guard lock(script_->mutex);
@@ -166,13 +199,20 @@ public:
                     version_ = static_cast<std::uint16_t>(script_->speaks.load());
                     std::vector<std::uint8_t> p, f;
                     std::string err;
-                    proto::EncodeError({0, 6, "protocol version not supported"}, p, err);
+                    // a released version 2 panel's words (the agreement's)
+                    proto::EncodeError({0, 6, version_ == 2 ? "protocol version " + std::to_string(version) + " - this server speaks versions 1 and 2"
+                                                            : std::string("protocol version not supported")},
+                                       p, err);
                     proto::EncodeFrame(proto::MsgType::Error, p, f, err, version_);
                     pending_.insert(pending_.end(), f.begin(), f.end());
                     closing_ = true;
                     continue;
                 }
                 version_ = version;
+            }
+            if (version_ >= proto::kVersion3 && type == static_cast<std::uint16_t>(proto::MsgType::Run) && !Run3Checked(payload)) {
+                closing_ = true;  // ERROR 1, then the connection closes
+                continue;
             }
             if (type == static_cast<std::uint16_t>(proto::MsgType::Notice)) {  // one-way
                 proto::Notice n;
@@ -190,6 +230,23 @@ public:
                 if (back[at + 4] == 1 && back[at + 5] == 0) back[at + 4] = static_cast<std::uint8_t>(version_);
                 std::uint32_t n = 0;
                 std::memcpy(&n, back.data() + at + 8, 4);
+                if (version_ >= proto::kVersion3 && back[at + 6] == static_cast<std::uint8_t>(proto::MsgType::HelloOk) && back[at + 7] == 0) {
+                    // version 3's rows: held, for the models the script holds
+                    proto::HelloOk ok;
+                    std::vector<std::uint8_t> p, f;
+                    std::string err;
+                    if (proto::DecodeHelloOk(back.data() + at + proto::kHeaderSize, n, ok, err)) {
+                        {
+                            std::lock_guard lock(script_->mutex);
+                            for (auto& m : ok.models) m.held = script_->held.count(m.name) ? 1 : 0;
+                        }
+                        proto::EncodeHelloOk(ok, p, err, version_);
+                        proto::EncodeFrame(proto::MsgType::HelloOk, p, f, err, version_);
+                        back.erase(back.begin() + static_cast<std::ptrdiff_t>(at), back.begin() + static_cast<std::ptrdiff_t>(at + proto::kHeaderSize + n));
+                        back.insert(back.begin() + static_cast<std::ptrdiff_t>(at), f.begin(), f.end());
+                        n = static_cast<std::uint32_t>(p.size());
+                    }
+                }
                 at += proto::kHeaderSize + n;
             }
             if (!script_->timed) {
@@ -239,6 +296,56 @@ public:
     void Close() noexcept override { ++script_->closes; }
 
 private:
+    // A version 3 RUN: recorded, checked against the agreement's refusals, and made version 2's for the script. False
+    // when refused: ERROR 1 is on its way.
+    bool Run3Checked(std::vector<std::uint8_t>& payload) {
+        proto::DecodedRun d;
+        std::string err;
+        Run3 r;
+        r.connection = index_;
+        r.bytes = payload.size();
+        if (!proto::DecodeRun(payload.data(), payload.size(), d, err, proto::kVersion3)) {
+            r.problem = err;
+        } else {
+            r.id = d.requestId;
+            r.stream = d.stream;
+            r.mode = d.mode;
+            r.model = d.model;
+            std::vector<std::string_view> ins, outs;
+            std::int64_t frames = 0;
+            bool hasFrames = false;
+            for (const auto& t : d.inputs) {
+                r.inputs.push_back(t.name);
+                if (t.name == proto::kPastFrames && t.dtype == 7 && t.bytes == 8) {
+                    std::memcpy(&frames, payload.data() + t.offset, 8);
+                    hasFrames = true;
+                    r.pastFrames = frames;
+                }
+            }
+            for (const auto& o : d.outputs) r.outputs.push_back(o);
+            for (const auto& n : r.inputs) ins.push_back(n);
+            for (const auto& n : r.outputs) outs.push_back(n);
+            r.problem = proto::HeldRunProblem(d.mode, ins, outs, hasFrames ? &frames : nullptr);
+            std::lock_guard lock(script_->mutex);
+            if (r.problem.empty() && d.mode != 0 && !script_->held.count(d.model)) r.problem = "a held mode for a model marked held 0";
+        }
+        const bool refused = !r.problem.empty();
+        {
+            std::lock_guard lock(script_->mutex);
+            script_->runs.push_back(r);
+        }
+        if (refused) {
+            ++script_->refused;
+            std::vector<std::uint8_t> p, f;
+            proto::EncodeError({r.id, 1, r.problem}, p, err);
+            proto::EncodeFrame(proto::MsgType::Error, p, f, err, version_);
+            pending_.insert(pending_.end(), f.begin(), f.end());
+            return false;
+        }
+        payload.erase(payload.begin() + 4, payload.begin() + 13);  // version 2's layout, for the script
+        return true;
+    }
+
     std::shared_ptr<Script> script_;
     std::size_t index_ = static_cast<std::size_t>(-1);
     std::vector<std::uint8_t> sent_;
