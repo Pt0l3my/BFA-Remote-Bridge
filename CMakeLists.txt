@@ -10,10 +10,11 @@
 # Without BFARB_PYTHON (or with a python lacking those packages) the tests that need a real runtime and the reference
 # server are skipped. BFARB_BFA_MODELS=<folder holding BFA's performance.onnx and network_fp16.onnx>,
 # BFARB_BFA_DLL=<BFA 4.3.2's BetterFacialAnimations.dll>, BFARB_BFA5_DLL=<BFA 5.0.6's> and
-# BFARB_BFA5_EMOTION=<BFA 5.0.6's emotion_performance.onnx>, in the environment when the tests run, add BFA's own files
-# (never committed) to them.
+# BFARB_BFA5_EMOTION=<BFA 5.0.6's emotion_performance.onnx>, BFARB_BFA7_DLL=<BFA 7.0.0's BetterFacialAnimations.dll>,
+# BFARB_BFA7_PERFORMANCE=<BFA 7.0.0's performance.onnx> and BFARB_BFA7_ULTRA=<BFA 7.0.0's ultra-performance.onnx>, in the
+# environment when the tests run, add BFA's own files (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.5.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

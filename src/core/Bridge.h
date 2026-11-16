@@ -18,11 +18,11 @@
 // With the bridge, no BFA model runs on this PC: every model load is the server's or is refused.
 //
 //   CreateSession   never the real one. The model file is hashed (base name, size, SHA-256), its options' overrides
-//                   taken (none set, as BFA's CPU route sets none: for BFA 5.0.6, the sizes its GPU route sets,
-//                   core/BfaSizes.h), and the server asked (HELLO). Ready there: BFA gets a bridge session, a handle of the
-//                   bridge's own. Not, or no server found, or the settings not read yet: BFA gets an error
-//                   status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and lines
-//                   get the game's own lip sync.
+//                   taken (none set, as BFA's CPU route sets none: for BFA 5.0.6 and 7.0.0, the sizes its GPU route
+//                   sets, core/BfaSizes.h), and the server asked (HELLO). Ready there: BFA gets a bridge session, a
+//                   handle of the bridge's own. Not, or no server found, or the settings not read yet: BFA gets an
+//                   error status made by the real CreateStatus ("BFA Remote Bridge: ..."), so it has no model, and
+//                   lines get the game's own lip sync.
 //   Run             on a bridge session, always the server, BFA's warm-up run included. When the server doesn't answer
 //                   in full, the call still succeeds (a tensor in graphics memory aside, below), with each requested
 //                   output a one-element float tensor holding NaN: BFA checks every answer it reads back. For its
@@ -128,7 +128,7 @@ public:
     // no server address.
     void Apply(const Settings& settings);
     void ExpectSettings(bool skyrimNet);
-    // BFA 5.0.6's [General] Batch, the Legacy model's frames per run (core/BfaSizes.h); 2 until set.
+    // BFA 5.0.6's or 7.0.0's [General] Batch, the Legacy model's frames per run (core/BfaSizes.h); 2 until set.
     void SetBfaBatch(int batch) noexcept;
     Settings CurrentSettings() const;
     Client& Connection() noexcept { return client_; }

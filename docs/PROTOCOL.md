@@ -9,10 +9,11 @@ Bridges 1.0.0 to 1.2.0 speak version 1. Bridge 1.3.0 and later speak version 2, 
 (NOTICE, FIND and FOUND), and version 1 to a server that speaks only that (["Version 2"](#version-2) below). The
 agreement behind version 2 is [AGREEMENT-1.2.md](AGREEMENT-1.2.md), stage 2.
 
-## 1 Facts from Better Facial Animations 4.3.2 and 5.0.6
+## 1 Facts from Better Facial Animations 4.3.2, 5.0.6 and 7.0.0
 
 From BFA 4.3.2's and BFA 5.0.6's public source (GPL-3.0; read, never copied). What follows holds for both unless it
-says otherwise; [BFA 5.0.6](#bfa-506) below gives what changed.
+says otherwise; [BFA 5.0.6](#bfa-506) below gives what changed. BFA 7.0.0's source wasn't available: [BFA
+7.0.0](#bfa-700) gives what its 7.0.0.1 files show, its DLL's code included, and marks what is inferred from them.
 
 - BFA loads `onnxruntime.dll` (ONNX Runtime **1.24.4**, DirectML build, `ORT_API_VERSION` **24**) from its own folder,
   `SKSE/Plugins/BetterFacialAnimations/`, with `DirectML.dll` and `onnxruntime_providers_shared.dll` beside it. It
@@ -336,6 +337,74 @@ setting is empty.
   to the port FIND left from on the gaming PC; Windows' firewall lets a unicast answer to a broadcast through for a
   few seconds by default.
 
+### BFA 7.0.0
+
+From the files of BFA 7.0.0.1 (its DLL, INI, installer and model files, its README and its models' JSON files; read
+for facts, never copied). Its source wasn't available: what is read from its DLL's code says so, and what is inferred
+is marked so.
+
+- **The DLL.** It reports 7.0.0.1 in its `SKSEPlugin_Version` data (7.0.0.N, as with 5.0.6, and the bridge treats
+  every 7.0.0.N alike). It still imports `GetProcAddress` from KERNEL32 by name, loads `onnxruntime.dll` with
+  `LoadLibraryExW` and carries the string `OrtGetApiBase`, so the bridge attaches to it as to 5.0.6. It also exports
+  `BFA_QueryInterface`, its interface for other plugins that speak lines (its `BFA_API.h`).
+- **The runtime.** ONNX Runtime 1.24 (its DLL's file version 1.24.20260316.9.2d92497; the DLL carries the version
+  string 1.24.4, as BFA's README names it) and DirectML 1.15.4.
+- **The models.** Four facial models and two emotion models:
+
+  | File | BFA setting | What it is |
+  |---|---|---|
+  | `a2f3_fp16.onnx` | V3 | named by the DLL; the file wasn't among those read |
+  | `performance.onnx` | Performance (its default) | **a new model under the old name**: 22,359,897 parameters, 48,157,105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22 |
+  | `ultra-performance.onnx` | Ultra Performance | the original Performance model by BFA's README and its JSON (Thin120, 80,729 parameters; not compared with 5.0.6's file): 329,557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff; `mel` [batch, frames, 80] f32, `identity` [batch] int64, `emotion` [batch, frames, 10] f32 in, `normalized_motion` [batch, frames, 73] f32 out |
+  | `network_fp16.onnx` | Legacy (`UseOldModel=1`) | named by the DLL, sized by `[General] Batch`; the file wasn't among those read |
+  | `emotion_fp16.onnx` | Audio2Emotion Full | named by the DLL; the file wasn't among those read |
+  | `emotion_performance.onnx` | Audio2Emotion Performance | named by the DLL; BFA's `emotion_performance.json` gives 5.0.6's SHA-256; the file wasn't among those read |
+
+- **The new Performance model carries state.** Every dimension is fixed. In: `mel` [1, 120, 80] f32, `identity` [1]
+  int64, `emotion` [1, 120, 10] f32, `past_k` and `past_v` [6, 1, 4, 256, 152] f32, `past_frames` [1] int64. Out:
+  `normalized_motion` [1, 90, 73] f32, `next_k` and `next_v` [6, 1, 4, 256, 152] f32. By BFA's
+  `performance-model.json`, a line's runs pass each run's `next_k` and `next_v` into the next as `past_k` and
+  `past_v`, keeping the last 256 frames' keys and values, with `past_frames` the frames kept (at most 256, 90 more
+  each run) and none at each new line. So this model is **not stateless between calls**: its state travels in the
+  run's inputs and outputs, as V3's latents do, and the server still keeps nothing per line. A run moves `past_k` and
+  `past_v` in (933,888 floats, 3,735,552 bytes each) and `next_k` and `next_v` out, about 15.0 MB in all (15,011,704
+  bytes of tensor data) for 90 frames, 3 seconds at 30 frames a second, where V3's 30-frame window moves about 200 KB.
+- **The overrides (read from its DLL's code).** The DLL calls `AddFreeDimensionOverrideByName` in one place, its GPU
+  session builder, which applies a list of names and values that each model's caller gives it. The lists:
+  `ultra-performance.onnx` `batch` = 1 and `frames` = 124; `performance.onnx` `batch` = 1; both emotion models
+  `batch_size` = 1, `seq_len` = 60000 and `batch` = 1; `a2f3_fp16.onnx` its four `*_dynamic_axes_1` at 1;
+  `network_fp16.onnx` its two at `[General] Batch`. The frames of 124 are the window BFA feeds its Ultra Performance
+  model on either device (120 for its Performance model). The new `performance.onnx` has no free dimension, so its
+  `batch` names a dimension it lacks, as 5.0.6's Performance emotion model's list does.
+- **The mode keys.** `[General] ForceCPU` (1 the CPU for its facial models) and `[General] EmotionDevice` (-1 the CPU,
+  0 and up a graphics card by its DXGI number), as in 5.0.6; `GpuAdapter`, as in 5.0.6, picks the facial models'
+  graphics card. Its installer writes sixteen choice files in `BetterFacialAnimations/Installer/`: 5.0.6's fourteen,
+  and `FaceGraphFusion.ini` and `EmotionGraphFusion.ini` (`GraphFusion` and `EmotionGraphFusion` alone). `ForceCPU`
+  is only in `Startup.ini` (with `GpuAdapter`), `EmotionDevice` only in `EmotionDevice.ini`. The INI its installer
+  installs leaves `ForceCPU`, `GpuAdapter` and `EmotionDevice` commented out and holds `Batch=2`; the archive's own
+  INI, used without the installer, holds `ForceCPU=0`, `GpuAdapter=0` and `EmotionDevice=0`. Its README says the
+  installer's files are defaults and an explicit value in `BetterFacialAnimations.ini` wins. It ships SimpleIni's
+  licence. Read from its DLL's code: it builds the sixteen names in the order the bridge reads them (5.0.6's fourteen
+  in their order, then `FaceGraphFusion` and `EmotionGraphFusion`), loads `Installer\<name>.ini` first to last into
+  one SimpleIni object, then `BetterFacialAnimations.ini` last; a missing file is skipped, and any other error reading
+  one ends the load and keeps the settings BFA held. Its load reads the legacy `GPU` and `GpuAdapter` (at least 0),
+  then `[General] ForceCPU` with the legacy `GPU=0` as its default; a missing `EmotionDevice` is -1 with `ForceCPU`
+  on, else `GpuAdapter`, and the value read is kept at -1 or more: 5.0.6's rule. (Its INI's comment gives
+  `EmotionDevice`'s default as 0.)
+- **Live changes.** A model or processing device chosen in its menu applies during the game (a session made or
+  released then); `Prefetch` prepares a line's animation early, when its response is created.
+- **The scene check.** Its DLL still names SexLab.esm and OStim.esp and logs the scene factions it finds, and its
+  mouth-gear rule now names Devious Devices' keywords too. Its code calls `IsInFaction` through one wrapper, which
+  picks the virtual function at index 0xF9 (0xFB under VR) and jumps to it; the wrapper's only caller is the scene
+  function, which loops over the scene factions and then the mouth-gear keywords, and is called from six places, as
+  in 5.0.6.3. The call returns into BFA's own image, so the bridge's scene answer applies as for 5.0.6; not yet seen
+  in game.
+- **Other games.** It also runs on Skyrim VR 1.4.15 and Skyrim 1.7.99 and 1.7.104. The bridge refuses VR, and hasn't
+  been tried on 1.7.x.
+- **SkyrimNet 1.2.0** (from its DLL's strings) has a setting, `facialAnimation.betterFacialAnimations`, that hands
+  its voiced lines to BFA through `BFA_QueryInterface` when BFA offers it, its own lip sync covering what BFA declines
+  or hasn't started yet. The lines BFA takes run through BFA's models, so through the bridge.
+
 ## 3 What the bridge does
 
 The bridge takes BFA's model inference over completely: no model runs on the gaming PC, on its graphics card or its
@@ -382,11 +451,11 @@ PandorumLLM's choice; the bridge reports it.
 - **A model load** (`CreateSession`) never reaches the real runtime. The bridge hashes the
   model file (base name, size, SHA-256), takes the overrides BFA set on the options, and sends HELLO with that model
   alone on a **side connection** of its own (3000 ms to connect, 60 seconds for the answer), closed after the answer.
-  - **The client-listed sizes (BFA 5.0.6).** When BFA set no overrides (its CPU route) and BFA is 5.0.6 (5.0.6 or
-    5.0.6.N, from its DLL: every 5.0.6.N gets them, by file name alone), the bridge lists the ones BFA 5.0.6's GPU
-    route sets, by file name, in BFA's order (`src/core/BfaSizes.h`); the log line says so, and gives the file's
-    SHA-256. BFA 4.3.2.3's HELLO lists none, as before (the sizes rule fills them
-    in), and a HELLO for which BFA set overrides (its GPU route) carries BFA's own.
+  - **The client-listed sizes (BFA 5.0.6 and 7.0.0).** When BFA set no overrides (its CPU route) and BFA is 5.0.6
+    (5.0.6 or 5.0.6.N, from its DLL: every 5.0.6.N gets them, by file name alone) or 7.0.0 (likewise every 7.0.0.N),
+    the bridge lists the ones that version's GPU route sets, by file name, in BFA's order, from a table per version
+    (`src/core/BfaSizes.h`); the log line says so, and gives the file's SHA-256. BFA 4.3.2.3's HELLO lists none, as
+    before (the sizes rule fills them in), and a HELLO for which BFA set overrides (its GPU route) carries BFA's own.
 
     | File | Overrides the bridge lists for BFA 5.0.6 |
     |---|---|
@@ -395,6 +464,23 @@ PandorumLLM's choice; the bridge reports it.
     | `performance.onnx` | `batch` = 1 |
     | `emotion_fp16.onnx` | `batch_size` = 1, `seq_len` = 60000, `batch` = 1 |
     | `emotion_performance.onnx` | `batch_size` = 1, `seq_len` = 60000, `batch` = 1 |
+
+    BFA 7.0.0's table is read from its DLL's code (its session builder's lists), its source not being available
+    ([BFA 7.0.0](#bfa-700)):
+
+    | File | Overrides the bridge lists for BFA 7.0.0 |
+    |---|---|
+    | `a2f3_fp16.onnx` | as for 5.0.6 |
+    | `network_fp16.onnx` | as for 5.0.6 (BFA's `[General] Batch`, read at start-up through 7.0.0's layers) |
+    | `performance.onnx` (the new model) | `batch` = 1, as BFA sets it (every dimension is fixed in the model) |
+    | `ultra-performance.onnx` | `batch` = 1, `frames` = 124 |
+    | `emotion_fp16.onnx` | as for 5.0.6 |
+    | `emotion_performance.onnx` | as for 5.0.6 |
+
+    The new `performance.onnx`'s run carries its line's state both ways (`past_k` and `past_v` in, `next_k` and
+    `next_v` out): 15,011,704 bytes of tensor data in all, about 7.5 MB each way, under the 64 MiB payload limit, and,
+    like any run, bound by the run's one 1000 ms deadline. The bridge forwards them as any other inputs and outputs;
+    tested byte for byte against a local run, a second run fed the first's state included (`tests/ForwardTests.cpp`).
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
     PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
     if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
@@ -502,20 +588,25 @@ PandorumLLM's choice; the bridge reports it.
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
   no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge asks the
   player nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. It sets
-  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3
-  and BFA 5.0.6 alone (the version the client string reports), it writes BFA's CPU mode under `[General]` in
+  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3, 5.0.6
+  and 7.0.0 alone (the version the client string reports), it writes BFA's CPU mode under `[General]` in
   `Data\SKSE\Plugins\BetterFacialAnimations.ini`, noting in its own `BFARemoteBridge.ini` (`[BfaMode]`) how to put
   it back, and writes it again at each game save (SKSE's save message), so a save of BFA's menu before that game save
   doesn't undo it (one after the last game save of a session is what BFA loads at the next start); BFA reads the file
   at its start, so it applies from the next start.
-  - BFA 4.3.2.3: `ForceCPU=1` when it was 0 (noted as `ForceCPUSetByBridge=1`).
-  - BFA 5.0.6: `ForceCPU=1` when it was 0 and `EmotionDevice=-1` when it was a graphics card, each read as BFA 5 reads
-    it (its SimpleIni's rules: a leading UTF-8 byte-order mark skipped, the last value winning, quotes kept), through
-    its installer's choice files and its own INI, and written in its own INI, which wins. The notes:
+  - BFA 4.3.2.3: `ForceCPU=1` when it was 0 (noted as `ForceCPUSetByBridge=1`; a missing `ForceCPU` reads as 0 there,
+    unless the INI holds the legacy `GPU=0`, so this BFA's note is never `added`, and its put-back writes `ForceCPU=0`).
+  - BFA 5.0.6 and 7.0.0 (both keys): `ForceCPU=1` when it was 0 and `EmotionDevice=-1` when it was a graphics card,
+    each read as BFA 5 reads it (its SimpleIni's rules: a leading UTF-8 byte-order mark skipped, the last value
+    winning, quotes kept), through its installer's choice files and its own INI, and written in its own INI, which
+    wins. The notes:
     `ForceCPUSetByBridge=1` and `EmotionDeviceSetByBridge=N` (N the card's number) when BFA's own INI held the key, or
     `added` when it held none, which the installer's files then decided. A card picked in BFA's menu since replaces N.
     Writes go through Windows' profile calls, each read back as BFA 5 reads the file. `IndependentGpuDevice` is never
-    written.
+    written. BFA 7.0.0 is read through its sixteen choice files in its DLL's order (5.0.6's fourteen in their order,
+    then `FaceGraphFusion` and `EmotionGraphFusion`), and its keys as 5.0.6 reads them, a missing `EmotionDevice`
+    included; its `GpuAdapter`, `GraphFusion` and `EmotionGraphFusion` are never written. The two versions share the
+    notes, which mean the same under either.
   - A server that answers only in version 1, or another BFA version (once the bridge attaches to it and a server
     answers: the put-back runs at an answer), gets each value put back: ForceCPU 0 and EmotionDevice N written back,
     or a key noted `added` removed, so BFA's installer choice applies again. Only when the bridge's note reads as
@@ -523,12 +614,12 @@ PandorumLLM's choice; the bridge reports it.
     put back. BFA's menu, saved later in that session, writes back what BFA loaded (the bridge's values), so each game
     save of that session puts them back again, and the notes stay until a game start finds BFA's own INI without the
     bridge's value (BFA has then loaded what was put back, or the player's own). A start without BFA's INI leaves the
-    notes; the EmotionDevice note is cleared only at a start of BFA 5.0.6 and left alone by BFA 4.3.2.3's put-back.
-    BFA's INI there but unreadable at that moment: nothing is cleared or written, logged once.
+    notes; the EmotionDevice note is cleared only at a start of BFA 5.0.6 or 7.0.0 and left alone by any BFA 4's
+    put-back. BFA's INI there but unreadable at that moment: nothing is cleared or written, logged once.
   - It never creates BFA's INI. Logged once, at info level; no setting, no note. BFA's CPU route sets no
     free-dimension overrides; for BFA 4.3.2.3 its HELLO then lists none, and the server fills in BFA 4.3.2.3's sizes
-    for V3 and its emotion model (the sizes rule, ["Version 2"](#version-2)); for BFA 5.0.6 the bridge lists them
-    (above).
+    for V3 and its emotion model (the sizes rule, ["Version 2"](#version-2)); for BFA 5.0.6 and 7.0.0 the bridge lists
+    them (above).
 - **The monitor** (`src/core/Monitor.h`) shows what the server does, from each model load's HELLO_OK and each
   HELLO_OK on the main connection: one line per model with its card, server and state, when it changes and at each
   game load (ready lines only while Status on load allows them), a model load the server refuses included, with its
