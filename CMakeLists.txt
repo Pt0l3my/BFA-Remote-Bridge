@@ -14,7 +14,7 @@
 # BFARB_BFA7_PERFORMANCE=<BFA 7.0.0's performance.onnx> and BFARB_BFA7_ULTRA=<BFA 7.0.0's ultra-performance.onnx>, in the
 # environment when the tests run, add BFA's own files (never committed) to them.
 cmake_minimum_required(VERSION 3.21)
-project(BFARemoteBridge VERSION 1.5.0 LANGUAGES CXX)
+project(BFARemoteBridge VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
