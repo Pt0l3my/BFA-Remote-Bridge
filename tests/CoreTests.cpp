@@ -1176,7 +1176,7 @@ TEST(BfaModeKeepsBfa5sRecordUnder4323) {
 
 // Another BFA version (or one unknown): its mode is left as it is, and a value the bridge set earlier is put back.
 TEST(BfaModeOnlyForBfa4323) {
-    for (const char* other : {"4.3.2.2", "4.4.0", ""}) {
+    for (const char* other : {"4.3.2.2", "4.4.0", "6.0.0", ""}) {
         ModeRig r(other);
         r.mode.OnServerVersion(2);
         r.mode.OnGameSave();
@@ -1184,6 +1184,7 @@ TEST(BfaModeOnlyForBfa4323) {
         CHECK_EQ(r.ini->iniWrites + r.ini->recordWrites, 0);
         CHECK_EQ(r.Logged("BFA's mode is left as it is: this is Better Facial Animations"), 1);
         CHECK_EQ(r.Logged(", the versions it is made for"), 1);
+        CHECK_EQ(r.Logged("sets BFA's CPU mode only for 4.3.2.3, 5.0.6 and 7.0.0, the versions it is made for"), 1);
     }
     // set under 4.3.2.3, then BFA updated: put back
     ModeRig r;
@@ -1776,9 +1777,9 @@ TEST(Bfa700ModeStartClearsTheEmotionDeviceRecord) {
 }
 
 // BFA 7.0.0's layers: each of its sixteen choice files is read, its own INI wins over them, and BFA 5.0.6 reads its
-// fourteen alone. A missing EmotionDevice is graphics card 0 under 7.0.0, whatever ForceCPU and GpuAdapter say (its
-// files' default), where 5.0.6 follows them; so with the facial model on the CPU and no EmotionDevice anywhere, the
-// bridge sets EmotionDevice=-1 for 7.0.0 and not for 5.0.6. Batch through the layers as 5.0.6's.
+// fourteen alone. A missing EmotionDevice follows ForceCPU or GpuAdapter under 7.0.0 as under 5.0.6 (7.0.0's DLL);
+// so with the facial model on the CPU and no EmotionDevice anywhere, the bridge writes nothing under either. Batch
+// through the layers as 5.0.6's.
 TEST(Bfa700ModeReadsSixteenLayers) {
     for (const char* choice : kBfa700InstallerChoices) {
         auto ini = std::make_shared<FakeIni>();
@@ -1804,12 +1805,12 @@ TEST(Bfa700ModeReadsSixteenLayers) {
     };
     using P = std::pair<int, long>;
     CHECK(devices("7.0.0.1", [](FakeIni&) {}) == P(0, 0));
-    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, -1));
     CHECK(devices("5.0.6.3", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); }) == P(1, -1));
-    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 3));
     CHECK(devices("5.0.6.3", [](FakeIni& i) { i.Set("Startup", "GpuAdapter", "3"); }) == P(0, 3));
     CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "EmotionDevice", "x"); }) == P(0, 0));
-    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "GPU", "0"); }) == P(1, 0));
+    CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "GPU", "0"); }) == P(1, -1));
     CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("Startup", "ForceCPU", "1"); i.Set("EmotionDevice", "EmotionDevice", "-1"); }) == P(1, -1));
     CHECK(devices("7.0.0.1", [](FakeIni& i) { i.Set("", "EmotionDevice", "-7"); }) == P(0, -1));
     // the mode: the facial model on the CPU by the installer, EmotionDevice nowhere
@@ -1817,11 +1818,7 @@ TEST(Bfa700ModeReadsSixteenLayers) {
     seven.ini->Set("Startup", "ForceCPU", "1");
     seven.ini->values.erase("EmotionDevice/General/EmotionDevice");
     seven.mode.OnServerVersion(2);
-    CHECK(!seven.ini->SetByBridge());
-    CHECK_EQ(seven.ini->Own("EmotionDevice"), std::string("-1"));
-    CHECK_EQ(seven.ini->Record(kEmotionDeviceRecord), std::string("added"));
-    seven.mode.OnServerVersion(1);
-    CHECK_EQ(seven.ini->Own("EmotionDevice"), std::string("(absent)"));
+    CHECK_EQ(seven.ini->iniWrites + seven.ini->recordWrites, 0);
     Mode5Rig five;
     five.ini->Set("Startup", "ForceCPU", "1");
     five.ini->values.erase("EmotionDevice/General/EmotionDevice");
@@ -1933,9 +1930,9 @@ TEST(Bfa506GpuRouteSizes) {
     }
 }
 
-// BFA 7.0.0's table, inferred from its models and its DLL's dimension names: V3, Legacy and both emotion models as
-// 5.0.6's; ultra-performance.onnx (5.0.6's Thin120 under a new name) its batch at 1; the new performance.onnx, whose
-// every dimension is fixed, nothing. 5.0.6's table is unchanged, and has no ultra-performance.onnx.
+// BFA 7.0.0's table, read from its DLL's code: V3, Legacy and both emotion models as 5.0.6's; ultra-performance.onnx
+// its batch at 1 and its frames at 124; the new performance.onnx, whose every dimension is fixed, its batch at 1, as
+// BFA sets it. 5.0.6's table is unchanged, and has no ultra-performance.onnx.
 TEST(Bfa700GpuRouteSizes) {
     const auto sizes = [](const std::string& bfa, const std::string& file, int batch = 2) {
         std::string s;
@@ -1949,8 +1946,8 @@ TEST(Bfa700GpuRouteSizes) {
         CHECK_EQ(sizes(v, "network_fp16.onnx"), std::string("input_dynamic_axes_1=2,emotion_dynamic_axes_1=2"));
         CHECK_EQ(sizes(v, "network_fp16.onnx", 5), std::string("input_dynamic_axes_1=5,emotion_dynamic_axes_1=5"));
         CHECK_EQ(sizes(v, "network_fp16.onnx", 0), std::string("input_dynamic_axes_1=1,emotion_dynamic_axes_1=1"));
-        CHECK_EQ(sizes(v, "ultra-performance.onnx"), std::string("batch=1"));
-        CHECK_EQ(sizes(v, "performance.onnx"), std::string());
+        CHECK_EQ(sizes(v, "ultra-performance.onnx"), std::string("batch=1,frames=124"));
+        CHECK_EQ(sizes(v, "performance.onnx"), std::string("batch=1"));
         CHECK_EQ(sizes(v, "emotion_fp16.onnx"), std::string("batch_size=1,seq_len=60000,batch=1"));
         CHECK_EQ(sizes(v, "emotion_performance.onnx"), std::string("batch_size=1,seq_len=60000,batch=1"));
         CHECK_EQ(sizes(v, "Ultra-Performance.onnx"), std::string());  // BFA's names, exactly

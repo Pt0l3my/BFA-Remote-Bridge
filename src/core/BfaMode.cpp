@@ -107,13 +107,9 @@ int Bfa5Batch(IniStore& store, const std::string& version) {
 // As BFA 5.0.6's LoadIni: ForceCPU over the legacy GPU=0; EmotionDevice over -1 (with ForceCPU) or GpuAdapter, at
 // least 0. The defaults' keys are read only when needed.
 //
-// BFA 7.0.0 (its source wasn't read, so this is inferred from its files): ForceCPU and the legacy GPU=0 are taken as
-// 5.0.6 reads them. A missing EmotionDevice is taken as graphics card 0 whatever ForceCPU and GpuAdapter say: its
-// INI's comment gives EmotionDevice's default as 0, independent of Audio2Face, and its README has each model default
-// to GPU 0 and keep its own device choice. Its installer always writes EmotionDevice (Installer\EmotionDevice.ini), so
-// this counts only where the key is missing or not a number everywhere. Taking the card is the safe side: should BFA
-// 7.0.0 in fact take the CPU there, the bridge's EmotionDevice=-1 changes nothing BFA does, and its put-back removes
-// it again; taking the CPU where BFA takes the card would leave Audio2Emotion's device as it is.
+// BFA 7.0.0 the same, by its DLL's code (7.0.0.1's, its source not being available): its load reads the legacy GPU
+// and GpuAdapter (at least 0), then [General] ForceCPU with the legacy GPU=0 as its default; EmotionDevice's default
+// is then -1 with ForceCPU on, else GpuAdapter, and the value read is kept at -1 or more.
 Bfa5Devices ReadBfa5Devices(IniStore& store, const std::string& version) {
     const InstallerChoices choices = InstallerChoicesFor(version);
     Bfa5Devices d;
@@ -122,9 +118,7 @@ Bfa5Devices ReadBfa5Devices(IniStore& store, const std::string& version) {
     d.forceCpu = forceCpu ? (*forceCpu != 0 ? 1 : 0) : (legacyCpu ? 1 : 0);
     const auto emotion = Bfa5Number(Bfa5Value(store, choices, "General", "EmotionDevice"));
     long fallback = -1;
-    if (IsBfa700(version))
-        fallback = 0;
-    else if (!d.forceCpu && !emotion)
+    if (!d.forceCpu && !emotion)
         fallback = std::max(0L, Bfa5Long(Bfa5Value(store, choices, "General", "GpuAdapter"), 0));
     d.emotionDevice = std::max(-1L, emotion.value_or(fallback));
     return d;

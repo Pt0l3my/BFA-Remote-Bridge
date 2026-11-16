@@ -31,14 +31,15 @@ const std::vector<FileSizes>& Bfa506() {
     return table;
 }
 
-// BFA 7.0.0's GPU route, inferred from its models and its DLL's dimension names, its source not read (see BfaSizes.h).
-// performance.onnx, a new model with every dimension fixed, gets none, so it isn't listed.
+// BFA 7.0.0's GPU route, read from its DLL's code (its session builder's lists), its source not being available (see
+// BfaSizes.h). performance.onnx, whose every dimension is fixed, is listed as BFA sets it, as 5.0.6's emotion lists are.
 const std::vector<FileSizes>& Bfa700() {
     static const std::vector<FileSizes> table = {
         {"a2f3_fp16.onnx",
          {{"window_dynamic_axes_1", 1}, {"identity_dynamic_axes_1", 1}, {"emotion_dynamic_axes_1", 1}, {"input_latents_dynamic_axes_1", 1}}},
         {"network_fp16.onnx", {{"input_dynamic_axes_1", kBatchSetting}, {"emotion_dynamic_axes_1", kBatchSetting}}},
-        {"ultra-performance.onnx", {{"batch", 1}}},
+        {"performance.onnx", {{"batch", 1}}},
+        {"ultra-performance.onnx", {{"batch", 1}, {"frames", 124}}},
         {"emotion_fp16.onnx", {{"batch_size", 1}, {"seq_len", 60000}, {"batch", 1}}},
         {"emotion_performance.onnx", {{"batch_size", 1}, {"seq_len", 60000}, {"batch", 1}}},
     };

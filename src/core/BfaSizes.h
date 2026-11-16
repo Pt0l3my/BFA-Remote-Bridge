@@ -17,15 +17,19 @@
 // was also checked against the lists 5.0.6.3's own DLL builds, and applies to every 5.0.6.N by file name alone (the
 // SHA-256 is logged, never compared): a later 5.0.6 build with other shapes would see the server's shape check fail.
 //
-// BFA 7.0.0's table is INFERRED, not read from its source (which wasn't read): from its models' shapes, read from the
-// files of 7.0.0.1, and from the dimension names its DLL carries, the same as 5.0.6.3's (window_dynamic_axes_1,
-// identity_dynamic_axes_1, emotion_dynamic_axes_1, input_latents_dynamic_axes_1, input_dynamic_axes_1, batch_size,
-// seq_len and batch). It ships a2f3_fp16.onnx, network_fp16.onnx, emotion_fp16.onnx and emotion_performance.onnx as
-// 5.0.6 does, and the bridge lists theirs as for 5.0.6. Its ultra-performance.onnx is 5.0.6's performance.onnx under a
-// new name (Thin120, the same free dimensions), so it gets the batch at 1 that 5.0.6 set on that model. Its
-// performance.onnx is a new model whose every dimension is fixed (mel [1, 120, 80], identity [1], emotion [1, 120, 10],
-// past_k and past_v [6, 1, 4, 256, 152], past_frames [1]), so the bridge lists nothing for it: an override could only
-// name a dimension it lacks. By file name alone, as for 5.0.6, for every 7.0.0.N.
+// BFA 7.0.0's table is read from its DLL's code (7.0.0.1's), its source not being available: the DLL calls
+// AddFreeDimensionOverrideByName in one place, its GPU session builder, which applies a list of names and values that
+// each model's caller gives it. The callers set: ultra-performance.onnx batch 1 and frames 124; performance.onnx
+// batch 1; both emotion models batch_size 1, seq_len 60000 and batch 1; a2f3_fp16.onnx window_dynamic_axes_1,
+// identity_dynamic_axes_1, emotion_dynamic_axes_1 and input_latents_dynamic_axes_1 at 1; network_fp16.onnx
+// input_dynamic_axes_1 and emotion_dynamic_axes_1 at BFA's Batch setting. Its frames of 124 match the window BFA feeds
+// its Ultra Performance model (124 frames, 120 for its Performance model, on either device). Its performance.onnx fixes
+// every dimension (mel [1, 120, 80], identity [1], emotion [1, 120, 10], past_k and past_v [6, 1, 4, 256, 152],
+// past_frames [1]), so its batch names a dimension it lacks; the bridge lists it as BFA sets it, as it lists 5.0.6's
+// emotion models'. Its ultra-performance.onnx has 5.0.6's Thin120 inputs (mel [batch, frames, 80], identity [batch],
+// emotion [batch, frames, 10]). a2f3_fp16.onnx, network_fp16.onnx, emotion_fp16.onnx and emotion_performance.onnx
+// weren't among the files read: the DLL names them, and the lists above are its lists for them. By file name alone,
+// as for 5.0.6, for every 7.0.0.N.
 #include <string>
 #include <vector>
 
@@ -33,9 +37,9 @@
 
 namespace bfarb {
 
-// The overrides BFA's GPU route sets on file's session in that BFA version, in BFA's order (5.0.6's, and 7.0.0's as
-// inferred above); empty when the bridge lists none for it (another version, 4.3.2.3 among them, another file, or
-// 7.0.0's performance.onnx). batch: BFA's [General] Batch.
+// The overrides BFA's GPU route sets on file's session in that BFA version, in BFA's order (5.0.6's and 7.0.0's);
+// empty when the bridge lists none for it (another version, 4.3.2.3 among them, or another file). batch: BFA's
+// [General] Batch.
 std::vector<proto::Override> GpuRouteSizes(const std::string& bfaVersion, const std::string& file, int batch);
 
 // Whether the bridge lists sizes for that BFA version: 5.0.6 or 7.0.0 (any build).

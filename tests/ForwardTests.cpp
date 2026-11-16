@@ -1647,8 +1647,9 @@ TEST(ForwardBfa506PerformanceEmotion) {
 
 // ---- BFA 7.0.0 (1.6.0)
 
-// BFA 7.0.0 in its CPU mode: the bridge lists its table's sizes (core/BfaSizes.h, inferred), so ultra-performance.onnx
-// gets its batch at 1 and the new performance.onnx none, and the HELLO says so on the wire.
+// BFA 7.0.0 in its CPU mode: the bridge lists its table's sizes (core/BfaSizes.h, read from its DLL), so
+// ultra-performance.onnx gets its batch at 1 and its frames at 124, and the new performance.onnx its batch at 1, and the
+// HELLO says so on the wire.
 TEST(ForwardBfa700ListsItsGpuSizes) {
     Need();
     const fs::path dir = TempFolder("bfa700");
@@ -1668,27 +1669,24 @@ TEST(ForwardBfa700ListsItsGpuSizes) {
             CHECK(h.bridge.IsBridgeSession(s));
             sessions.push_back(s);
         }
-        CHECK_EQ(h.CountLogged("(BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"), 5);
-        CHECK(h.Logged(", overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge)"));
+        CHECK_EQ(h.CountLogged("(BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"), 6);
+        CHECK_EQ(h.CountLogged(", overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge)"), 1);  // performance.onnx
+        CHECK(h.Logged(", overrides batch = 1, frames = 124 (BFA 7.0.0.1's GPU sizes, listed by the bridge)"));
         CHECK(h.Logged(", overrides input_dynamic_axes_1 = 3, emotion_dynamic_axes_1 = 3 (BFA 7.0.0.1's"));
-        CHECK_EQ(h.CountLogged(", no overrides; asking the server"), 1);  // performance.onnx
-        // the tiny model's batch of 2: free under performance.onnx's (none listed), fixed at 1 under ultra-performance's
+        CHECK_EQ(h.CountLogged(", no overrides; asking the server"), 0);
+        // the tiny model's batch of 2: free under a2f3's list (none of its names), fixed at 1 under performance.onnx's
+        // and ultra-performance's (the tiny model has no frames)
         TinyInputs in(h.api, h.cpu, 7);
-        {
+        for (int k : {0, 2, 3}) {
             Outputs out(h.api, 5);
-            Ok(h.api->Run(sessions[2], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
-            CHECK(!IsNanAnswer(h.api, out.v[0]));
-        }
-        {
-            Outputs out(h.api, 5);
-            Ok(h.api->Run(sessions[3], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
-            CHECK(IsNanAnswer(h.api, out.v[0]));
+            Ok(h.api->Run(sessions[k], nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
+            CHECK_EQ(IsNanAnswer(h.api, out.v[0]), k != 0);
         }
         for (OrtSession* s : sessions) h.api->ReleaseSession(s);
     }
     const auto seven = HelloLines(hellos);
-    CHECK(CountWith(seven, "{\"name\": \"performance.onnx\", \"overrides\": []}") >= 1);
-    CHECK(CountWith(seven, "{\"name\": \"ultra-performance.onnx\", \"overrides\": [[\"batch\", 1]]}") >= 1);
+    CHECK(CountWith(seven, "{\"name\": \"performance.onnx\", \"overrides\": [[\"batch\", 1]]}") >= 1);
+    CHECK(CountWith(seven, "{\"name\": \"ultra-performance.onnx\", \"overrides\": [[\"batch\", 1], [\"frames\", 124]]}") >= 1);
     CHECK(CountWith(seven, "{\"name\": \"network_fp16.onnx\", \"overrides\": [[\"input_dynamic_axes_1\", 3], [\"emotion_dynamic_axes_1\", 3]]}") >= 1);
     CHECK(CountWith(seven, "{\"name\": \"emotion_performance.onnx\", \"overrides\": [[\"batch_size\", 1], [\"seq_len\", 60000], [\"batch\", 1]]}") >= 1);
     CHECK_EQ(CountWith(seven, "BFA 7.0.0.1"), static_cast<int>(seven.size()));  // the client string reports it
@@ -1713,7 +1711,7 @@ OrtValue* LongTensor(Harness& h, std::int64_t& value) {
 }  // namespace
 
 // BFA 7.0.0's new Performance model (never committed): BFARB_BFA7_PERFORMANCE names its performance.onnx. Every
-// dimension is fixed, so the bridge lists no sizes. Each run carries its line's state: past_k and past_v in, next_k and
+// dimension is fixed; the bridge lists its batch at 1 as BFA sets it, a dimension the model lacks. Each run carries its line's state: past_k and past_v in, next_k and
 // next_v out ([6, 1, 4, 256, 152] float each, 3,735,552 bytes). A first run from an empty state and a second fed the
 // first's next_k and next_v (90 frames kept, as BFA's JSON describes) answer through the bridge exactly as local runs
 // do, byte for byte, so the state round-trips through the bridge unchanged. The run's wall time on loopback is logged.
@@ -1732,9 +1730,8 @@ TEST(ForwardBfa700Performance) {
     const auto t0 = Clock::now();
     Ok(h.Create(dir / "performance.onnx", {}, &session));
     const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-    CHECK(h.Logged("Model performance.onnx: 48157105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22, no "
-                   "overrides; asking the server"));
-    CHECK(!h.Logged("listed by the bridge"));
+    CHECK(h.Logged("Model performance.onnx: 48157105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22, "
+                   "overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"));
 
     constexpr std::size_t kState = 6 * 1 * 4 * 256 * 152;  // 933,888 floats
     const std::vector<std::int64_t> stateShape = {6, 1, 4, 256, 152};
@@ -1765,7 +1762,7 @@ TEST(ForwardBfa700Performance) {
         CHECK(kDims == stateShape);
         CHECK(vDims == stateShape);
         CHECK_EQ(nextK.size(), kState * 4);
-        const auto local = LocalRun(dir / "performance.onnx", {}, in, values, out, 3, 1);
+        const auto local = LocalRun(dir / "performance.onnx", {{"batch", 1}}, in, values, out, 3, 1);
         CHECK(motion == local[0]);
         CHECK(nextK == local[1]);
         CHECK(nextV == local[2]);
@@ -1784,8 +1781,9 @@ TEST(ForwardBfa700Performance) {
     fs::remove_all(dir);
 }
 
-// BFA 7.0.0's Ultra Performance model (never committed): BFARB_BFA7_ULTRA names its ultra-performance.onnx, 5.0.6's
-// Thin120 under a new name. The bridge lists its batch at 1, and it answers as a local run with that size does.
+// BFA 7.0.0's Ultra Performance model (never committed): BFARB_BFA7_ULTRA names its ultra-performance.onnx (Thin120).
+// The bridge lists its batch at 1 and its frames at 124, as BFA sets them; fed BFA's window of 124 frames, it answers
+// as a local run with those sizes does.
 TEST(ForwardBfa700UltraPerformance) {
     Need();
     const fs::path model = Env("BFARB_BFA7_ULTRA");
@@ -1798,10 +1796,10 @@ TEST(ForwardBfa700UltraPerformance) {
     OrtSession* session = nullptr;
     Ok(h.Create(dir / "ultra-performance.onnx", {}, &session));
     CHECK(h.Logged("Model ultra-performance.onnx: 329557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff, "
-                   "overrides batch = 1 (BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"));
+                   "overrides batch = 1, frames = 124 (BFA 7.0.0.1's GPU sizes, listed by the bridge); asking the server"));
     std::mt19937 rng(29);
     std::normal_distribution<float> n(0.f, 1.f);
-    const int frames = 124;  // any length: the model's frames are free
+    const int frames = 124;  // BFA's window for this model, the frames it sets
     for (int call = 0; call < 3; ++call) {
         std::vector<float> mel(frames * 80), emo(frames * 10);
         for (auto& v : mel) v = call ? n(rng) : 0.f;
@@ -1815,11 +1813,11 @@ TEST(ForwardBfa700UltraPerformance) {
         std::vector<std::int64_t> dims;
         const auto got = Bytes(h.api, o.v[0], &dims);
         CHECK(dims == (std::vector<std::int64_t>{1, frames, 73}));
-        const auto local = LocalRun(dir / "ultra-performance.onnx", {{"batch", 1}}, in, values, out, 1, 1);
+        const auto local = LocalRun(dir / "ultra-performance.onnx", {{"batch", 1}, {"frames", 124}}, in, values, out, 1, 1);
         CHECK(got == local[0]);
         for (auto* v : values) h.api->ReleaseValue(v);
     }
-    std::printf("        ultra-performance.onnx (7.0.0): served with batch 1, 3 runs answered as a local run\n");
+    std::printf("        ultra-performance.onnx (7.0.0): served with batch 1 and frames 124, 3 runs answered as a local run\n");
     h.api->ReleaseSession(session);
     fs::remove_all(dir);
 }

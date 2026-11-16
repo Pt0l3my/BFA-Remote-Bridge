@@ -24,17 +24,18 @@
 // menu saves (its SaveIni) write every setting back into its own INI from what BFA loaded at its start, as BFA
 // 4.3.2.3's do for ForceCPU. IndependentGpuDevice is left as it is.
 //
-// BFA 7.0.0 (its builds report 7.0.0.N; the bridge was checked against 7.0.0.1's files, not its source, which wasn't
-// read): the same two keys with the same meanings, by its own INI's comments and its README ([General] ForceCPU=1 the
-// CPU for its facial models; [General] EmotionDevice -1 the CPU, 0 and up a graphics card by its DXGI number). Its
-// installer writes ForceCPU (with GpuAdapter) in Installer\Startup.ini and EmotionDevice in
+// BFA 7.0.0 (its builds report 7.0.0.N; the bridge was checked against 7.0.0.1's files, its source not being
+// available): the same two keys with the same meanings, by its own INI's comments and its README ([General]
+// ForceCPU=1 the CPU for its facial models; [General] EmotionDevice -1 the CPU, 0 and up a graphics card by its DXGI
+// number). Its installer writes ForceCPU (with GpuAdapter) in Installer\Startup.ini and EmotionDevice in
 // Installer\EmotionDevice.ini, and leaves both commented out in the INI it installs; its README says the installer's
 // files are defaults that an explicit value in BetterFacialAnimations.ini overrides, and that its menu saves keep the
-// choices in effect. INFERRED from those files, not read from source: it reads them in layers with SimpleIni's rules
-// as 5.0.6 does, and its menu saves write every setting back as 5.0.6's do. So the bridge treats 7.0.0 exactly as
-// 5.0.6, with 7.0.0's sixteen choice files (kBfa700InstallerChoices), and one difference for an EmotionDevice missing
-// everywhere (ReadBfa5Devices). GpuAdapter, IndependentGpuDevice, GraphFusion and EmotionGraphFusion are left as they
-// are. "Both keys" below means BFA 5.0.6 or 7.0.0 (BfaHasBothKeys). The rule:
+// choices in effect. Read from its DLL's code: it loads the sixteen choice files and then its own INI into one
+// SimpleIni object (kBfa700InstallerChoices), and reads ForceCPU, the legacy GPU, GpuAdapter and EmotionDevice as
+// 5.0.6 does (ReadBfa5Devices). INFERRED, not read: its menu saves write every setting back as 5.0.6's do. So the
+// bridge treats 7.0.0 exactly as 5.0.6, with 7.0.0's sixteen choice files. GpuAdapter, IndependentGpuDevice,
+// GraphFusion and EmotionGraphFusion are left as they are. "Both keys" below means BFA 5.0.6 or 7.0.0
+// (BfaHasBothKeys). The rule:
 //
 //   a game start         a record whose value BFA's own INI no longer holds (ForceCPU 1, EmotionDevice -1) is cleared:
 //                        BFA loaded another value at this start, the one put back or the player's own (SKSE's
@@ -106,12 +107,11 @@ inline constexpr std::array<const char*, 14> kBfa506InstallerChoices{
     "GraphicsRoute", "Startup", "FaceModel", "EmotionModel", "VanillaEmotions", "ActiveOnly", "PlayerAnimation",
     "PrepareEarly",  "Tongue",  "Gaze",      "Logging",      "Khajiit",         "Argonian",   "EmotionDevice"};
 // BFA 7.0.0's: the sixteen files its installer writes (its fomod), 5.0.6's fourteen and FaceGraphFusion and
-// EmotionGraphFusion. Its read order is not known (its source wasn't read): the bridge keeps 5.0.6's order for the
-// fourteen and lists the two new files last. As BFA 7.0.0's installer writes them, each key the bridge reads is in one
-// choice file at most (ForceCPU and GpuAdapter in Startup.ini, EmotionDevice in EmotionDevice.ini; GPU and Batch in
-// none), and the two new files hold only GraphFusion and EmotionGraphFusion, which the bridge doesn't read; so the
-// order changes nothing the bridge reads from files as the installer wrote them. A choice file edited by hand to hold
-// one of those keys twice over could read otherwise.
+// EmotionGraphFusion, in the order its DLL's code loads them (read from 7.0.0.1's DLL): it builds these sixteen names
+// in this order, loads Installer\<name>.ini first to last into one SimpleIni object, then BetterFacialAnimations.ini
+// last. A missing file is skipped; any other error reading one ends the load there, and BFA keeps the settings it held
+// before it. The bridge takes a choice file it can't read as one without the key (src/plugin/BfaIni.cpp), so while one
+// can't be read it may read a value BFA wouldn't load.
 inline constexpr std::array<const char*, 16> kBfa700InstallerChoices{
     "GraphicsRoute", "Startup", "FaceModel", "EmotionModel",  "VanillaEmotions", "ActiveOnly",      "PlayerAnimation", "PrepareEarly",
     "Tongue",        "Gaze",    "Logging",   "Khajiit",       "Argonian",        "EmotionDevice",   "FaceGraphFusion", "EmotionGraphFusion"};
@@ -154,7 +154,7 @@ public:
     virtual bool WriteRecord(const char* key, const char* value, std::string& err) = 0;
 };
 
-// The Bfa5 functions below read BFA's files as BFA 5 does, which BFA 7.0.0 is taken to do too (above).
+// The Bfa5 functions below read BFA's files as BFA 5 does, and as BFA 7.0.0's DLL does too (above).
 //
 // [section] key as BFA 5.0.6 reads it: the installer's choice files in choices' order (InstallerChoicesFor), then its
 // own INI; the last file that holds the key wins. Empty when none does.
