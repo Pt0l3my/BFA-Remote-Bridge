@@ -29,7 +29,7 @@ mode (see [BFA's mode](#bfas-mode)).
   4.3.2.3: its four facial models, V3 (`a2f3_fp16.onnx`), the new Performance model (`performance.onnx`), Ultra
   Performance (`ultra-performance.onnx`, 5.0.6's Performance model under a new name) and Legacy (`network_fp16.onnx`),
   and both its emotion models. Copy BFA 7.0.0's folder to the server (see [On PandorumLLM's PC](#on-pandorumllms-pc)).
-  The protocol is unchanged, so PandorumLLM's side needs no change. Not yet tried in game.
+  The protocol is unchanged. BFA 7.0.0 hasn't yet been tried with PandorumLLM's server, nor in game.
 - **BFA 7.0.0's mode** is set as 5.0.6's: both keys, `ForceCPU=1` and `EmotionDevice=-1`, with a server that speaks
   protocol version 2, read through BFA 7.0.0's installer files (sixteen of them now). See [BFA's mode](#bfas-mode).
 - **The new Performance model carries each line's state** in and out of every run, so a run is larger: about 15 MB in
@@ -255,10 +255,10 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   5.0.6 the bridge sends its GPU mode's sizes itself, for every 5.0.6 build alike, by the model's file name. The
   protocol is unchanged, so PandorumLLM's server needs nothing new for it. That includes a size for a dimension the
   model lacks (the emotion models get such sizes, as BFA's own GPU mode sets them): PandorumLLM's server accepts
-  them, tested in game with BFA 5.0.6. For BFA 7.0.0 it sends 5.0.6's sizes for the models the two share, the earlier
-  Performance model's for `ultra-performance.onnx`, and none for the new `performance.onnx`, whose sizes are all fixed
-  in the model itself. BFA 7.0.0's source wasn't read: these sizes follow from its models and from the size names its
-  DLL carries, the same as 5.0.6's.
+  them, tested in game with BFA 5.0.6. For BFA 7.0.0 it sends the sizes its GPU mode sets, read from BFA 7.0.0's DLL,
+  its source not being available: the same as 5.0.6's for V3, Legacy and both emotion models, the batch at 1 and 124
+  frames for `ultra-performance.onnx`, and the batch at 1 for the new `performance.onnx`, a size it lacks (its sizes
+  are all fixed in the model itself).
 - No setting and no note on screen: the log lines are all.
 
 ## Lip sync in scenes
@@ -267,8 +267,8 @@ Better Facial Animations leaves the faces of everyone in an OStim or SexLab scen
 their lines, and SkyrimNet's log shows each such line as "given back (Declined/InScene)". With **Lip sync in scenes**
 on (the default), speakers in a scene get BFA's lip sync and expression for their lines, as anywhere else. It works
 with BFA 4.3.2.3, and BFA 5.0.6 makes the same scene check, so the setting applies to it too. BFA 7.0.0's DLL still
-names the same scene plugins and logs the scene factions it finds, so the setting most likely applies to it
-unchanged; that hasn't been seen in game yet.
+names the same scene plugins, logs the scene factions it finds and asks the game the same faction question, so the
+setting applies to it the same way; that hasn't been seen in game yet.
 
 - **Only BFA is answered differently.** BFA tells a scene by asking the game whether the speaker is in one of three
   factions: SexLab's SexLabAnimatingFaction, and OStim's OStimActorCountFaction and OStimExcitementFaction. The bridge
