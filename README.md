@@ -45,7 +45,9 @@ mode (see [BFA's mode](#bfas-mode)).
 - **PandorumLLM v3.98 Beta patch26 and earlier** don't serve BFA 7.0.0's `ultra-performance.onnx`,
   `emotion_performance.onnx` or new `performance.onnx` (patch27 does): with such a server, those models aren't loaded,
   and their lines get the game's own lip sync.
-- Not yet tried in game: PandorumLLM's patch27 isn't public until it has been tried with the bridge.
+- **Tried in game** with PandorumLLM v3.98 Beta patch27 and BFA 7.0.0.1: 2,454 runs over two sessions with no line
+  falling back, the Performance model's state kept on the server. A line's state rebuilt after the server lost it
+  hasn't been seen in game yet; the bridge's tests cover it. Patch27 is public when PandorumLLM releases it.
 
 ## What's new in 1.6.0
 
