@@ -23,6 +23,30 @@ the arithmetic happens on the server's PC, and BFA gets the results back. BFA's 
 bridge attaches to BFA in memory when the game starts. The one file of BFA's it writes is BFA's INI, to set its CPU
 mode (see [BFA's mode](#bfas-mode)).
 
+## What's new in 1.7.0
+
+- **The server keeps each line's state.** BFA 7.0.0's Performance model carries each line's state into and out of
+  every run, about 15 MB a run. With a PandorumLLM server that speaks the bridge's protocol version 3 (v3.98 Beta
+  patch27 or later) and its **Keep line state** setting on (Audio > Lip Sync, on by default), the server keeps that
+  state itself between a line's runs, and the bridge stops sending it: a run of BFA 7.0.0's Performance model drops
+  from about 15 MB to about 70 KB. The lip sync is the same, byte for byte. Nothing to set in Skyrim. See
+  [On PandorumLLM's PC](#on-pandorumllms-pc).
+- **A line whose state the server lost** (it restarted, or the connection dropped in the middle of a line) is sent
+  again from its start, within that call's 1000 ms, and carries on unchanged. When that can't be done in time, that one
+  line gets the game's own lip sync, as a line the server didn't answer in time does.
+- **Older servers work as before.** The bridge speaks protocol version 3 to a server that does, and version 2 or 1 to
+  an older one, by itself; every run then carries its line's state, as in 1.6.0. Finding the server on the local
+  network works as before.
+- **Two corrections.** BFA 7.0.0's `ultra-performance.onnx` is BFA 4.3.2.3's `performance.onnx` under a new name:
+  the same file, by PandorumLLM's hashes against its record of 4.3.2.3's files. And PandorumLLM's sizes rule for BFA
+  4.3.2.3's files (protocol version 2) reaches BFA 7.0.0's `a2f3_fp16.onnx` and `emotion_fp16.onnx` too, since they
+  are 4.3.2.3's files byte for byte (the same SHA-256); bridges 1.6.0 and 1.7.0 list their own sizes for BFA 7.0.0, so
+  the rule isn't used with them.
+- **PandorumLLM v3.98 Beta patch26 and earlier** don't serve BFA 7.0.0's `ultra-performance.onnx`,
+  `emotion_performance.onnx` or new `performance.onnx` (patch27 does): with such a server, those models aren't loaded,
+  and their lines get the game's own lip sync.
+- Not yet tried in game: PandorumLLM's patch27 isn't public until it has been tried with the bridge.
+
 ## What's new in 1.6.0
 
 - **Better Facial Animations 7.0.0.** The bridge serves BFA 7.0.0 (made for its 7.0.0.1 build) beside 5.0.6 and
@@ -119,13 +143,17 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   the gaming PC's network adapters' broadcast addresses on the port setting, at start-up and after a lost connection,
   at most once every 5 seconds while none answers, and connects to the first server that answers. Its address is
   never logged.
-- **Protocol versions.** The bridge opens each connection in protocol version 2; a server that speaks only version 1
-  says so (or, as v3.97-p6 and earlier can, drops the connection twice without an answer), and the bridge then speaks
-  version 1 to it until the game restarts or the address changes.
-- **BFA's mode.** With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode
+- **Protocol versions.** The bridge opens each connection in protocol version 3; a server that speaks only versions 1
+  and 2, or only version 1, says so (or drops the connection twice without an answer, as v3.97-p6 and earlier can), and
+  the bridge then speaks the newest version that server does until the game restarts or the address changes.
+- **A line's state on the server.** With a server that speaks protocol version 3 and keeps line state, a model that
+  carries each line's state in its runs (BFA 7.0.0's Performance model) leaves that state on the server: the bridge
+  sends each run without it, and the server answers exactly as it would with it. If the server no longer has a line's
+  state, the bridge sends that line's earlier parts again first, within the call's 1000 ms.
+- **BFA's mode.** With a PandorumLLM server that speaks protocol version 2 or 3, the bridge switches BFA to its CPU mode
   itself, from the next game start, so BFA 4.3.2.3 opens nothing on this PC's graphics card, BFA 5.0.6 creates no
-  graphics device there, and BFA 7.0.0 runs its facial and emotion models in its CPU mode. The model still runs on
-  the server. See [BFA's mode](#bfas-mode).
+  graphics device there, and BFA 7.0.0 runs its facial and emotion models in its CPU mode. The model still runs on the
+  server. See [BFA's mode](#bfas-mode).
 - The bridge keeps one connection for speech. When BFA loads a model, the server loads it on a short-lived connection
   of its own, so the lines of a model already loaded keep flowing meanwhile. After a minute without speech the bridge
   checks the connection (PING), so it is ready before the next line needs it.
@@ -151,7 +179,8 @@ Bridge 1.2.0 wasn't released on its own: 1.3.0 brings its changes too. Since 1.1
   1.24.4). Other versions are tried too.
 - PandorumLLM's A2F server on another PC of your local network, holding the same BFA files as your gaming PC (or any
   server that speaks [the bridge's protocol](docs/PROTOCOL.md)). Finding it by itself needs one that speaks protocol
-  version 2; an older one is reached by its address.
+  version 2 or 3; an older one is reached by its address. Keeping each line's state on the server needs one that speaks
+  version 3 (v3.98 Beta patch27 or later).
 
 ## Install (Mod Organizer 2)
 
@@ -184,7 +213,9 @@ The server runs BFA's models, so it needs BFA's files, of the **same BFA version
    - the `.onnx` models (`a2f3_fp16.onnx`, `emotion_fp16.onnx`, `performance.onnx`, `network_fp16.onnx`, from BFA
      5.0.6 `emotion_performance.onnx`, and from BFA 7.0.0 `ultra-performance.onnx`, as many as your BFA has):
      copying the whole folder takes them all. BFA 7.0.0's `performance.onnx` is a new model under the old name, and
-     its `ultra-performance.onnx` is the earlier Performance model, so the server needs 7.0.0's own copies of both;
+     its `ultra-performance.onnx` is BFA 4.3.2.3's `performance.onnx` under a new name (the same file, by
+     PandorumLLM's record of 4.3.2.3's files). The server matches each model by its name, size and SHA-256, so it
+     needs 7.0.0's own folder, under 7.0.0's names;
    - `onnxruntime.dll`, `DirectML.dll` and `onnxruntime_providers_shared.dll`;
    - BFA's licence files (`NOTICE.txt` and the `licenses` folder), which go with its models.
 2. In PandorumLLM's panel, point the A2F server's **Model folder** at that folder, and choose the card it runs on.
@@ -201,16 +232,27 @@ about 7.5 MB to the server and gets about 7.5 MB back, about 15 MB in all, for 9
 frames a second). Each run, as any other, is to be answered within 1000 ms. Its other models' runs are the size they
 were in 5.0.6.
 
+- **With a PandorumLLM that speaks protocol version 3** (v3.98 Beta patch27 or later) and its **Keep line state**
+  setting on (Audio > Lip Sync, on by default, applied from the A2F server's next start), the server keeps each line's
+  state itself: a run of this model then sends about 43 KB and gets about 26 KB back, about 70 KB in all. The
+  answers are the same as with the state sent, byte for byte. PandorumLLM's panel shows the lines it holds for the
+  bridge, the memory they take, and how often a line's state was found gone.
+- **With an older PandorumLLM**, or the setting off, every run carries its state, as above.
+- **PandorumLLM v3.98 Beta patch26 and earlier** don't serve BFA 7.0.0's `ultra-performance.onnx`,
+  `emotion_performance.onnx` or new `performance.onnx`; patch27 does. With an older server those models aren't
+  loaded, and their lines get the game's own lip sync (the monitor shows each as not ready, with the server's
+  reason).
+
 ## BFA's mode
 
 The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you set nothing about it on the gaming PC.
 
-- With a PandorumLLM server that speaks protocol version 2, the bridge switches BFA to its CPU mode itself, from the
-  next game start. The model still runs on the server. It writes the CPU mode under `[General]` in BFA's own
+- With a PandorumLLM server that speaks protocol version 2 or 3, the bridge switches BFA to its CPU mode itself, from
+  the next game start. The model still runs on the server. It writes the CPU mode under `[General]` in BFA's own
   `BetterFacialAnimations.ini` (BFA reads that file once, as the game starts), says so once in its log, and writes it
-  again at each game save, so a change in BFA's menu before that save doesn't undo it; one made after the last save
-  of a session is what BFA loads at the next start. In Mod Organizer 2 the change goes to BFA's own file, in BFA's
-  mod folder, and the bridge's new file below to Overwrite.
+  again at each game save, so a change in BFA's menu before that save doesn't undo it; one made after the last save of a
+  session is what BFA loads at the next start. In Mod Organizer 2 the change goes to BFA's own file, in BFA's mod
+  folder, and the bridge's new file below to Overwrite.
   - **BFA 4.3.2.3:** `ForceCPU=1`, so BFA opens nothing on this PC's graphics card.
   - **BFA 5.0.6:** both of its keys, `ForceCPU=1` for its facial model (Audio2Face) and `EmotionDevice=-1` for its
     emotion model (Audio2Emotion), so BFA creates no graphics device on this PC. BFA 5's installer keeps your choices
@@ -229,8 +271,8 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   card picked in BFA's menu for the emotion model while the bridge's value is there is noted in its place at the
   bridge's next write.
 - With a server that speaks only protocol version 1 (PandorumLLM v3.97 Beta patch7 and earlier), it puts BFA's values
-  back, from the next game start: it sets BFA's CPU mode only for a server that speaks version 2. It writes back the
-  value BFA's INI held, or takes out the one it added, so BFA's installer choice applies again. A save of BFA's menu
+  back, from the next game start: it sets BFA's CPU mode only for a server that speaks version 2 or 3. It writes back
+  the value BFA's INI held, or takes out the one it added, so BFA's installer choice applies again. A save of BFA's menu
   later in that session would write the bridge's values back, so the bridge puts BFA's values back again at each game
   save of that session, and keeps its note until a game start has loaded them.
 - It puts back only a value that is still its own in BFA's INI (`ForceCPU=1`, `EmotionDevice=-1`): one you changed
@@ -252,11 +294,12 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   version and a server answers.
 - In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime. For BFA 4.3.2.3 a version 2
   server fills in its own for V3 (`a2f3_fp16.onnx`) and the emotion model (`emotion_fp16.onnx`), part of protocol
-  version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5). For BFA
+  version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5); a server
+  that speaks version 3 does the same, as PandorumLLM's side confirmed on 17 November 2026. For BFA
   5.0.6 the bridge sends its GPU mode's sizes itself, for every 5.0.6 build alike, by the model's file name. The
   protocol is unchanged, so PandorumLLM's server needs nothing new for it. That includes a size for a dimension the
-  model lacks (the emotion models get such sizes, as BFA's own GPU mode sets them): PandorumLLM's server accepts
-  them, tested in game with BFA 5.0.6. For BFA 7.0.0 it sends the sizes its GPU mode sets, read from BFA 7.0.0's DLL,
+  model lacks (the emotion models get such sizes, as BFA's own GPU mode sets them): PandorumLLM's server accepts them,
+  tested in game with BFA 5.0.6. For BFA 7.0.0 it sends the sizes its GPU mode sets, read from BFA 7.0.0's DLL,
   its source not being available: the same as 5.0.6's for V3, Legacy and both emotion models, the batch at 1 and 124
   frames for `ultra-performance.onnx`, and the batch at 1 for the new `performance.onnx`, a size it lacks (its sizes
   are all fixed in the model itself).
@@ -342,7 +385,7 @@ Skyrim's own corner notifications, so SkyrimNet sees each one as a `notification
 can react to them by that beginning.
 
 The server is told too, so PandorumLLM's panel can show it: when a line falls back, a server that speaks protocol
-version 2 gets a NOTICE on the speech connection (the model, the reason, what happened and how many lines fell back
+version 2 or 3 gets a NOTICE on the speech connection (the model, the reason, what happened and how many lines fell back
 since the last), at most one a minute; an older server gets the bridge's status check within seconds (at most one
 every 30 seconds) with the reason in its client string.
 
@@ -358,7 +401,11 @@ every 30 seconds) with the reason in its client string.
 - with the address empty, the server found on the local network, by its name and port (never its address), or that
   none answered;
 - the server's first answer at start-up (its name and device, such as "PandorumLLM ... A2F" on "DirectML 0: ..." or
-  "CPU: ...", and the protocol version it answered in), and, once, that a server speaks protocol version 1 only;
+  "CPU: ...", and the protocol version it answered in), and, once, that a server speaks only protocol versions 1 and
+  2, or version 1 only;
+- in the line giving the server's answer for each model, "its line's state kept on the server" for a model whose line
+  state the server keeps; and each time the server no longer had a line's state, that the line was sent again from
+  its start, or why that couldn't be done in time;
 - each model BFA loads: its size, SHA-256 and overrides (for BFA 5.0.6 and 7.0.0, the sizes of BFA's GPU mode the
   bridge lists, said as such), and whether the server serves it ("is served by ...; nothing of it runs on this PC")
   or why not, with the server's note when it runs another model in that role's place; a refusal BFA meets again on
@@ -377,14 +424,14 @@ every 30 seconds) with the reason in its client string.
   "250 runs since the last summary: 249 answered, 1 not (1 timed out, 0 refused, 0 not ready, 0 no connection, 0
   paused, 0 other); round trip 8.1 ms, server 6.2 ms, slowest 21.0 ms".
 
-With Log detail set to Detailed it also logs one line per run, each connection opened or closed and why, each answer
-to HELLO, each unanswered PING, each late answer discarded, each background reconnection attempt and each status
-check sent for a fallback or NOTICE, each search sent and each datagram ignored, BFA's GPU mode, once, as a fact,
-and, at most once a minute, a line whose scene check the bridge answered: the speaker's form ID, the scene faction,
-and how many such lines since the last such log line. BFA's own settings and BFA 5's mouth-gear rule can still keep
-such a line on the game's face. The checks BFA makes every frame are never logged.
+With Log detail set to Detailed it also logs one line per run (with whether its line's state stayed on the server),
+each connection opened or closed and why, each answer to HELLO, each unanswered PING, each late answer discarded, each
+background reconnection attempt and each status check sent for a fallback or NOTICE, each search sent and each datagram
+ignored, BFA's GPU mode, once, as a fact, and, at most once a minute, a line whose scene check the bridge answered: the
+speaker's form ID, the scene faction, and how many such lines since the last such log line. BFA's own settings and BFA
+5's mouth-gear rule can still keep such a line on the game's face. The checks BFA makes every frame are never logged.
 
-The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.6.0
+The bridge's HELLO carries its counters since the game started and the gaming PC's versions, as "BFARemoteBridge 1.7.0
 (answered 1250, fallbacks 0, timeouts 0, BFA 5.0.6.3, ORT 1.24.4)", and every 5 minutes, when they changed, it sends
 them on a short connection of its own, so PandorumLLM's panel shows them.
 
@@ -396,6 +443,7 @@ them on a short connection of its own, so PandorumLLM's panel shows them.
 | "no server answered on the local network" | No server was found. In PandorumLLM, start the A2F server and set its Remote IP to the gaming PC's address; allow the port (7871 by default) through the server PC's firewall for UDP as well as TCP, private networks only; and check both PCs are on the same network. A PandorumLLM older than protocol version 2 (v3.97 Beta patch7 and earlier) can't be found: enter its address on SkyrimNet's page instead, save, and restart. The log says what the search sent and whether anything answered. |
 | "SkyrimNet wasn't found" | Install SkyrimNet Beta26 or later: the settings are read from it. |
 | "the server isn't answering" | Start PandorumLLM's A2F server, check the address (if one is set) and the port, set its Remote IP to the gaming PC, and allow the port through the server PC's firewall for UDP as well as TCP (private networks only). Then reload the model in BFA's menu, or restart. |
+| "The server speaks protocol versions 1 and 2 only (two version 3 HELLOs got no answer ...", with a PandorumLLM that speaks version 3 | Its connection was dropped twice before it answered (while it restarted, say). The bridge then speaks version 2 to it until the game restarts or the address changes, so the server keeps no line's state for that session, and every run carries it, as with an older server. Two more drops and it is spoken to in version 1 ("... version 1 only (two version 2 HELLOs got no answer ..."): no NOTICE either, and BFA's mode is put back (see [BFA's mode](#bfas-mode)). Restart the game once the server is up. |
 | "the server refused the access key" | The bridge has no access key any more: turn the key off in PandorumLLM's A2F settings. |
 | "the server lacks ... or has a different copy" | Copy the gaming PC's `BetterFacialAnimations` folder to the server's Model folder again: the two must be the same BFA version. |
 | "couldn't attach to Better Facial Animations" | This BFA looks ONNX Runtime up in a way the bridge doesn't know, or another mod loaded it first: the log says which. BFA runs on this PC as usual; update the bridge. |

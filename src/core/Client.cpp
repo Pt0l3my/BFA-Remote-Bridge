@@ -55,7 +55,7 @@ std::uint32_t U32(const std::uint8_t* p) {
 bool IsType(const proto::Header& h, MsgType t) { return h.type == static_cast<std::uint16_t>(t); }
 
 // One request and its answer on t by the deadline, framed in `version`; the answer must be framed in it too (with
-// olderError, an ERROR framed in an older version also passes: a version 1 server's answer to a version 2 HELLO). With
+// olderError, an ERROR framed in an older version also passes: an older server's answer to a newer HELLO). With
 // owed, whole frames answering a request that timed out earlier on this connection (RUN_OK or ERROR with an owed
 // request id other than `awaited`) are read and discarded first; a discarded ERROR that ends the connection fails the
 // exchange. False with failure and reason otherwise.
@@ -129,10 +129,11 @@ bool Transact(Transport& t, MsgType type, const std::vector<std::uint8_t>& paylo
 struct HelloAnswer {
     ProbeResult result;
     std::vector<proto::ModelReply> models;
+    std::uint16_t olderVersion = 0;  // OlderVersion: the version the server's ERROR 6 was framed in
 };
 
-// HELLO on t in `version` and its answer, checked against the models it listed (the same, in the same order). A
-// version 2 HELLO answered with ERROR 6 framed in version 1 fails with OlderVersion: a version 1 server.
+// HELLO on t in `version` and its answer, checked against the models it listed (the same, in the same order). A HELLO
+// answered with ERROR 6 framed in an older version fails with OlderVersion: a server that speaks only up to that one.
 bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Clock::time_point deadline, std::vector<std::uint32_t>* owed,
               HelloAnswer& out, Failure& failure, std::string& reason, const Note& note) {
     out = HelloAnswer{};
@@ -161,6 +162,7 @@ bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Cl
         failure = Failure::Refused;
         if (header.version < version && e.code == static_cast<std::uint16_t>(proto::ErrorCode::VersionNotSupported)) {
             failure = Failure::OlderVersion;
+            out.olderVersion = header.version;
             out.result.detail = "the server speaks protocol version " + std::to_string(header.version) + " only";
             reason = "the server answered the version " + std::to_string(version) + " HELLO with " + ErrorText(e) + ", framed in version " +
                      std::to_string(header.version);
@@ -173,7 +175,7 @@ bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Cl
     }
     failure = Failure::Malformed;
     proto::HelloOk ok;
-    if (!IsType(header, MsgType::HelloOk) || !proto::DecodeHelloOk(answer.data(), answer.size(), ok, err)) {
+    if (!IsType(header, MsgType::HelloOk) || !proto::DecodeHelloOk(answer.data(), answer.size(), ok, err, version)) {
         reason = out.result.detail = "the server's answer to HELLO is malformed" + (err.empty() ? std::string() : " (" + err + ")");
         return false;
     }
@@ -200,7 +202,20 @@ bool SayHello(Transport& t, const proto::Hello& hello, std::uint16_t version, Cl
 bool Early(Failure f) { return f == Failure::SendFailed || f == Failure::Closed || f == Failure::Reset; }
 // No frame came back: the connection was reset, or closed before any answer.
 bool NoFrame(Failure f) { return f == Failure::Closed || f == Failure::Reset; }
-constexpr const char* kNoFrameTwice = "two version 2 HELLOs got no answer: the connection was reset or closed before any";
+std::string NoFrameTwice(std::uint16_t version) {
+    return "two version " + std::to_string(version) + " HELLOs got no answer: the connection was reset or closed before any";
+}
+std::string OlderAnswer(std::uint16_t version) { return "it answered the bridge's version " + std::to_string(version) + " HELLO with ERROR 6"; }
+std::string NoFrameLine(std::uint16_t version, Failure f) {
+    return std::string("The connection was ") + (f == Failure::Reset ? "reset" : "closed") + " before any answer to a version " +
+           std::to_string(version) + " HELLO";
+}
+
+// An ERROR's code; 0 for any other frame.
+std::uint16_t ErrorCodeIn(const proto::Header& h, const std::vector<std::uint8_t>& answer) {
+    if (!IsType(h, MsgType::Error) || answer.size() < 6) return 0;
+    return static_cast<std::uint16_t>(answer[4] | answer[5] << 8);
+}
 
 // The version rule's identity of a server: the address setting's, or the address found, with the port. Never logged.
 std::string HostKey(const std::string& host, int port) { return "address " + host + " port " + std::to_string(port); }
@@ -305,7 +320,7 @@ struct Client::Snapshot {
 // A connection of its own, opened with HELLO (OpenWithHello).
 struct Client::Opened {
     std::unique_ptr<Transport> transport;  // open after HELLO_OK; null otherwise
-    std::uint16_t version = proto::kVersion2;
+    std::uint16_t version = proto::kNewestVersion;
     bool connected = false;  // the last connect tried succeeded
     std::string connectError;
     HelloAnswer answer;
@@ -391,7 +406,7 @@ void Client::Configure(const Settings& settings) {
         std::lock_guard lock(configMutex_);
         moved = settings.serverAddress != pending_.serverAddress || settings.serverPort != pending_.serverPort;
         if (moved) {
-            // another address (or the search's, or another port): searched again at once, and spoken to in version 2 first
+            // another address (or the search's, or another port): searched again at once, and spoken to in version 3 first
             lookupFailureLogged_.store(false);
             found_ = Found{};
             anyFind_ = false;
@@ -399,6 +414,8 @@ void Client::Configure(const Settings& settings) {
             notFoundLogged_ = false;
             versionKey_.clear();
             serverVersion_ = 0;
+            reportedKey_.clear();
+            reportedVersion_ = 0;
         }
         configured_ = true;
         pending_ = settings;
@@ -441,22 +458,29 @@ int Client::NoticesSent() const {
 
 int Client::Searches() const { return searches_.load(); }
 
+// The version every connection to the server at key opens in: an older one learnt for it (1 or 2), else the newest.
 std::uint16_t Client::VersionFor(const std::string& key) const {
     std::lock_guard lock(configMutex_);
-    return versionKey_ == key && serverVersion_ == proto::kVersion1 ? proto::kVersion1 : proto::kVersion2;
+    return versionKey_ == key && serverVersion_ >= proto::kVersion1 && serverVersion_ < proto::kNewestVersion ? serverVersion_
+                                                                                                                : proto::kNewestVersion;
 }
 
-// What the server at key answered in: a version 1 server is spoken to in version 1 from now on, logged once.
-void Client::LearnVersion(const std::string& key, std::uint16_t version, const char* why) {
-    bool first = false, changed = false;
+// What the server at key answered in, or the older version it is spoken to in from now on, logged once. The sink hears
+// only a version a frame came back in (a HELLO_OK, or an ERROR 6 framed in it): one learnt from HELLOs that got no frame
+// back waits for the server's next answer, so BFA's mode never follows a version no frame showed.
+void Client::LearnVersion(const std::string& key, std::uint16_t version, const std::string& why, bool answered) {
+    bool first = false;
     std::function<void(std::uint16_t)> sink;
     {
         std::lock_guard lock(configMutex_);
-        changed = !(versionKey_ == key && serverVersion_ == version);
-        first = version == proto::kVersion1 && changed;
+        first = version < proto::kNewestVersion && !(versionKey_ == key && serverVersion_ == version);
         versionKey_ = key;
         serverVersion_ = version;
-        if (changed) sink = versionSink_;
+        if (answered && !(reportedKey_ == key && reportedVersion_ == version)) {
+            reportedKey_ = key;
+            reportedVersion_ = version;
+            sink = versionSink_;
+        }
     }
     if (sink) {
         try {
@@ -464,11 +488,14 @@ void Client::LearnVersion(const std::string& key, std::uint16_t version, const c
         } catch (...) {
         }
     }
-    if (first)
-        Log(Level::Info, std::string("The server speaks protocol version 1 only (") +
-                             (why ? why : "it answered the bridge's version 2 HELLO with ERROR 6") +
+    if (first && version == proto::kVersion1)
+        Log(Level::Info, "The server speaks protocol version 1 only (" + (why.empty() ? OlderAnswer(proto::kVersion2) : why) +
                              "): the bridge speaks version 1 to it until the game restarts or the address changes, and tells it of "
                              "fallbacks by its status checks, not by NOTICE");
+    else if (first && version == proto::kVersion2)
+        Log(Level::Info, "The server speaks protocol versions 1 and 2 only (" + (why.empty() ? OlderAnswer(proto::kVersion3) : why) +
+                             "): the bridge speaks version 2 to it until the game restarts or the address changes, and each run "
+                             "carries its line's state, as before");
 }
 
 void Client::SetOrtVersion(const std::string& version) {
@@ -646,9 +673,11 @@ bool Client::Discover(int port, Target& out, std::string& reason, bool mayFind) 
         } else {
             fresh = !found_.valid || found_.stale || found_.endpoints != endpoints || found_.port != port;
             if (!found_.valid || found_.endpoints != endpoints || found_.port != port) {
-                // another address: spoken to in version 2 first
+                // another address: spoken to in version 3 first
                 versionKey_.clear();
                 serverVersion_ = 0;
+                reportedKey_.clear();
+                reportedVersion_ = 0;
             }
             found_ = Found{true, false, port, endpoints, server};
             notFoundLogged_ = false;
@@ -720,15 +749,21 @@ void Client::MarkFoundStale() {
 }
 
 // A connection of its own: connected within kConnectTimeout, then HELLO in the server's version, within helloTimeout.
-// A version 1 server's ERROR 6 to a version 2 HELLO is learnt, and HELLO goes again on a new connection, in version 1.
+// An older server's ERROR 6 is learnt, and HELLO goes again on a new connection, in the version the ERROR was framed in.
+// A HELLO that gets no frame back goes once more in its version, then in the version below (3, 3, 2, 2, 1 at most).
 Client::Opened Client::OpenWithHello(const Target& target, const proto::Hello& hello, std::chrono::milliseconds helloTimeout, bool notes) {
     Opened o;
     const Note note = [this, notes](const std::string& l) {
         if (notes) Detail(l);
     };
-    int noFrame = 0;  // version 2 HELLOs that got no frame back
-    for (int round = 0; round < 3; ++round) {
+    int noFrame = 0;                  // HELLOs of noFrameVersion that got no frame back
+    std::uint16_t noFrameVersion = 0;
+    for (int round = 0; round < 6; ++round) {
         o.version = VersionFor(target.key);
+        if (o.version != noFrameVersion) {
+            noFrameVersion = o.version;
+            noFrame = 0;
+        }
         auto t = factory_ ? factory_() : nullptr;
         o.connectError = "no network";
         o.connected = t && t->Connect(target.endpoints, static_cast<int>(kConnectTimeout.count()), o.connectError);
@@ -743,16 +778,15 @@ Client::Opened Client::OpenWithHello(const Target& target, const proto::Hello& h
         }
         t->Close();
         if (o.failure == Failure::OlderVersion) {
-            LearnVersion(target.key, proto::kVersion1);
-            if (notes) Detail("Connecting again in protocol version 1");
+            LearnVersion(target.key, o.answer.olderVersion, OlderAnswer(o.version));
+            if (notes) Detail("Connecting again in protocol version " + std::to_string(o.answer.olderVersion));
             continue;
         }
-        // no frame back (PandorumLLM v3.97-p6 and earlier close with the payload unread, which can reset the
-        // connection on Windows): once more in version 2, then as a version 1 server
-        if (o.version == proto::kVersion2 && NoFrame(o.failure)) {
-            Detail(std::string("The connection was ") + (o.failure == Failure::Reset ? "reset" : "closed") +
-                   " before any answer to a version 2 HELLO");
-            if (++noFrame == 2) LearnVersion(target.key, proto::kVersion1, kNoFrameTwice);
+        // no frame back (a lost connection; PandorumLLM v3.97-p6 and earlier close with the payload unread, which can
+        // reset the connection on Windows): once more in this version, then in the one below
+        if (o.version > proto::kVersion1 && NoFrame(o.failure)) {
+            Detail(NoFrameLine(o.version, o.failure));
+            if (++noFrame == 2) LearnVersion(target.key, static_cast<std::uint16_t>(o.version - 1), NoFrameTwice(o.version), false);
             continue;
         }
         return o;
@@ -778,6 +812,10 @@ void Client::SetModels(const std::vector<proto::ModelEntry>& models) {
         for (std::size_t i = 0; same && i < listed.size(); ++i) same = listed[i].entry == listed_[i].entry;
         if (same) return;
         listed_ = std::move(listed);
+        // a model no longer live has no line to replay
+        std::erase_if(lines_, [this](const auto& l) {
+            return std::none_of(listed_.begin(), listed_.end(), [&](const Listed& m) { return m.entry.name == l.first; });
+        });
         ++modelsGeneration_;
         helloCurrent_ = false;
     }
@@ -805,6 +843,18 @@ int Client::Pings() const {
 
 int Client::SideLoadsInFlight() const noexcept { return sideLoads_.load(); }
 
+int Client::Replays() const {
+    Lock lock(mutex_);
+    return replays_;
+}
+
+std::size_t Client::LineBytes(const std::string& model) const {
+    Lock lock(mutex_);
+    for (const auto& [name, line] : lines_)
+        if (name == model) return line.bytes;
+    return 0;
+}
+
 Counters Client::Totals() const {
     std::lock_guard lock(statsMutex_);
     return totals_;
@@ -823,6 +873,8 @@ void Client::CloseLocked(const std::string& why) noexcept {
     helloCurrent_ = false;
     mainAnswered_ = false;
     owed_.clear();
+    streams_.clear();  // a held state belongs to its connection
+    nextStream_ = 1;
 }
 
 void Client::StartPauseLocked(const std::string& reason) {
@@ -906,6 +958,7 @@ std::string Client::StatusLine(const std::string& server, const std::string& dev
         // a ready model may carry a detail too (another model running in its place): it is always logged
         std::string part = m.entry.name + " " + proto::ModelStatusName(m.status);
         if (!m.detail.empty()) part += " (" + m.detail + ")";
+        if (m.held) part += ", its line's state kept on the server";
         parts.push_back(std::move(part));
     }
     return "Server " + server + " on " + device + ": " + (parts.empty() ? std::string("no models asked") : Join(parts));
@@ -952,16 +1005,15 @@ bool Client::HelloMainLocked(Clock::time_point deadline, ExchangeFailure& failur
     lastActivity_ = now_();
     if (!ok) {
         Detail("HELLO on the main connection: " + reason);
-        if (mainVersion_ == proto::kVersion2 && !mainAnswered_ && NoFrame(failure))
-            Detail(std::string("The connection was ") + (failure == Failure::Reset ? "reset" : "closed") +
-                   " before any answer to a version 2 HELLO");
-        if (failure == Failure::OlderVersion) LearnVersion(mainKey_, proto::kVersion1);
+        if (mainVersion_ > proto::kVersion1 && !mainAnswered_ && NoFrame(failure)) Detail(NoFrameLine(mainVersion_, failure));
+        if (failure == Failure::OlderVersion) LearnVersion(mainKey_, ans.olderVersion, OlderAnswer(mainVersion_));
         return false;
     }
     mainAnswered_ = true;
     LearnVersion(mainKey_, mainVersion_);
     std::vector<Answered> fresh;
-    for (std::size_t i = 0; i < hello.models.size(); ++i) fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    for (std::size_t i = 0; i < hello.models.size(); ++i)
+        fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail, ans.models[i].held});
     AnsweredLocked(std::move(fresh));
     helloCurrent_ = true;
     const std::string line = StatusLine(ans.result.server, ans.result.device, answered_);
@@ -1027,10 +1079,112 @@ Admission Client::Admit(const proto::ModelEntry& model) {
     return a;
 }
 
+std::uint32_t Client::NextRequestLocked() {
+    const std::uint32_t id = nextRequest_++;
+    if (nextRequest_ == 0) nextRequest_ = 1;
+    return id;
+}
+
+// The connection's stream for a stateful model: one per model, the same for every line of it.
+std::uint64_t Client::StreamLocked(const std::string& model) {
+    for (const auto& [name, stream] : streams_)
+        if (name == model) return stream;
+    streams_.emplace_back(model, nextStream_);
+    return nextStream_++;
+}
+
+// A held line's window answered: its inputs but past_X kept for a replay, within kLineWindows and kLineBytes. A line
+// longer than that stops being kept, and what it kept is freed.
+void Client::KeepWindowLocked(Line& line, const proto::RunRequest& request, const proto::LineState& state) {
+    if (line.full) return;
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < request.inputs.size(); ++i)
+        if (!state.stateInput[i]) bytes += request.inputs[i].bytes;
+    if (line.windows.size() >= kLineWindows || line.bytes + bytes > kLineBytes) {
+        line.full = true;
+        line.windows.clear();
+        line.windows.shrink_to_fit();
+        line.bytes = 0;
+        return;
+    }
+    std::vector<StoredTensor> window;
+    for (std::size_t i = 0; i < request.inputs.size(); ++i) {
+        if (state.stateInput[i]) continue;
+        const proto::TensorView& t = request.inputs[i];
+        const auto* p = static_cast<const std::uint8_t*>(t.data);
+        window.push_back(StoredTensor{std::string(t.name), t.dtype, t.dims, std::vector<std::uint8_t>(p, p + t.bytes)});
+    }
+    line.windows.push_back(std::move(window));
+    line.bytes += bytes;
+}
+
+bool Client::ReplayLocked(const Line& line, proto::RunRequest current, Clock::time_point deadline, proto::Header& header,
+                          std::vector<std::uint8_t>& answer, std::uint32_t& sentId, std::size_t& bytesUp, std::size_t& bytesBack,
+                          ExchangeFailure& failure, std::string& reason) {
+    failure = Failure::None;
+    if (line.kind != Line::Kind::Held || line.full || line.windows.empty()) {
+        reason = line.full ? "its line is longer than the bridge keeps for a replay" : "the bridge kept no window of its line to replay";
+        return false;
+    }
+    const Note note = [this](const std::string& l) { Detail(l); };
+    const std::size_t steps = line.windows.size() + 1;  // window 0 as a start, the others as continues, then this run
+    for (std::size_t i = 0; i < steps; ++i) {
+        if (Clock::now() >= deadline) {
+            reason = "its line's replay couldn't finish within the run's time (" + std::to_string(i) + " of " + std::to_string(steps) +
+                     " runs answered)";
+            return false;
+        }
+        proto::RunRequest step;
+        if (i + 1 < steps) {
+            step.model = current.model;
+            step.stream = current.stream;
+            step.mode = static_cast<std::uint8_t>(i == 0 ? proto::RunMode::Start : proto::RunMode::Continue);
+            for (const StoredTensor& t : line.windows[i]) step.inputs.push_back(proto::TensorView{t.name, t.dtype, t.dims, t.data.data(), t.data.size()});
+            step.outputs = current.outputs;  // asked as the run asks them, and discarded
+        } else {
+            step = current;
+        }
+        step.requestId = NextRequestLocked();
+        std::vector<std::uint8_t> payload;
+        std::string err;
+        if (!proto::EncodeRun(step, payload, err, mainVersion_)) {
+            failure = Failure::Encode;
+            reason = "couldn't encode a replayed RUN (" + err + ")";
+            return false;
+        }
+        sentId = step.requestId;
+        bytesUp += proto::kHeaderSize + payload.size();
+        const bool ok = Transact(*transport_, MsgType::Run, payload, mainVersion_, deadline, &owed_, sentId, header, answer, failure, reason, note);
+        lastActivity_ = now_();
+        if (ok) bytesBack += proto::kHeaderSize + answer.size();
+        if (!ok || i + 1 == steps || IsType(header, MsgType::Error)) return ok;  // an ERROR ends the replay, as the run's answer
+        proto::DecodedRunOk ok2;
+        if (!IsType(header, MsgType::RunOk) || !proto::DecodeRunOk(answer.data(), answer.size(), ok2, err) || ok2.requestId != sentId) {
+            failure = Failure::Malformed;
+            reason = "the server's answer to a replayed RUN is malformed or answers another request";
+            return false;
+        }
+    }
+    return true;
+}
+
 Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& request, Reply& reply, Fallback& fallback) {
     fallback = Fallback{};
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+    proto::LineState state;  // the run's line state, once the connection's lock is held
     const auto answer = [&](Outcome o, Why why, std::string text, bool quiet = false) {
         fallback = Fallback{why, std::move(text), quiet};
+        // BFA ends a line whose run gets the NaN answer, and its next run starts a new one: nothing of this one is kept
+        // for a replay, and a held one is marked ended
+        if (state.stateful && lock.owns_lock())
+            for (auto it = lines_.begin(); it != lines_.end(); ++it)
+                if (it->first == model.name) {
+                    if (it->second.kind == Line::Kind::Held || it->second.kind == Line::Kind::Ended)
+                        it->second = Line{Line::Kind::Ended, false, 0, {}};
+                    else
+                        lines_.erase(it);
+                    break;
+                }
         return o;
     };
     // the call's whole time, counted from here: waiting for the connection, a connect, a HELLO and RUN
@@ -1039,7 +1193,6 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     const Clock::time_point deadline = entry + std::chrono::milliseconds(timeoutMs);
     // during a pause: at once, without the connection's lock
     if (paused_.load() && !SettingsPending()) return answer(Outcome::Skipped, Why::Paused, "the bridge is paused", true);
-    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
     ++runsWaiting_;
     const bool got = lock.try_lock_until(deadline);
     --runsWaiting_;
@@ -1050,6 +1203,7 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         return Outcome::Skipped;
     }
     ApplyPendingLocked();
+    state = proto::DescribeLineState(request);
     if (paused_.load()) return answer(Outcome::Skipped, Why::Paused, "the bridge is paused", true);
     const auto listed = std::find_if(listed_.begin(), listed_.end(), [&](const Listed& l) { return l.entry.name == model.name; });
     if (listed == listed_.end() || !(listed->entry == model))  // a session a newer one of its model replaced
@@ -1077,11 +1231,18 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
                       quiet);
     }
 
-    request.requestId = nextRequest_++;
-    if (nextRequest_ == 0) nextRequest_ = 1;
-    std::vector<std::uint8_t> payload;
+    request.requestId = NextRequestLocked();
+    request.stream = 0;
+    request.mode = 0;
+    // the carried RUN, checked before the network; versions 1 and 2 share its layout, and version 3's adds stream and mode.
+    // Its payload is made only when a carried RUN is sent: a held run never sends it (a line's state, megabytes, not
+    // copied for nothing)
+    const auto layout = [](std::uint16_t v) { return v >= proto::kVersion3 ? proto::kVersion3 : proto::kVersion1; };
+    std::uint16_t carriedLayout = layout(transport_ ? mainVersion_ : proto::kNewestVersion);
+    std::vector<std::uint8_t> carried;  // made in carriedLayout once carriedMade
+    bool carriedMade = false;
     std::string err;
-    if (!proto::EncodeRun(request, payload, err)) return answer(Outcome::Skipped, Why::Other, "couldn't encode RUN (" + err + ")");
+    if (!proto::CheckRun(request, err, carriedLayout)) return answer(Outcome::Skipped, Why::Other, "couldn't encode RUN (" + err + ")");
 
     const Clock::time_point start = Clock::now();
     if (start >= deadline) {
@@ -1091,8 +1252,17 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
     const Note note = [this](const std::string& l) { Detail(l); };
     proto::Header header;
     bool reused = transport_ != nullptr;
-    bool downgraded = false;  // connected again in version 1, for a version 1 server's answer to the version 2 HELLO
-    int noFrame = 0;          // version 2 HELLOs on a new connection that got no frame back
+    int noFrame = 0;                   // HELLOs of noFrameVersion on a new connection that got no frame back
+    std::uint16_t noFrameVersion = 0;
+    std::uint32_t sentId = request.requestId;  // the RUN whose answer is awaited: a replay's are its own
+    proto::RunMode mode = proto::RunMode::Carried;
+    // the call's RUN traffic, both ways over the same exchanges: up, every RUN this call sent (a send again after a
+    // closed connection, each replayed window and the window that got ERROR 8 included); back, every answer read to
+    // them (ERROR 8 and each replayed window's RUN_OK included). A late answer to an earlier call's RUN, discarded, is
+    // in neither
+    std::size_t bytesUp = 0, bytesBack = 0;
+    bool replayed = false;
+    reply.replayed = 0;
     for (int attempt = 0;; ++attempt) {
         if (!transport_) {
             bool timedOut = false;
@@ -1124,26 +1294,91 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         }
         if (ok) {
             inHello = false;
-            ok = Transact(*transport_, MsgType::Run, payload, mainVersion_, deadline, &owed_, request.requestId, header, reply.payload, f, reason,
-                          note);
+            // the RUN as this connection takes it: a model whose line state the server holds sends a start or a
+            // continue, its state left out both ways; every other run is carried, as in version 2
+            const Answered* a = FindAnsweredLocked(model);
+            const bool heldHere = state.stateful && mainVersion_ >= proto::kVersion3 && a && a->held;
+            const Line* line = nullptr;
+            for (const auto& l : lines_)
+                if (l.first == model.name) line = &l.second;
+            const bool heldLine = line && line->kind == Line::Kind::Held;
+            mode = proto::RunMode::Carried;
+            if (state.stateful && state.pastFrames == 0) {
+                if (heldHere) mode = proto::RunMode::Start;
+            } else if (state.stateful && line && line->kind == Line::Kind::Ended) {
+                return answer(Outcome::Failed, Why::Other, "its line's state was held on the server, and its last run got no answer");
+            } else if (state.stateful && heldLine) {
+                // BFA's own next_X were left as placeholders: only the server's held copy can continue this line
+                if (!heldHere)
+                    return answer(Outcome::Failed, Why::Other,
+                                  "its line's state was held on the server, and this connection doesn't hold it (" +
+                                      std::string(mainVersion_ < proto::kVersion3 ? "protocol version " + std::to_string(mainVersion_) : "held 0") +
+                                      ")");
+                mode = proto::RunMode::Continue;
+            }  // a line begun carried goes on carrying its own state, BFA's real one
+            std::vector<std::uint8_t> held;
+            proto::RunRequest wire;
+            if (mode != proto::RunMode::Carried) {
+                wire.requestId = request.requestId;
+                wire.stream = StreamLocked(model.name);
+                wire.mode = static_cast<std::uint8_t>(mode);
+                wire.model = request.model;
+                for (std::size_t i = 0; i < request.inputs.size(); ++i)
+                    if (!state.stateInput[i]) wire.inputs.push_back(request.inputs[i]);
+                for (std::size_t o = 0; o < request.outputs.size(); ++o)
+                    if (state.pairedInput[o] < 0) wire.outputs.push_back(request.outputs[o]);
+                if (!proto::EncodeRun(wire, held, err, mainVersion_))
+                    return answer(Outcome::Failed, Why::Other, "couldn't encode RUN (" + err + ")");
+            } else if (!carriedMade || layout(mainVersion_) != carriedLayout) {
+                carriedLayout = layout(mainVersion_);
+                carriedMade = true;
+                if (!proto::EncodeRun(request, carried, err, carriedLayout))
+                    return answer(Outcome::Failed, Why::Other, "couldn't encode RUN (" + err + ")");
+            }
+            const std::vector<std::uint8_t>& payload = mode != proto::RunMode::Carried ? held : carried;
+            sentId = request.requestId;
+            bytesUp += proto::kHeaderSize + payload.size();
+            ok = Transact(*transport_, MsgType::Run, payload, mainVersion_, deadline, &owed_, sentId, header, reply.payload, f, reason, note);
             lastActivity_ = now_();
+            if (ok) bytesBack += proto::kHeaderSize + reply.payload.size();
+            // the server no longer holds the line's state (a restart, a reconnect, an eviction): the line replayed from
+            // its start, all within this run's own deadline
+            if (ok && mode == proto::RunMode::Continue && ErrorCodeIn(header, reply.payload) == static_cast<std::uint16_t>(proto::ErrorCode::State)) {
+                proto::Error gone;
+                proto::DecodeError(reply.payload.data(), reply.payload.size(), gone, err);
+                ++replays_;
+                replayed = true;
+                ok = ReplayLocked(*line, wire, deadline, header, reply.payload, sentId, bytesUp, bytesBack, f, reason);
+                if (!ok && f == Failure::None) {
+                    // nothing failed on the connection: the line goes without, as after a timeout
+                    Log(Level::Info, model.name + ": the server no longer held its line's state (" + ErrorText(gone) + "), and " + reason);
+                    return answer(Outcome::Failed, Why::RunTimedOut, "the server no longer held its line's state, and " + reason);
+                }
+                if (ok) {
+                    reply.replayed = static_cast<int>(line->windows.size());
+                    Log(Level::Info, model.name + ": the server no longer held its line's state (" + ErrorText(gone) + "); its " +
+                                         std::to_string(line->windows.size()) + " earlier window" + (line->windows.size() == 1 ? "" : "s") +
+                                         " replayed from a start, then this one sent again");
+                }
+            }
         }
         if (ok) break;
-        // a version 1 server: connect again in version 1 and say HELLO, once, within the same deadline
-        if (f == Failure::OlderVersion && !downgraded && Clock::now() < deadline) {
-            CloseLocked("the server speaks protocol version 1 only");
-            downgraded = true;
+        // an older server: connect again in the version its ERROR 6 was framed in (learnt by the HELLO), within the same
+        // deadline; each time a lower version, so this ends
+        if (f == Failure::OlderVersion && Clock::now() < deadline) {
+            CloseLocked("the server speaks an older protocol version");
             reused = false;
             continue;
         }
-        // a new connection's version 2 HELLO with no frame back: once more in version 2, then in version 1 (an older
-        // server that closed with the HELLO unread), within the same deadline
-        if (inHello && !reused && mainVersion_ == proto::kVersion2 && NoFrame(f) && !downgraded && Clock::now() < deadline) {
-            if (++noFrame == 2) {
-                LearnVersion(mainKey_, proto::kVersion1, kNoFrameTwice);
-                downgraded = true;
+        // a new connection's HELLO with no frame back: once more in its version, then in the one below (an older server
+        // that closed with the HELLO unread), within the same deadline
+        if (inHello && !reused && mainVersion_ > proto::kVersion1 && NoFrame(f) && Clock::now() < deadline) {
+            if (mainVersion_ != noFrameVersion) {
+                noFrameVersion = mainVersion_;
+                noFrame = 0;
             }
-            CloseLocked("no answer to the version 2 HELLO");
+            if (++noFrame == 2) LearnVersion(mainKey_, static_cast<std::uint16_t>(mainVersion_ - 1), NoFrameTwice(mainVersion_), false);
+            CloseLocked("no answer to the version " + std::to_string(mainVersion_) + " HELLO");
             continue;
         }
         // a connection the server had closed or reset, or a send that failed: open it again and send again, once,
@@ -1168,11 +1403,11 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         if (f == Failure::NoByte) {
             // no byte of the answer arrived: the stream is still whole, and its late answer comes first
             const std::string text = "no answer within " + std::to_string(timeoutMs) + " ms";
-            owed_.push_back(request.requestId);
+            owed_.push_back(sentId);
             if (++timeoutsInARow_ >= 2) {
                 StartPauseLocked("A second RUN in a row timed out");
             } else {
-                Detail("Keeping the connection after a RUN timeout: the late answer to request " + std::to_string(request.requestId) +
+                Detail("Keeping the connection after a RUN timeout: the late answer to request " + std::to_string(sentId) +
                        " will be discarded");
             }
             return answer(Outcome::Failed, Why::RunTimedOut, text);
@@ -1183,7 +1418,9 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         return answer(Outcome::Failed, why, reason);
     }
     reply.roundTrip = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
-    reply.bytesUp = payload.size() + proto::kHeaderSize;
+    reply.bytesUp = bytesUp;
+    reply.bytesBack = bytesBack;
+    const std::string during = replayed ? "replaying its line after ERROR 8: " : "";
     if (IsType(header, MsgType::Error)) {
         proto::Error e;
         if (!proto::DecodeError(reply.payload.data(), reply.payload.size(), e, err)) {
@@ -1195,19 +1432,34 @@ Client::Outcome Client::Run(const proto::ModelEntry& model, proto::RunRequest& r
         reason = ErrorText(e);
         if (proto::ErrorEndsConnection(e.code)) StartPauseLocked("The server answered " + reason);
         SignalNoticeLocked();
-        return answer(Outcome::Failed, Why::ServerError, reason);
+        return answer(Outcome::Failed, Why::ServerError, during.empty() ? reason : reason + " (" + during.substr(0, during.size() - 2) + ")");
     }
     if (!IsType(header, MsgType::RunOk) || !proto::DecodeRunOk(reply.payload.data(), reply.payload.size(), reply.ok, err)) {
         reason = "the server's answer to RUN is malformed" + (err.empty() ? std::string() : " (" + err + ")");
         StartPauseLocked(reason);
         return answer(Outcome::Failed, Why::Other, reason);
     }
-    if (reply.ok.requestId != request.requestId) {
-        reason = "the server answered request " + std::to_string(reply.ok.requestId) + ", not " + std::to_string(request.requestId);
+    if (reply.ok.requestId != sentId) {
+        reason = "the server answered request " + std::to_string(reply.ok.requestId) + ", not " + std::to_string(sentId);
         StartPauseLocked(reason);
         return answer(Outcome::Failed, Why::Other, reason);
     }
     timeoutsInARow_ = 0;
+    reply.mode = static_cast<std::uint8_t>(mode);
+    reply.heldFrom.clear();
+    if (mode != proto::RunMode::Carried) reply.heldFrom = state.pairedInput;
+    if (state.stateful) {
+        // the line goes on: a start begins it (held when its state stays on the server), and a held line keeps each
+        // window's inputs for a replay
+        auto it = std::find_if(lines_.begin(), lines_.end(), [&](const auto& l) { return l.first == model.name; });
+        if (it == lines_.end()) it = lines_.insert(lines_.end(), {model.name, Line{}});
+        Line& line = it->second;
+        if (state.pastFrames == 0) {
+            line = Line{};
+            line.kind = mode == proto::RunMode::Start ? Line::Kind::Held : Line::Kind::Carried;
+        }
+        if (line.kind == Line::Kind::Held) KeepWindowLocked(line, request, state);
+    }
     SignalNoticeLocked();
     return Outcome::Forwarded;
 }
@@ -1532,7 +1784,8 @@ bool Client::Recover(const Snapshot& snap) {
     else
         Detail(connected);
     std::vector<Answered> fresh;
-    for (std::size_t i = 0; i < hello.models.size(); ++i) fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail});
+    for (std::size_t i = 0; i < hello.models.size(); ++i)
+        fresh.push_back(Answered{hello.models[i], ans.models[i].status, ans.models[i].detail, ans.models[i].held});
     AnsweredLocked(std::move(fresh));
     helloCurrent_ = modelsGeneration_ == snap.modelsGeneration;
     lastActivity_ = now_();
@@ -1626,7 +1879,7 @@ void Client::StatusCheck() {
                                                  : "Status check: no answer" + (r.detail.empty() ? std::string() : " (" + r.detail + ")"));
 }
 
-// A line fell back: to a server that answered in version 2, a NOTICE (the background thread's, NoticeMain). Anything
+// A line fell back: to a server that answered in version 2 or 3, a NOTICE (the background thread's, NoticeMain). Anything
 // else (a line to any other server; a model load's refusal or a runtime entry to every server): a status check with
 // its reason, within seconds, at most one per kFallbackReportEvery.
 void Client::ReportFallback(Reason reason, const std::string& model, const std::string& detail) {
@@ -1638,8 +1891,8 @@ void Client::ReportFallback(Reason reason, const std::string& model, const std::
         notice_ = proto::Notice{model, ReasonKey(reason), ShownServerText(detail), 0};
         noticePending_ = true;
     }
-    if (ServerVersion() == proto::kVersion2 && !model.empty()) {
-        // a line goes to a version 2 server by NOTICE alone; a model load's refusal or a runtime entry (no line) keeps
+    if (ServerVersion() >= proto::kVersion2 && !model.empty()) {
+        // a line goes to a version 2 or 3 server by NOTICE alone; a model load's refusal or a runtime entry (no line) keeps
         // 1.2.0's status check, sent in the version the server speaks
         Wake();
         return;
@@ -1657,7 +1910,7 @@ void Client::ReportFallback(Reason reason, const std::string& model, const std::
     }
 }
 
-// The NOTICE due, on the open main connection: only in version 2, and only while no request there awaits an answer
+// The NOTICE due, on the open main connection: only in version 2 or 3, and only while no request there awaits an answer
 // (after a RUN's answer, before the next request). How soon to look again: zero when there is nothing to retry.
 Clock::duration Client::NoticeMain() {
     TryLock lock(mutex_, std::try_to_lock);
@@ -1667,8 +1920,8 @@ Clock::duration Client::NoticeMain() {
     {
         std::lock_guard nl(noticeMutex_);
         if (!noticePending_ || (anyNotice_ && now_() < lastNotice_ + kNoticeEvery)) return Clock::duration::zero();
-        // nothing of version 2 to a server that hasn't answered in it; and none without a model left to run
-        if ((transport_ && mainVersion_ != proto::kVersion2) || ServerVersion() == proto::kVersion1 || (!transport_ && listed_.empty())) {
+        // nothing of version 2 to a server that hasn't answered in 2 or 3; and none without a model left to run
+        if ((transport_ && mainVersion_ < proto::kVersion2) || ServerVersion() == proto::kVersion1 || (!transport_ && listed_.empty())) {
             noticePending_ = false;
             noticeLines_ = 0;
             return Clock::duration::zero();

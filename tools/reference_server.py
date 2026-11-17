@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small reference A2F server: protocol versions 1 and 2 (docs/PROTOCOL.md), server side.
+"""A small reference A2F server: protocol versions 1, 2 and 3 (docs/PROTOCOL.md), server side.
 
 It is the bridge's test partner and a reference for a real server such as PandorumLLM's A2F server. It runs the
 models with ONNX Runtime's Python package on the processor by default, one thread per connection
@@ -7,7 +7,7 @@ models with ONNX Runtime's Python package on the processor by default, one threa
 of zeros, and one lock per session around its runs.
 
     python3 tools/reference_server.py --models <folder> [--host 127.0.0.1] [--port 7871] [--key KEY]
-                                      [--v1-only] [--remote-ip ADDRESS] [--notice-log FILE]
+                                      [--v1-only | --v2-only] [--no-held] [--remote-ip ADDRESS] [--notice-log FILE]
 
 It prints "LISTENING <port>" once it accepts connections (with --port 0 the system picks the port). The test
 options --delay-ms, --fault and --run-error make it slow or wrong on purpose (--fault-count limits them to the first
@@ -16,12 +16,27 @@ runs), and --hello-log FILE appends each HELLO's models and overrides as a JSON 
 As PandorumLLM's server does: each connection's requests are answered in order, late ones too; PING is answered with
 PONG only after HELLO (before it, ERROR 1); after ERROR 1, 2, 5, 6 or 7 the connection is closed.
 
-The versions: each connection is answered in the version its first frame opened it with, 1 or 2 (--v1-only: 1
+The versions: each connection is answered in the version its first frame opened it with, 1, 2 or 3 (--v1-only: 1
 alone, as PandorumLLM v3.97 Beta patch7 and earlier; --p6: the same, closing as p6 and earlier do, with a refused frame's
-payload unread). A first frame of a version it doesn't speak gets ERROR 6, framed in the
-newest version it speaks, and the connection closes; so does a later frame of another version. Version 2 adds
-NOTICE (one-way, logged; --notice-log FILE appends each as a JSON line) and, with --remote-ip ADDRESS, FIND and FOUND
-on UDP on the same port: a FIND from that address alone is answered with FOUND, at most one a second.
+payload unread; --v2-only: 1 and 2, as a released version 2 panel, v3.97 Beta patch8 to v3.98 Beta patch26, which reads a
+version 3 HELLO whole, answers ERROR 6 framed in version 2 and closes cleanly). A first frame of a version it doesn't
+speak gets ERROR 6, framed in the newest version it speaks, and the connection closes; so does a later frame of another
+version. Version 2 adds NOTICE (one-way, logged; --notice-log FILE appends each as a JSON line) and, with --remote-ip
+ADDRESS, FIND and FOUND on UDP on the same port: a FIND from that address alone is answered with FOUND, at most one a
+second. FIND and FOUND stay version 2 datagrams.
+
+Version 3 (docs/AGREEMENT-1.7.md): a line's state held on the server. HELLO_OK's rows carry held, 1 for a model whose
+inputs past_X pair with outputs next_X, with past_frames, unless --no-held (the panel's "Keep line state" off). RUN
+carries a stream and a mode: 0 as version 2; 1, a start, from zeros of the state's shape; 2, a continue, from the state
+held for the stream. One held state per connection and stream, changed only by a successful run, its count min(p + F, W)
+(F normalized_motion's second dimension, W past_k's fourth); at most 8 per connection, the one used least recently freed
+by a start beyond that; freed by a start on its stream, a HELLO that no longer lists its model, and the connection's
+close. A continue whose stream holds no state, another model's, or another count gets ERROR 8, and the connection stays
+open. The four refusals (a mode other than 0, 1 or 2; a held mode for a model marked held 0; mode 1 with past_frames
+other than 0, mode 2 with 0; a held mode carrying past_X or asking for next_X) are ERROR 1, and close it. Test options:
+--drop-held-on FILE drops every connection's held state when FILE appears (and removes it), checked at each RUN;
+--drop-held-every N drops a stream's state at every Nth continue the server gets of a line not rebuilt after an ERROR 8
+(one whose start came straight after an ERROR 8 on its stream is left alone, so a replay can finish).
 
 The sizes rule (version 2, and PandorumLLM's patch7 in version 1): a HELLO that lists no overrides for a file of
 BFA 4.3.2.3's set gets that set's sizes, with the detail "built with BFA 4.3.2.3's sizes"; one that lists overrides
@@ -39,16 +54,20 @@ import struct
 import sys
 import threading
 import time
+from collections import OrderedDict
 
 import numpy as np
 import onnxruntime as ort
 
 MAGIC = b"BFAR"
-VERSIONS = (1, 2)  # the versions this server speaks; --v1-only: (1,)
 HEADER = struct.Struct("<4sHHI")
 MAX_PAYLOAD = 64 * 1024 * 1024
 
 HELLO, HELLO_OK, RUN, RUN_OK, ERROR, PING, PONG = 1, 2, 3, 4, 5, 6, 7
+VERSIONS = (1, 2, 3)  # --v2-only: (1, 2); --v1-only and --p6: (1,)
+HELD_CAP = 8  # held streams per connection
+# a released version 2 panel's answer to a version 3 HELLO (the agreement's words)
+V2_PANEL_REFUSAL = "protocol version %d - this server speaks versions 1 and 2"
 FIND, FOUND, NOTICE = 8, 9, 10  # version 2: FIND and FOUND on UDP only, NOTICE one-way on TCP
 FOUND_EVERY = 1.0  # at most one FOUND a second
 # the row's detail when the sizes were filled in (the agreed words; with --fill-sizes the test files stand in for
@@ -57,7 +76,7 @@ FILLED_DETAIL = "built with BFA 4.3.2.3's sizes"
 
 READY, NOT_FOUND, DIFFERENT_FILE, FAILED_TO_LOAD, NOT_ALLOWED = 0, 1, 2, 3, 4
 
-E_MALFORMED, E_WRONG_KEY, E_UNKNOWN_MODEL, E_INFERENCE, E_TOO_LARGE, E_VERSION, E_BUSY = 1, 2, 3, 4, 5, 6, 7
+E_MALFORMED, E_WRONG_KEY, E_UNKNOWN_MODEL, E_INFERENCE, E_TOO_LARGE, E_VERSION, E_BUSY, E_STATE = 1, 2, 3, 4, 5, 6, 7, 8
 # after these the server closes the connection; 7 says it is busy or stopping
 CLOSING_ERRORS = {E_MALFORMED, E_WRONG_KEY, E_TOO_LARGE, E_VERSION, E_BUSY}
 MAX_NAME = 255  # bytes of a model or tensor name; longer is malformed
@@ -249,6 +268,7 @@ class Models:
                         options.add_free_dimension_override_by_name(dim, value)
                     session = ort.InferenceSession(path, sess_options=options, providers=self.providers)
                     warm_up(session, dict(overrides))
+                    entry["layout"] = state_layout(session)
                     entry["session"] = session
                 except Exception as e:  # the runtime's own message, without this PC's folder
                     entry["error"] = self.scrub(e)
@@ -263,6 +283,10 @@ class Models:
             text = text.replace(path + os.sep, "").replace(path, "")
         return text[:200]
 
+    def layout(self, key):
+        """The model's line state (state_layout), or None: a model without one is marked held 0."""
+        return self.sessions[key].get("layout")
+
     def run(self, key, feeds, outputs):
         entry = self.sessions[key]
         with entry["lock"]:
@@ -270,6 +294,33 @@ class Models:
             results = entry["session"].run(outputs, feeds)
             micros = int((time.perf_counter() - start) * 1e6)
         return results, micros
+
+
+def state_layout(session):
+    """A model's line state, version 3: its inputs past_X paired with outputs next_X, with past_frames, and the shapes
+    the count needs (F, normalized_motion's second dimension; W, past_k's fourth, or the first pair's), all fixed; else
+    None, and the model is marked held 0."""
+    ins = {i.name: i for i in session.get_inputs()}
+    outs = {o.name: o for o in session.get_outputs()}
+    if "past_frames" not in ins:
+        return None
+    pairs = [n for n in ins if n.startswith("past_") and n != "past_frames"]
+    if not pairs or any(not n[5:] or "next_" + n[5:] not in outs for n in pairs):
+        return None
+    if any("past_" + n[5:] not in ins for n in outs if n.startswith("next_")):
+        return None
+    motion = outs.get("normalized_motion")
+    window = ins.get("past_k", ins[pairs[0]])
+    if motion is None or len(motion.shape) < 2 or not isinstance(motion.shape[1], int):
+        return None
+    if len(window.shape) < 4 or not isinstance(window.shape[3], int):
+        return None
+    shapes = {}
+    for n in pairs:
+        if any(not isinstance(d, int) for d in ins[n].shape):
+            return None
+        shapes[n] = (tuple(ins[n].shape), ORT_TYPES.get(ins[n].type, np.float32))
+    return {"pairs": pairs, "F": motion.shape[1], "W": window.shape[3], "shapes": shapes}
 
 
 def warm_up(session, overrides):
@@ -307,12 +358,17 @@ class Handler(socketserver.StreamRequestHandler):
         spoken = self.server.versions
         self.version = None  # the connection's: its first frame's
         self.client = ""
+        # version 3: the held states, by stream (least recently used first), and the streams last answered ERROR 8
+        self.held = OrderedDict()
+        self.state_errors = set()
+        self.drop_seen = self.server.drop_generation
         try:
             while True:
                 head = self.read_exact(HEADER.size)
                 if head is None:
                     return
                 magic, version, kind, length = HEADER.unpack(head)
+                opening = self.version is None
                 if self.version is None:
                     # answered in the version it opened with; one this server doesn't speak, in the newest it does
                     self.version = version if magic == MAGIC and version in spoken else max(spoken)
@@ -324,6 +380,8 @@ class Handler(socketserver.StreamRequestHandler):
                         # unread, which can reset the connection before its ERROR 6 is read
                         if not cfg.p6 and length <= MAX_PAYLOAD and length:
                             self.read_exact(length)
+                        if opening and max(spoken) == 2 and version > 2 and magic == MAGIC:
+                            raise Refusal(E_VERSION, V2_PANEL_REFUSAL % version)
                         raise Refusal(E_VERSION, "protocol version %d not supported" % version)
                     if length > MAX_PAYLOAD:
                         # answered and closed: the oversize payload is never read
@@ -335,6 +393,9 @@ class Handler(socketserver.StreamRequestHandler):
                     if kind == HELLO:
                         ready = self.hello(payload)
                         hello_done = True
+                        # a held state whose model the connection's ready set no longer holds is freed
+                        for stream in [s for s, h in self.held.items() if ready.get(h["model"]) != h["key"]]:
+                            del self.held[stream]
                     elif not hello_done:
                         raise Refusal(E_MALFORMED, "HELLO comes first")
                     elif kind == PING:
@@ -353,6 +414,8 @@ class Handler(socketserver.StreamRequestHandler):
                         return
         except (ConnectionError, OSError):
             return
+        finally:
+            self.held.clear()  # the connection's held states end with it
 
     def hello(self, payload):
         r = Reader(payload)
@@ -378,6 +441,8 @@ class Handler(socketserver.StreamRequestHandler):
             if status == READY:
                 ready[name] = key
             out += pack_str(name) + struct.pack("<B", status) + pack_str(detail)
+            if self.version >= 3:
+                out += struct.pack("<B", 1 if status == READY and self.layout(key) else 0)
         self.server.log("HELLO from %s (runtime %s, version %d): %d models" % (client, ort_version, self.version, len(models)))
         self.server.record_hello({"client": client, "version": self.version,
                                   "models": [{"name": n, "overrides": [[d, v] for d, v in o]} for n, _, _, o in models]})
@@ -398,11 +463,20 @@ class Handler(socketserver.StreamRequestHandler):
         self.server.log("NOTICE from %s: %s, %s (%d lines): %s" % (self.client, model, reason, lines, detail))
         self.server.record_notice({"client": self.client, "model": model, "reason": reason, "detail": detail, "lines": lines})
 
+    def layout(self, key):
+        """The model's line state when this server holds it (held 1), else None."""
+        return None if self.server.cfg.no_held or key is None else self.server.models.layout(key)
+
     def run(self, payload, ready, cfg):
         r = Reader(payload)
         request_id = r.u32()
+        stream, mode = 0, 0
         faulty = self.server.take_fault()
         try:
+            if self.version >= 3:
+                stream, mode = r.u64(), r.u8()
+                if mode not in (0, 1, 2):
+                    raise Refusal(E_MALFORMED, "mode %d isn't 0, 1 or 2" % mode)
             model = r.str()
             if not valid_name(model):
                 raise Refusal(E_MALFORMED, "the model name isn't a plain file name")
@@ -419,14 +493,23 @@ class Handler(socketserver.StreamRequestHandler):
             raise
         if model not in ready:
             raise Refusal(E_UNKNOWN_MODEL, "%s isn't ready here" % model, request_id)
+        layout, past_frames, state_outputs = None, 0, []
+        if mode:
+            layout, past_frames = self.held_checks(mode, model, ready, feeds, outputs, request_id)
+            state_outputs = ["next_" + n[5:] for n in layout["pairs"]]
+            self.held_inputs(mode, stream, model, ready[model], layout, past_frames, feeds, request_id)
         if faulty and cfg.delay_ms:
             time.sleep(cfg.delay_ms / 1000.0)
         if faulty and cfg.run_error:
             raise Refusal(cfg.run_error, "a test option's error", request_id)
         try:
-            results, micros = self.server.models.run(ready[model], feeds, outputs)
+            results, micros = self.server.models.run(ready[model], feeds, outputs + state_outputs)
         except Exception as e:
             raise Refusal(E_INFERENCE, self.server.models.scrub(e), request_id)
+        if mode:
+            # changed only by a successful run
+            self.hold(mode, stream, model, ready[model], layout, past_frames, dict(zip(state_outputs, results[len(outputs):])))
+            results = results[:len(outputs)]
         fault = cfg.fault if faulty else "none"
         if fault == "malformed":
             self.send(RUN_OK, struct.pack("<II", request_id, micros) + b"\x01")
@@ -446,6 +529,72 @@ class Handler(socketserver.StreamRequestHandler):
         self.send(RUN_OK, body)
 
 
+    def held_checks(self, mode, model, ready, feeds, outputs, request_id):
+        """The agreement's refusals of a held run (ERROR 1, closing): (layout, past_frames) when none applies."""
+        layout = self.layout(ready[model])
+        if layout is None:
+            raise Refusal(E_MALFORMED, "mode %d for %s, which this server marks held 0" % (mode, model), request_id)
+        frames = feeds.get("past_frames")
+        if frames is None or frames.dtype != np.int64 or frames.size != 1:
+            raise Refusal(E_MALFORMED, "mode %d without past_frames" % mode, request_id)
+        past_frames = int(frames.reshape(-1)[0])
+        if mode == 1 and past_frames != 0:
+            raise Refusal(E_MALFORMED, "a start (mode 1) with past_frames %d" % past_frames, request_id)
+        if mode == 2 and past_frames <= 0:
+            raise Refusal(E_MALFORMED, "a continue (mode 2) with past_frames %d" % past_frames, request_id)
+        for name in layout["pairs"]:
+            if name in feeds or "next_" + name[5:] in outputs:
+                raise Refusal(E_MALFORMED, "mode %d carrying %s or asking for next_%s" % (mode, name, name[5:]), request_id)
+        return layout, past_frames
+
+    def held_inputs(self, mode, stream, model, key, layout, past_frames, feeds, request_id):
+        """The state a held run starts from: zeros for a start; for a continue, the stream's, or ERROR 8."""
+        self.check_drop()
+        if mode == 1:
+            for name, (shape, dtype) in layout["shapes"].items():
+                feeds[name] = np.zeros(shape, dtype=dtype)
+            return
+        held = self.held.get(stream)
+        if held is not None and not held["rebuilt"] and self.server.take_drop():
+            del self.held[stream]  # the test option: as an eviction would
+            held = None
+        if held is None or held["model"] != model or held["key"] != key or held["count"] != past_frames:
+            self.state_errors.add(stream)
+            why = ("no state is held for stream %d" % stream if held is None
+                   else "stream %d holds %s's state" % (stream, held["model"]) if held["model"] != model or held["key"] != key
+                   else "past_frames is %d, not %d" % (past_frames, held["count"]))
+            self.server.log("ERROR 8 to %s: %s" % (self.client, why))
+            raise Refusal(E_STATE, why, request_id)
+        feeds.update(held["states"])
+
+    def hold(self, mode, stream, model, key, layout, past_frames, next_states):
+        """A successful held run: the stream's state and count, replaced by a start, the least recently used freed."""
+        states = {"past_" + n[5:]: np.ascontiguousarray(a) for n, a in next_states.items()}
+        count = min(past_frames + layout["F"], layout["W"])
+        if mode == 1:
+            rebuilt = stream in self.state_errors
+            self.state_errors.discard(stream)
+            self.held.pop(stream, None)
+            while len(self.held) >= HELD_CAP:
+                self.held.popitem(last=False)
+            self.held[stream] = {"model": model, "key": key, "count": count, "states": states, "rebuilt": rebuilt}
+        else:
+            self.held[stream].update(count=count, states=states)
+            self.held.move_to_end(stream)
+
+    def check_drop(self):
+        """--drop-held-on: every connection's held states dropped once the file appears."""
+        path = self.server.cfg.drop_held_on
+        with self.server.drop_lock:
+            if path and os.path.exists(path):
+                os.unlink(path)
+                self.server.drop_generation += 1
+            generation = self.server.drop_generation
+        if generation != self.drop_seen:
+            self.drop_seen = generation
+            self.held.clear()
+
+
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -462,6 +611,17 @@ class Server(socketserver.ThreadingTCPServer):
             return
         with self.notice_lock, open(self.cfg.hello_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(hello) + "\n")
+
+    def take_drop(self):
+        """--drop-held-every N: whether this continue finds its state dropped (every Nth continue the server gets)."""
+        if self.cfg.drop_held_every <= 0:
+            return False
+        with self.drop_lock:
+            self.continues += 1
+            if self.continues >= self.cfg.drop_held_every:
+                self.continues = 0
+                return True
+            return False
 
     def take_fault(self):
         """Whether this RUN gets the test options' delay, fault or error (all of them, or the first --fault-count)."""
@@ -540,11 +700,22 @@ def main(argv=None):
     p.add_argument("--fault-count", type=int, default=0,
                    help="test option: --delay-ms, --fault and --run-error apply to the first this many RUNs only (0: all)")
     p.add_argument("--v1-only", action="store_true",
-                   help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a version 2 HELLO gets ERROR 6, "
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97 Beta patch7 and earlier: a newer version's HELLO (2 or 3) gets ERROR 6, "
                         "read whole first and closed cleanly, as patch7 does")
     p.add_argument("--p6", action="store_true",
-                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a version 2 HELLO's header alone is "
-                        "read, ERROR 6 sent, and the connection closed with the payload unread (which can reset it)")
+                   help="speak protocol version 1 alone, as PandorumLLM v3.97-p6 and earlier: a newer version's HELLO (2 or 3) "
+                        "has its header alone read, ERROR 6 sent, and the connection closed with the payload unread (which can "
+                        "reset it)")
+    p.add_argument("--v2-only", action="store_true",
+                   help="speak protocol versions 1 and 2 alone, as a released version 2 panel (PandorumLLM v3.97 Beta patch8 to "
+                        "v3.98 Beta patch26): a version 3 HELLO is read whole, answered with ERROR 6 framed in version 2, and closed")
+    p.add_argument("--no-held", action="store_true",
+                   help="version 3: hold no line state (every model held 0), as with the panel's Keep line state off")
+    p.add_argument("--drop-held-on", default="", metavar="FILE",
+                   help="test option: drop every connection's held state when FILE appears (it is then removed); checked at each RUN")
+    p.add_argument("--drop-held-every", type=int, default=0, metavar="N",
+                   help="test option: every Nth continue the server gets of a line not rebuilt after an ERROR 8 finds its "
+                        "stream's state gone (ERROR 8)")
     p.add_argument("--remote-ip", default="",
                    help="answer FIND (UDP, on the same port) from this address alone, as PandorumLLM's Remote IP (empty: no FIND)")
     p.add_argument("--notice-log", default="", help="append each NOTICE to this file, one JSON object a line")
@@ -559,7 +730,10 @@ def main(argv=None):
     allowed = set(cfg.allow.split(",")) if cfg.allow else None
     server = Server((cfg.host, cfg.port), Handler)
     server.cfg = cfg
-    server.versions = (1,) if cfg.v1_only or cfg.p6 else VERSIONS
+    server.versions = (1,) if cfg.v1_only or cfg.p6 else (1, 2) if cfg.v2_only else VERSIONS
+    server.drop_lock = threading.Lock()
+    server.drop_generation = 0
+    server.continues = 0
     if cfg.p6:
         Handler.rbufsize = 0  # reads take only what they ask for: the payload stays unread in the socket
     server.notice_lock = threading.Lock()

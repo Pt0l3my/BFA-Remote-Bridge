@@ -684,7 +684,7 @@ TEST(ForwardFindsTheServerOnTheLocalNetwork) {
     Ok(h.Create(Models() / "tiny.onnx", {{"batch", 2}}, &session));
     CHECK(h.bridge.IsBridgeSession(session));
     CHECK_EQ(h.CountLogged("Found the server on the local network: BFA Remote Bridge reference server"), 1);
-    CHECK_EQ(h.bridge.Connection().ServerVersion(), 2);
+    CHECK_EQ(h.bridge.Connection().ServerVersion(), 3);  // found by a version 2 FIND, then spoken to in version 3
     TinyInputs in(h.api, h.cpu, 4);
     for (int i = 0; i < 3; ++i) {
         Outputs out(h.api, 5);
@@ -701,7 +701,7 @@ TEST(ForwardFindsTheServerOnTheLocalNetwork) {
     h.api->ReleaseSession(session);
 }
 
-// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the version 2 HELLO with ERROR 6 framed in version 1:
+// A version 1 server (PandorumLLM v3.97 Beta patch7 and earlier) answers the bridge's version 3 HELLO with ERROR 6 framed in version 1:
 // the bridge connects again in version 1, says so once, and stays on version 1 for it. A fallback is told by the
 // status check (`fallback REASON`), never by NOTICE.
 TEST(ForwardVersionOneServer) {
@@ -769,8 +769,9 @@ TEST(ForwardHelloAgainWhenSessionsChange) {
     fs::remove_all(folder);
 }
 
-// A server that closes as PandorumLLM v3.97-p6 and earlier do, with the version 2 HELLO's payload unread (which can
-// reset the connection before its ERROR 6 is read): either way the bridge ends on version 1, and lines go.
+// A server that closes as PandorumLLM v3.97-p6 and earlier do, with a newer version's HELLO payload unread (the bridge's
+// version 3 HELLO, then version 2's), which can reset the connection before its ERROR 6 is read: either way the bridge
+// ends on version 1, and lines go.
 TEST(ForwardP6ServerEndsOnVersionOne) {
     Need();
     for (int i = 0; i < 3; ++i) {
@@ -787,14 +788,16 @@ TEST(ForwardP6ServerEndsOnVersionOne) {
         Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
         CHECK(!IsNanAnswer(h.api, out.v[0]));
         std::printf("        p6 try %d: %s\n", i,
-                    h.Logged("two version 2 HELLOs got no answer") ? "no frame twice" : "ERROR 6 read");
+                    h.Logged("two version 2 HELLOs got no answer")   ? "no frame twice in versions 3 and 2"
+                    : h.Logged("two version 3 HELLOs got no answer") ? "no frame twice in version 3, then ERROR 6 read in version 2"
+                                                                      : "ERROR 6 read in version 3");
         h.api->ReleaseSession(session);
     }
 }
 
 // BFA's mode follows the version the server answers in, never a detail's words: a version 1 server that fills in
 // BFA's sizes when a HELLO lists none (as PandorumLLM's patch7 does), and says so in the row's detail, still gets BFA's
-// own mode; a version 2 server gets its CPU mode.
+// own mode; a version 2 or 3 server gets its CPU mode.
 namespace {
 struct MemoryIni final : IniStore {
     int forceCpu = 0;
@@ -823,9 +826,11 @@ TEST(ForwardBfaModeFollowsTheVersionNotTheDetail) {
     std::string err;
     CHECK(HashFile(Models() / "tiny.onnx", size, digest, err));
     const std::string fill = Sha256::Hex(digest) + ":batch=2";
-    for (const bool v1 : {true, false}) {
+    for (const int speaks : {1, 2, 3}) {
+        const bool v1 = speaks == 1;
         std::vector<std::string> args = {"--fill-sizes", fill};
         if (v1) args.push_back("--v1-only");
+        if (speaks == 2) args.push_back("--v2-only");
         Server server(Models(), args);
         Harness h(On(server.Port()));
         auto store = std::make_unique<MemoryIni>();
@@ -841,7 +846,7 @@ TEST(ForwardBfaModeFollowsTheVersionNotTheDetail) {
         Outputs out(h.api, 5);
         Ok(h.api->Run(session, nullptr, kTinyIn, in.values.data(), 5, kTinyOut, 5, out.v.data()));
         CHECK(!IsNanAnswer(h.api, out.v[0]));
-        CHECK_EQ(h.bridge.Connection().ServerVersion(), v1 ? 1 : 2);
+        CHECK_EQ(h.bridge.Connection().ServerVersion(), speaks);
         CHECK_EQ(mode.Set(), !v1);
         CHECK_EQ(ini->forceCpu, v1 ? 0 : 1);
         h.bridge.Connection().OnVersion(nullptr);
@@ -1715,14 +1720,15 @@ OrtValue* LongTensor(Harness& h, std::int64_t& value) {
 // its line's state: past_k and past_v in, next_k and next_v out ([6, 1, 4, 256, 152] float each, 3,735,552 bytes).
 // A first run from an empty state and a second fed the first's next_k and next_v (90 frames kept, as BFA's JSON
 // describes) answer through the bridge exactly as local runs do, byte for byte, so the state round-trips through the
-// bridge unchanged. The run's wall time on loopback is logged.
+// bridge unchanged: carried, as with a server that holds no line state (held 0; ForwardBfa700PerformanceHeld has held
+// mode). The run's wall time on loopback is logged.
 TEST(ForwardBfa700Performance) {
     Need();
     const fs::path model = Env("BFARB_BFA7_PERFORMANCE");
     if (model.empty()) SKIP("BFARB_BFA7_PERFORMANCE isn't set");
     const fs::path dir = TempFolder("bfa700-performance");
     fs::create_symlink(fs::absolute(model), dir / "performance.onnx");
-    Server server(dir);
+    Server server(dir, {"--no-held"});
     Settings s = On(server.Port());
     s.timeoutMs = 5000;  // the wall time is logged against kRunTimeoutMs, not made to fit it
     Harness h(s);
@@ -2087,4 +2093,428 @@ TEST(ForwardGraphicsMemoryOutputIsRefused) {
              1);
     h.api->ReleaseMemoryInfo(gpu);
     h.api->ReleaseSession(session);
+}
+
+// ---- protocol version 3: a line's state held on the server (1.7.0)
+
+namespace {
+
+// A model with a line's state, as BFA 7.0.0's Performance model has one: its shapes, F (frames a run) and W (the
+// state's window).
+struct StateSpec {
+    std::vector<std::int64_t> mel, emotion, state, motion;
+    std::int64_t frames = 0, window = 0;
+};
+const StateSpec kTinyState{{1, 4, 8}, {1, 4, 2}, {2, 1, 2, 8, 3}, {1, 4, 5}, 4, 8};          // tests/make_test_model.py
+const StateSpec kBfa7State{{1, 120, 80}, {1, 120, 10}, {6, 1, 4, 256, 152}, {1, 90, 73}, 90, 256};  // BFA 7.0.0's
+
+std::size_t Count(const std::vector<std::int64_t>& dims) {
+    std::size_t n = 1;
+    for (const auto d : dims) n *= static_cast<std::size_t>(d);
+    return n;
+}
+
+const char* kStateIn[] = {"mel", "identity", "emotion", "past_k", "past_v", "past_frames"};
+const char* kStateOut[] = {"normalized_motion", "next_k", "next_v"};
+
+// One window's inputs but the state, from a seed.
+struct WindowData {
+    std::vector<float> mel, emotion;
+    std::int64_t identity = 0;
+    WindowData(const StateSpec& spec, unsigned seed) : mel(Count(spec.mel)), emotion(Count(spec.emotion)), identity(seed % 2) {
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> n(0.f, 1.f);
+        for (auto& v : mel) v = n(rng);
+        for (auto& v : emotion) v = std::fabs(n(rng)) * 0.1f;
+    }
+};
+
+bool AnyNan(const std::vector<std::uint8_t>& floats) {
+    for (std::size_t i = 0; i + 4 <= floats.size(); i += 4) {
+        float f = 0;
+        std::memcpy(&f, floats.data() + i, 4);
+        if (std::isnan(f)) return true;
+    }
+    return false;
+}
+
+// BFA's runs of a stateful model, as BFA 7.0.0.1 makes them: every input over a CPU buffer of its own
+// (CreateTensorWithDataAsOrtValue), the outputs pre-bound over its own buffers too, and after each answer its past and
+// next state buffers swapped whole, past_frames min(previous + F, W). With `bound` off, the outputs are left for the
+// runtime to make and copied into BFA's buffers (BFA's way when an output overlaps an input).
+struct BfaLine {
+    Harness& h;
+    OrtSession* session;
+    StateSpec spec;
+    bool bound;
+    std::vector<float> pastK, pastV, nextK, nextV, motion;
+    std::int64_t pastFrames = 0;
+    bool nextUntouched = true;  // every pre-bound next_k and next_v left as it was by the bridge
+    bool nextZero = true;       // every next_k and next_v the bridge made is zeros of past_k's shape and type
+    std::vector<double> ms;     // each run's wall time
+    BfaLine(Harness& harness, OrtSession* s, const StateSpec& sp, bool preBound = true)
+        : h(harness), session(s), spec(sp), bound(preBound), pastK(Count(sp.state)), pastV(Count(sp.state)), nextK(Count(sp.state), 0.f),
+          nextV(Count(sp.state), 0.f), motion(Count(sp.motion)) {}
+
+    void Start() {
+        std::fill(pastK.begin(), pastK.end(), 0.f);
+        std::fill(pastV.begin(), pastV.end(), 0.f);
+        pastFrames = 0;
+    }
+    // One window: its motion, or empty when the bridge answered NaN (BFA then ends the line).
+    std::vector<std::uint8_t> Run(unsigned seed) {
+        WindowData w(spec, seed);
+        std::vector<OrtValue*> values = {FloatTensor(h, w.mel, spec.mel),    LongTensor(h, w.identity), FloatTensor(h, w.emotion, spec.emotion),
+                                         FloatTensor(h, pastK, spec.state), FloatTensor(h, pastV, spec.state), LongTensor(h, pastFrames)};
+        Outputs o(h.api, 3);
+        if (bound) o.v = {FloatTensor(h, motion, spec.motion), FloatTensor(h, nextK, spec.state), FloatTensor(h, nextV, spec.state)};
+        const std::vector<float> k0 = nextK, v0 = nextV;
+        const auto t0 = Clock::now();
+        Ok(h.api->Run(session, nullptr, kStateIn, values.data(), values.size(), kStateOut, 3, o.v.data()));
+        ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        for (auto* v : values) h.api->ReleaseValue(v);
+        std::vector<std::int64_t> dims;
+        int type = 0;
+        auto got = Bytes(h.api, o.v[0], &dims, &type);
+        if (AnyNan(got)) return {};
+        CHECK(dims == spec.motion);
+        if (bound) {
+            nextUntouched = nextUntouched && nextK == k0 && nextV == v0;
+        } else {
+            for (int i = 1; i <= 2; ++i) {
+                const auto b = Bytes(h.api, o.v[static_cast<std::size_t>(i)], &dims, &type);
+                CHECK(dims == spec.state);
+                CHECK_EQ(type, static_cast<int>(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+                CHECK_EQ(b.size(), nextK.size() * 4);
+                nextZero = nextZero && std::all_of(b.begin(), b.end(), [](std::uint8_t x) { return x == 0; });
+                std::memcpy(i == 1 ? nextK.data() : nextV.data(), b.data(), b.size());
+            }
+        }
+        std::swap(pastK, nextK);
+        std::swap(pastV, nextV);
+        pastFrames = std::min(pastFrames + spec.frames, spec.window);
+        return got;
+    }
+};
+
+// The same line on a session of the runtime's own, outside the bridge, each run carrying the last one's state.
+std::vector<std::vector<std::uint8_t>> LocalLine(const fs::path& model, std::vector<std::pair<const char*, int>> overrides, const StateSpec& spec,
+                                                 const std::vector<unsigned>& seeds) {
+    const OrtApi* real = RealApi();
+    OrtEnv* env = nullptr;
+    Ok(real->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "bfarb-local", &env));
+    OrtMemoryInfo* cpu = nullptr;
+    Ok(real->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu));
+    OrtSessionOptions* so = nullptr;
+    Ok(real->CreateSessionOptions(&so));
+    Ok(real->SetIntraOpNumThreads(so, 1));
+    Ok(real->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_EXTENDED));
+    for (auto [n, v] : overrides) Ok(real->AddFreeDimensionOverrideByName(so, n, v));
+    OrtSession* s = nullptr;
+    Ok(real->CreateSession(env, model.c_str(), so, &s));
+    real->ReleaseSessionOptions(so);
+    std::vector<float> k(Count(spec.state), 0.f), v(Count(spec.state), 0.f);
+    std::int64_t frames = 0;
+    std::vector<std::vector<std::uint8_t>> motions;
+    const auto tensor = [&](void* p, std::size_t bytes, const std::vector<std::int64_t>& shape, ONNXTensorElementDataType t) {
+        OrtValue* value = nullptr;
+        Ok(real->CreateTensorWithDataAsOrtValue(cpu, p, bytes, shape.data(), shape.size(), t, &value));
+        return value;
+    };
+    for (const unsigned seed : seeds) {
+        WindowData w(spec, seed);
+        const std::vector<std::int64_t> one = {1};
+        std::vector<OrtValue*> values = {tensor(w.mel.data(), w.mel.size() * 4, spec.mel, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+                                         tensor(&w.identity, 8, one, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
+                                         tensor(w.emotion.data(), w.emotion.size() * 4, spec.emotion, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+                                         tensor(k.data(), k.size() * 4, spec.state, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+                                         tensor(v.data(), v.size() * 4, spec.state, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+                                         tensor(&frames, 8, one, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)};
+        Outputs o(real, 3);
+        Ok(real->Run(s, nullptr, kStateIn, values.data(), values.size(), kStateOut, 3, o.v.data()));
+        for (auto* x : values) real->ReleaseValue(x);
+        motions.push_back(Bytes(real, o.v[0]));
+        const auto nk = Bytes(real, o.v[1]), nv = Bytes(real, o.v[2]);
+        std::memcpy(k.data(), nk.data(), nk.size());
+        std::memcpy(v.data(), nv.data(), nv.size());
+        frames = std::min(frames + spec.frames, spec.window);
+    }
+    real->ReleaseSession(s);
+    real->ReleaseMemoryInfo(cpu);
+    real->ReleaseEnv(env);
+    return motions;
+}
+
+std::vector<unsigned> Seeds(unsigned first, int n) {
+    std::vector<unsigned> s;
+    for (int i = 0; i < n; ++i) s.push_back(first + static_cast<unsigned>(i));
+    return s;
+}
+
+// A line of stateful.onnx through the bridge to a reference server started with `args`: its motions.
+struct HeldLineRun {
+    std::vector<std::vector<std::uint8_t>> motions;
+    Stats stats;
+    bool untouched = true, zero = true;
+    int replays = 0;
+    std::uint16_t version = 0;
+};
+// lineLength: a new line (a start) every so many windows; 0, one line.
+HeldLineRun TinyLine(std::vector<std::string> args, const std::vector<unsigned>& seeds, bool bound = true, std::size_t lineLength = 0) {
+    Server server(Models(), std::move(args));
+    Settings s = On(server.Port());
+    s.logDetail = LogDetail::Detailed;
+    Harness h(s);
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+    BfaLine line(h, session, kTinyState, bound);
+    HeldLineRun out;
+    for (std::size_t i = 0; i < seeds.size(); ++i) {
+        if (lineLength && i % lineLength == 0) line.Start();
+        out.motions.push_back(line.Run(seeds[i]));
+    }
+    out.stats = h.bridge.Statistics();
+    out.untouched = line.nextUntouched;
+    out.zero = line.nextZero;
+    out.replays = h.bridge.Connection().Replays();
+    out.version = h.bridge.Connection().ServerVersion();
+    h.api->ReleaseSession(session);
+    return out;
+}
+
+}  // namespace
+
+// Held mode against carried mode, byte for byte, over a chained line (tests/make_test_model.py's stateful.onnx, whose
+// layout is BFA 7.0.0's Performance model's): the bridge's line through a version 3 server holding its state, through
+// one holding none (held 0, mode 0), and through a version 2 server, each run answered exactly as a local run fed the
+// last run's real state. In held mode BFA's pre-bound next_k and next_v are left as they were (finite: zeros, then
+// the state of two windows before), and when the runtime makes the outputs they are zeros of past_k's shape and type;
+// nothing of past_k or past_v goes up and nothing of next_k or next_v comes back.
+TEST(ForwardHeldLineMatchesCarriedByteForByte) {
+    Need();
+    const auto seeds = Seeds(40, 7);  // past_frames 0, 4, 8, 8, ...: the state's window filled, then slid
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, seeds);
+    const HeldLineRun held = TinyLine({}, seeds);
+    const HeldLineRun carried = TinyLine({"--no-held"}, seeds);
+    const HeldLineRun v2 = TinyLine({"--v2-only"}, seeds);
+    const HeldLineRun made = TinyLine({}, seeds, false);
+    CHECK_EQ(held.version, 3);
+    CHECK_EQ(carried.version, 3);
+    CHECK_EQ(v2.version, 2);
+    for (std::size_t i = 0; i < seeds.size(); ++i) {
+        CHECK(!local[i].empty());
+        CHECK(held.motions[i] == local[i]);
+        CHECK(carried.motions[i] == local[i]);
+        CHECK(v2.motions[i] == local[i]);
+        CHECK(made.motions[i] == local[i]);
+    }
+    CHECK(held.untouched);
+    CHECK(made.zero);
+    CHECK_EQ(held.stats.forwarded, seeds.size());
+    CHECK_EQ(held.stats.unanswered, 0u);
+    CHECK_EQ(held.replays + carried.replays + v2.replays + made.replays, 0);
+    // the bytes: per run, carried sends past_k and past_v (two tensors of 96 floats, named, typed and shaped) and gets
+    // next_k and next_v back; held mode neither, and names neither
+    const std::size_t state = 2 + 6 + 1 + 1 + 5 * 8 + 4 + 96 * 4;
+    const std::size_t runs = seeds.size();
+    CHECK_EQ(carried.stats.bytesUp - held.stats.bytesUp, runs * (2 * state + 2 * (2 + 6)));
+    CHECK_EQ(carried.stats.bytesDown - held.stats.bytesDown, runs * 2 * state);
+    CHECK_EQ(v2.stats.bytesUp + runs * 9, carried.stats.bytesUp);  // version 3's mode 0 adds stream and mode
+    std::printf("        stateful.onnx, %zu runs: held %llu bytes up, %llu back; carried %llu up, %llu back\n", runs,
+                static_cast<unsigned long long>(held.stats.bytesUp), static_cast<unsigned long long>(held.stats.bytesDown),
+                static_cast<unsigned long long>(carried.stats.bytesUp), static_cast<unsigned long long>(carried.stats.bytesDown));
+}
+
+// A lost state replayed, byte for byte: the server drops the line's state mid-line (on demand, as after a restart or an
+// eviction), the next continue gets ERROR 8, and the bridge replays the line from its start within the run's own
+// deadline; every motion is still a local run's. Then the server drops a state at every 4th continue of a line not
+// rebuilt, over three lines of 7 windows: each loss is replayed, and every line stays exact.
+TEST(ForwardHeldLostStateIsReplayedByteForByte) {
+    Need();
+    const fs::path dir = TempFolder("held-drop");
+    const fs::path trigger = dir / "drop";
+    const auto seeds = Seeds(60, 6);
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, seeds);
+    {
+        Server server(Models(), {"--drop-held-on", trigger.string()});
+        Settings s = On(server.Port());
+        Harness h(s);
+        OrtSession* session = nullptr;
+        Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+        BfaLine line(h, session, kTinyState);
+        for (std::size_t i = 0; i < seeds.size(); ++i) {
+            if (i == 3) std::ofstream(trigger.string()).put('x');
+            CHECK(line.Run(seeds[i]) == local[i]);
+        }
+        CHECK(!fs::exists(trigger));
+        CHECK_EQ(h.bridge.Connection().Replays(), 1);
+        CHECK_EQ(h.CountLogged("stateful.onnx: the server no longer held its line's state (ERROR 8, the line's state isn't held: no state is "
+                               "held for stream 1); its 3 earlier windows replayed from a start, then this one sent again"),
+                 1);
+        CHECK_EQ(h.bridge.Statistics().unanswered, 0u);
+        CHECK(line.nextUntouched);
+        h.api->ReleaseSession(session);
+    }
+    {
+        const auto lines = Seeds(70, 21);
+        std::vector<std::vector<std::uint8_t>> expected;
+        for (std::size_t first = 0; first < lines.size(); first += 7) {
+            const auto one = LocalLine(Models() / "stateful.onnx", {}, kTinyState, std::vector<unsigned>(lines.begin() + first, lines.begin() + first + 7));
+            expected.insert(expected.end(), one.begin(), one.end());
+        }
+        const HeldLineRun every = TinyLine({"--drop-held-every", "4"}, lines, true, 7);
+        for (std::size_t i = 0; i < lines.size(); ++i) CHECK(every.motions[i] == expected[i]);
+        CHECK_EQ(every.replays, 3);
+        CHECK_EQ(every.stats.unanswered, 0u);
+    }
+    fs::remove_all(dir);
+}
+
+// A reconnect in the middle of a line (the server closed an idle connection): the run connects again within its own
+// call, its continue gets ERROR 8 on the new connection, and the line is replayed there, exactly.
+TEST(ForwardHeldReconnectMidLineReplays) {
+    Need();
+    Server server(Models(), {"--idle-seconds", "0.3"});
+    Harness h(On(server.Port()));
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+    const auto seeds = Seeds(80, 5);
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, seeds);
+    BfaLine line(h, session, kTinyState);
+    for (std::size_t i = 0; i < seeds.size(); ++i) {
+        if (i == 3) std::this_thread::sleep_for(std::chrono::milliseconds(600));  // the server closes the connection
+        CHECK(line.Run(seeds[i]) == local[i]);
+    }
+    CHECK_EQ(h.bridge.Connection().Replays(), 1);
+    CHECK(h.Logged("The server had closed the connection; reconnecting") || h.Logged("The server had reset the connection; reconnecting"));
+    CHECK_EQ(h.bridge.Connection().Reconnects(), 2);
+    CHECK_EQ(h.bridge.Statistics().unanswered, 0u);
+    h.api->ReleaseSession(session);
+}
+
+// A replay that can't finish within the run's time is answered as a timeout is: non-finite motion (BFA drops that line,
+// and the game's own lip sync plays it), never an error status; counted as a timeout and noted. The next line starts
+// afresh, the late answer discarded first. Here each run takes the server 150 ms, and the call has 500.
+TEST(ForwardHeldReplayThatCantFinishIsATimeout) {
+    Need();
+    const fs::path dir = TempFolder("held-slow");
+    const fs::path trigger = dir / "drop";
+    Server server(Models(), {"--drop-held-on", trigger.string(), "--delay-ms", "150"});
+    Settings s = On(server.Port());
+    s.timeoutMs = 500;
+    Harness h(s);
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+    BfaLine line(h, session, kTinyState);
+    for (unsigned seed = 90; seed < 94; ++seed) CHECK(!line.Run(seed).empty());
+    std::ofstream(trigger.string()).put('x');
+    CHECK(line.Run(94).empty());  // ERROR 8, then four windows to replay and this one: 750 ms
+    CHECK_EQ(h.bridge.Connection().Replays(), 1);
+    CHECK_EQ(h.bridge.Connection().Totals().timeouts, 1u);
+    CHECK_EQ(h.bridge.Statistics().unanswered, 1u);
+    CHECK_EQ(h.CountNotes("stateful.onnx: lines get the game's own lip sync"), 1);
+    // BFA's next line: a start, answered
+    line.Start();
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, {95, 96});
+    CHECK(line.Run(95) == local[0]);
+    CHECK(line.Run(96) == local[1]);
+    CHECK(!h.bridge.Connection().Paused());
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
+// A replay that fails without timing out, through the bridge's run path: the line is longer than the bridge keeps
+// (65 windows, past kLineWindows), the server then loses its state, and the replay can't be made. BFA still gets the
+// non-finite answer, never an error status, counted as a timeout and noted; the connection stays, and the next line is
+// answered as a local run.
+TEST(ForwardHeldLineTooLongToReplayIsATimeout) {
+    Need();
+    const fs::path dir = TempFolder("held-long");
+    const fs::path trigger = dir / "drop";
+    Server server(Models(), {"--drop-held-on", trigger.string()});
+    Harness h(On(server.Port()));
+    OrtSession* session = nullptr;
+    Ok(h.Create(Models() / "stateful.onnx", {}, &session));
+    BfaLine line(h, session, kTinyState);
+    for (unsigned seed = 200; seed <= 200 + kLineWindows; ++seed) CHECK(!line.Run(seed).empty());
+    CHECK_EQ(h.bridge.Connection().LineBytes("stateful.onnx"), std::size_t{0});  // past the cap: nothing kept
+    std::ofstream(trigger.string()).put('x');
+    CHECK(line.Run(300).empty());  // Ok() above: the call's status is success, its answer NaN
+    CHECK_EQ(h.bridge.Connection().Replays(), 1);
+    CHECK_EQ(h.bridge.Connection().Totals().timeouts, 1u);
+    CHECK_EQ(h.bridge.Statistics().unanswered, 1u);
+    CHECK(h.Logged("the server no longer held its line's state, and its line is longer than the bridge keeps for a replay"));
+    CHECK_EQ(h.CountNotes("stateful.onnx: lines get the game's own lip sync"), 1);
+    line.Start();
+    const auto local = LocalLine(Models() / "stateful.onnx", {}, kTinyState, {301, 302});
+    CHECK(line.Run(301) == local[0]);
+    CHECK(line.Run(302) == local[1]);
+    CHECK(!h.bridge.Connection().Paused());
+    CHECK_EQ(h.bridge.Connection().Reconnects(), 1);
+    h.api->ReleaseSession(session);
+    fs::remove_all(dir);
+}
+
+// BFA 7.0.0's Performance model (never committed: BFARB_BFA7_PERFORMANCE) in held mode against carried mode, byte for
+// byte, over a line of five windows (past_frames 0, 90, 180, 256, 256), with a lost state replayed at the fifth; the
+// payload sizes and loopback times of each are printed.
+TEST(ForwardBfa700PerformanceHeld) {
+    Need();
+    const fs::path model = Env("BFARB_BFA7_PERFORMANCE");
+    if (model.empty()) SKIP("BFARB_BFA7_PERFORMANCE isn't set");
+    const fs::path dir = TempFolder("bfa700-held");
+    fs::create_symlink(fs::absolute(model), dir / "performance.onnx");
+    const fs::path trigger = dir / "drop";
+    const auto seeds = Seeds(100, 5);
+    const auto local = LocalLine(dir / "performance.onnx", {{"batch", 1}}, kBfa7State, seeds);
+    struct Result {
+        std::vector<std::vector<std::uint8_t>> motions;
+        std::vector<double> ms;
+        Stats first;  // after the line's first run
+        Stats all;
+        int replays = 0;
+        bool untouched = true;
+    };
+    const auto line = [&](std::vector<std::string> args, bool drop) {
+        Server server(dir, std::move(args));
+        Settings s = On(server.Port());
+        s.timeoutMs = 5000;  // the wall time is printed against kRunTimeoutMs, not made to fit it
+        Harness h(s);
+        h.bridge.Connection().SetBfaVersion("7.0.0.1");
+        OrtSession* session = nullptr;
+        Ok(h.Create(dir / "performance.onnx", {}, &session));
+        BfaLine bfa(h, session, kBfa7State);
+        Result r;
+        for (std::size_t i = 0; i < seeds.size(); ++i) {
+            if (drop && i == 4) std::ofstream(trigger.string()).put('x');
+            r.motions.push_back(bfa.Run(seeds[i]));
+            if (i == 0) r.first = h.bridge.Statistics();
+        }
+        r.ms = bfa.ms;
+        r.all = h.bridge.Statistics();
+        r.replays = h.bridge.Connection().Replays();
+        r.untouched = bfa.nextUntouched;
+        h.api->ReleaseSession(session);
+        return r;
+    };
+    const Result held = line({"--drop-held-on", trigger.string()}, true);
+    const Result carried = line({"--no-held"}, false);
+    for (std::size_t i = 0; i < seeds.size(); ++i) {
+        CHECK(held.motions[i] == local[i]);
+        CHECK(carried.motions[i] == local[i]);
+    }
+    CHECK_EQ(held.replays, 1);
+    CHECK(held.untouched);
+    CHECK_EQ(carried.replays, 0);
+    const auto per = [](const Stats& s) { return static_cast<unsigned long long>(s.bytesUp + s.bytesDown); };
+    std::printf("        performance.onnx (7.0.0), one run, frames and payloads both ways: held %llu bytes (%llu up, %llu back), "
+                "carried %llu bytes (%llu up, %llu back)\n",
+                per(held.first), static_cast<unsigned long long>(held.first.bytesUp), static_cast<unsigned long long>(held.first.bytesDown),
+                per(carried.first), static_cast<unsigned long long>(carried.first.bytesUp),
+                static_cast<unsigned long long>(carried.first.bytesDown));
+    std::printf("        loopback runs through the bridge, held: %.1f, %.1f, %.1f, %.1f ms, then %.1f ms with a lost state "
+                "replayed (4 windows); carried: %.1f, %.1f, %.1f, %.1f, %.1f ms (the game's limit: %d ms)\n",
+                held.ms[0], held.ms[1], held.ms[2], held.ms[3], held.ms[4], carried.ms[0], carried.ms[1], carried.ms[2], carried.ms[3],
+                carried.ms[4], kRunTimeoutMs);
+    fs::remove_all(dir);
 }

@@ -14,7 +14,7 @@
 //                   hook is installed at data loaded, once the scene factions are loaded
 //   game loaded     the settings again; at the first load, the notes held until then, BFA's state, and at each load
 //                   the monitor's lines (src/core/Monitor.h; setting showStatus)
-//   game saved      BFA's CPU mode written again, while a server answered in protocol version 2 this session
+//   game saved      BFA's CPU mode written again, while a server answered in protocol version 2 or 3 this session
 //                   (src/core/BfaMode.h); the server's version itself comes from the client, as a task on the main
 //                   thread
 //
@@ -249,8 +249,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     g_bridge = new Bridge(WinsockFactory(), &WinsockResolve, [](Level level, const std::string& line) { Log(level, line); });
     g_bridge->Connection().SetDiscovery(WinsockDiscovery());  // an empty address: FIND on each adapter's broadcast address
     g_mode = new BfaCpuMode(BfaIniStore(), [](Level level, const std::string& line) { Log(level, line); });
-    // the version the server answered in, on the game's main thread: BFA's CPU mode with version 2, its own value back
-    // with version 1
+    // the version the server answered in, on the game's main thread: BFA's CPU mode with version 2 or 3, its own value
+    // back with version 1
     g_bridge->Connection().OnVersion([](std::uint16_t version) {
         if (const auto* tasks = SKSE::GetTaskInterface()) tasks->AddTask([version] { g_mode->OnServerVersion(version); });
     });

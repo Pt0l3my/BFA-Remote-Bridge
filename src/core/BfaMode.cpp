@@ -10,7 +10,7 @@ namespace bfarb {
 namespace {
 
 constexpr const char* kVersionOneReason =
-    "the server speaks protocol version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2";
+    "the server speaks protocol version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2 or 3";
 
 // The C library's isspace, in the C locale.
 bool Space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'; }
@@ -196,9 +196,11 @@ void BfaCpuMode::OnStart() {
 
 void BfaCpuMode::OnServerVersion(std::uint16_t version) {
     std::lock_guard lock(mutex_);
-    if (!store_ || (version != 1 && version != 2)) return;
-    answered_ = version;
-    if (version == 2)
+    if (!store_ || version < 1 || version > 3) return;
+    // a version 3 server speaks version 2 too: the same as a version 2 answer (it keeps version 2's sizes rule, as
+    // PandorumLLM's side confirmed: docs/PROTOCOL.md, "Version 2")
+    answered_ = version >= 2 ? 2 : 1;
+    if (answered_ == 2)
         SetLocked();
     else
         PutBackLocked(kVersionOneReason);
@@ -299,8 +301,8 @@ void BfaCpuMode::SetBfa4Locked() {
         return;
     }
     if (!setLogged_.insert("ForceCPU").second) return;
-    Log(Level::Info, "Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0): the server speaks protocol version "
-                     "2, so BFA uses its CPU mode from the next game start and opens nothing on this PC's graphics card. The model "
+    Log(Level::Info, "Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0): the server answered in protocol version "
+                     "2 or 3, so BFA uses its CPU mode from the next game start and opens nothing on this PC's graphics card. The model "
                      "still runs on the server.");
 }
 
@@ -350,7 +352,7 @@ void BfaCpuMode::SetBothKeysLocked() {
     const std::string models = face && emotion ? "Audio2Face and Audio2Emotion" : face ? "Audio2Face" : "Audio2Emotion";
     // that no graphics device is made with both on the CPU is known from 5.0.6's source; 7.0.0's wasn't read
     const bool noDevice = face && emotion && IsBfa506(bfaVersion_);
-    Log(Level::Info, "Set BFA's [General] " + what + " in BetterFacialAnimations.ini: the server speaks protocol version 2, so BFA runs " +
+    Log(Level::Info, "Set BFA's [General] " + what + " in BetterFacialAnimations.ini: the server answered in protocol version 2 or 3, so BFA runs " +
                          models + " in its CPU mode from the next game start" + (noDevice ? " and creates no graphics device on this PC" : "") +
                          ". The model still runs on the server.");
 }

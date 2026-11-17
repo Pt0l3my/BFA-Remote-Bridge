@@ -1,13 +1,15 @@
-# The bridge's protocol, versions 1 and 2
+# The bridge's protocol, versions 1, 2 and 3
 
 BFA Remote Bridge (the client, on the gaming PC) and an A2F server (on another PC of the local network, such as
 PandorumLLM's) speak this protocol. `src/core/Protocol.h` implements both sides' encoding; `src/core/Client.h` the
-client's conduct; `tools/reference_server.py` is a reference server, which speaks both versions (`--v1-only` for
-version 1 alone).
+client's conduct; `tools/reference_server.py` is a reference server, which speaks all three versions (`--v1-only` for
+version 1 alone, `--v2-only` for versions 1 and 2).
 
-Bridges 1.0.0 to 1.2.0 speak version 1. Bridge 1.3.0 and later speak version 2, which is version 1 with three messages added
-(NOTICE, FIND and FOUND), and version 1 to a server that speaks only that (["Version 2"](#version-2) below). The
-agreement behind version 2 is [AGREEMENT-1.2.md](AGREEMENT-1.2.md), stage 2.
+Bridges 1.0.0 to 1.2.0 speak version 1. Bridges 1.3.0 to 1.6.0 speak version 2, which is version 1 with three messages
+added (NOTICE, FIND and FOUND), and version 1 to a server that speaks only that (["Version 2"](#version-2) below). The
+agreement behind version 2 is [AGREEMENT-1.2.md](AGREEMENT-1.2.md), stage 2. Bridge 1.7.0 and later speak version 3,
+which is version 2 with a line's state kept on the server, and versions 2 and 1 to a server that speaks only those
+(["Version 3"](#version-3) below). The agreement behind version 3 is [AGREEMENT-1.7.md](AGREEMENT-1.7.md).
 
 ## 1 Facts from Better Facial Animations 4.3.2, 5.0.6 and 7.0.0
 
@@ -81,8 +83,8 @@ new game has begun, on its worker. What changed:
 
 ## 2 The protocol
 
-TCP, one request in flight per connection, strictly request then response (NOTICE, in version 2, is one-way). All
-integers little-endian. FIND and FOUND, in version 2, go on UDP.
+TCP, one request in flight per connection, strictly request then response (NOTICE, in versions 2 and 3, is one-way). All
+integers little-endian. FIND and FOUND go on UDP, as version 2 datagrams whatever version the TCP connection speaks.
 
 **Strings** (`str`): `u16` byte length, then UTF-8 bytes, no terminator.
 
@@ -91,7 +93,7 @@ integers little-endian. FIND and FOUND, in version 2, go on UDP.
 | Bytes | Field |
 |---|---|
 | 4 | magic, the ASCII bytes `BFAR` |
-| 2 | `u16` protocol version, `1` or `2` (see [the version rule](#version-2)) |
+| 2 | `u16` protocol version, `1`, `2` or `3` (see [the version rule](#version-2), and [version 3's](#version-3)) |
 | 2 | `u16` message type |
 | 4 | `u32` payload length (at most 64 MiB; larger is refused) |
 
@@ -100,18 +102,18 @@ integers little-endian. FIND and FOUND, in version 2, go on UDP.
 | Type | Name | Direction | Payload |
 |---|---|---|---|
 | 1 | HELLO | client → server | see below |
-| 2 | HELLO_OK | server → client | see below |
-| 3 | RUN | client → server | see below |
+| 2 | HELLO_OK | server → client | see below (version 3 adds `held` to each row) |
+| 3 | RUN | client → server | see below (version 3 adds `stream` and `mode`) |
 | 4 | RUN_OK | server → client | see below |
 | 5 | ERROR | server → client | `u32` request id (0 for HELLO), `u16` code, `str` message |
 | 6 | PING | client → server | empty |
 | 7 | PONG | server → client | empty |
-| 8 | FIND | client → local network, UDP | version 2 only: `str` client |
-| 9 | FOUND | server → client, UDP | version 2 only: `str` server |
-| 10 | NOTICE | client → server | version 2 only: see below |
+| 8 | FIND | client → local network, UDP | a version 2 datagram: `str` client |
+| 9 | FOUND | server → client, UDP | a version 2 datagram: `str` server |
+| 10 | NOTICE | client → server | versions 2 and 3: see below |
 
 In version 1 a frame of type 8 or above is malformed (ERROR 1). FIND and FOUND are datagrams: on TCP they are
-malformed in either version.
+malformed in every version, and a datagram framed in a version other than 2 is ignored.
 
 **HELLO** comes first on every connection, and may come again at any time (BFA can switch models mid-game: the
 bridge then sends its current list again).
@@ -198,9 +200,9 @@ u16  output_count    in the order requested
 
 **Error codes**: 1 malformed frame or payload; 2 wrong access key; 3 unknown or unready model; 4 inference failed
 (the runtime's message in `message`); 5 too large; 6 protocol version not supported (framed in the newest version the
-server speaks: see the version rule); 7 busy or shutting down. After codes 1, 2, 5 and 6 the server closes the
-connection; code 7 says it is stopping, and the bridge treats it as the connection's end too. After codes 3 and 4 the
-connection stays open.
+server speaks: see the version rule); 7 busy or shutting down; 8 (version 3) the line's state isn't held (see
+["Version 3"](#version-3)). After codes 1, 2, 5 and 6 the server closes the connection; code 7 says it is stopping,
+and the bridge treats it as the connection's end too. After codes 3, 4 and 8 the connection stays open.
 
 **Rules**
 
@@ -255,12 +257,20 @@ get no sizes of the server's own, nor does any other file, and a HELLO that list
 listed. So BFA's CPU route, which lists none, is served for those two models ([AGREEMENT-1.2.md](AGREEMENT-1.2.md),
 measurement 5, which names the two files' SHA-256). PandorumLLM's v3.97 Beta patch7 does the same in version 1. The bridge never reads a detail as a sign of the
 server's version or abilities: it knows the version by the frames alone, and sets BFA's CPU mode only for a server
-that answered in version 2 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
+that answered in version 2 or 3 (section 3). The reference server has no such table; its `--fill-sizes SHA256:DIM=VALUE`
 stands in for one with the test files. For BFA 5.0.6 the bridge lists the sizes itself (section 3, "A model load"), so
 its HELLOs list overrides, to be served exactly as listed, and nothing on the wire changes: a server should need no
 table of 5.0.6's files. Two of those lists name dimensions the model lacks (`batch` for `emotion_fp16.onnx`, all three
 for `emotion_performance.onnx`, whose input is fixed), as BFA's own GPU route sets them; ONNX Runtime ignores such an
-override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6).
+override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6). The rule matches by SHA-256, so it
+reaches BFA 7.0.0's `a2f3_fp16.onnx` and `emotion_fp16.onnx` too: they are 4.3.2.3's files, byte for byte (PandorumLLM's
+hashes of the owner's 7.0.0.1 copies against its record of 4.3.2.3's set). Bridges 1.6.0 and later list their own sizes
+for BFA 7.0.0 (section 3), so the rule, which applies only to a HELLO that lists none, isn't used with them; it would be
+with bridge 1.5.0 and BFA 7.0.0. **In version 3** the rule is unchanged: a version 3 server keeps version 2's sizes
+rule, which BFA 4.3.2.3's CPU mode relies on. PandorumLLM's side confirmed it on 2026-11-17: its server reads and serves
+a HELLO with the same code in versions 1, 2 and 3 (only HELLO_OK's rows gain the held byte), checked against v3.98 Beta
+patch27 with 4.3.2.3's two files, a HELLO listing no sizes answered ready with "built with BFA 4.3.2.3's sizes" in each
+version; its patch28 adds a version 3 check to the panel's gate.
 
 **The version rule.** Each side answers in the version the other opened with.
 
@@ -283,10 +293,11 @@ override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6).
   connects again in version 1. Either way it stays on version 1 for that server until the game restarts or the
   address changes (the setting, or the address FIND found), and the log says so once. No frame back once, then
   HELLO_OK framed in version 2, stays on version 2. With Log detail at Detailed, each version 2 HELLO reset or closed
-  before any answer is logged. Any other answer framed in a version the bridge didn't open with is malformed.
+  before any answer is logged. Any other answer framed in a version the bridge didn't open with is malformed. Bridge
+  1.7.0 opens in version 3 instead, and comes down to this rule from there (["Version 3"](#version-3)).
 - Nothing of version 2 goes to a server that hasn't answered in version 2: NOTICE goes only on a connection whose
-  HELLO was answered with HELLO_OK framed in version 2. FIND goes to the local network, not to a server, and a
-  version 1 server doesn't listen for it.
+  HELLO was answered with HELLO_OK framed in version 2 (or, from bridge 1.7.0, 3). FIND goes to the local network, not
+  to a server, and a version 1 server doesn't listen for it.
 - Bridges 1.0.0 to 1.2.0 never open in version 2, so they never see a version 2 frame. A version 2 server answers
   them in version 1, as it answers any connection opened in version 1.
 
@@ -337,6 +348,124 @@ setting is empty.
   to the port FIND left from on the gaming PC; Windows' firewall lets a unicast answer to a broadcast through for a
   few seconds by default.
 
+### Version 3
+
+Version 3 is version 2 with a line's state kept on the server. A model whose inputs `past_X` pair with outputs `next_X`
+(today BFA 7.0.0's Performance model, `past_k` with `next_k` and `past_v` with `next_v`) carries its line's state in
+every run, about 15 MB of it for BFA 7.0.0's ([BFA 7.0.0](#bfa-700)). In version 3 the server can keep that state
+between a line's runs, and the bridge then sends neither it nor asks for it back: a run of BFA 7.0.0's Performance
+model drops from about 15 MB to about 70 KB. The agreement behind it is [AGREEMENT-1.7.md](AGREEMENT-1.7.md), between
+PandorumLLM's side (v3.98 Beta patch27, not public until the owner has tested it) and the bridge's (1.7.0).
+
+- **What doesn't change.** Versions 1 and 2 stay as they are. Mode 0 in version 3 (below) is version 2's run, exactly.
+  "The server must not cache or reuse state across runs or connections" still holds for versions 1 and 2, and for
+  mode 0.
+- **Only the frame's version changes** for every other message: HELLO, RUN_OK, ERROR, PING, PONG, NOTICE and the status
+  check keep their version 2 payloads in version 3. Only HELLO_OK's rows and RUN gain fields.
+- **FIND and FOUND stay version 2 datagrams.** The bridge sends FIND framed in version 2, and the server answers FOUND
+  framed in version 2. Version 3 changes nothing on UDP, so version 2 panels still answer a 1.7 bridge's FIND (a server
+  ignores a datagram of another version).
+
+**HELLO_OK** in version 3: each model's row carries `str` name, `u8` status and `str` detail, then `u8` **held**.
+
+```
+  per model:
+  str  name
+  u8   status
+  str  detail
+  u8   held          version 3 only: 1 when the server keeps this model's line state, else 0
+```
+
+- **held 1:** the server keeps this model's line state. Two things are needed: the model's inputs `past_X` pair with
+  outputs `next_X`, and the owner's setting is on. The setting is "Keep line state" on PandorumLLM's Audio > Lip Sync,
+  on by default; it applies from the lip-sync server's next start, so it never changes during a connection.
+- **held 0:** otherwise. The bridge then sends every run of that model in mode 0.
+
+**RUN** in version 3: two fields after the request id, then version 2's layout.
+
+```
+u32  request_id
+u64  stream          the bridge's choice: bridge 1.7 uses one per stateful model per connection, the same for every
+                     line of that model
+u8   mode            0 carried, 1 start, 2 continue
+str  model           then as in version 2: the inputs, the outputs asked for
+...
+```
+
+| mode | | What happens |
+|---|---|---|
+| 0 | carried | As version 2. The server neither reads nor changes a held state. |
+| 1 | start | `past_frames` 0. The server starts from zeros of the model's state shape, then holds `next_k` and `next_v` for the stream, replacing whatever the stream held. |
+| 2 | continue | `past_frames` above 0. The server fills `past_k` and `past_v` from its held copy for the stream. |
+
+- In modes 1 and 2, `past_k` and `past_v` are left out of the inputs, and `next_k` and `next_v` out of the outputs
+  asked for. `past_frames` is sent in every run.
+- **RUN_OK is unchanged.** It returns what the RUN asked for: in modes 1 and 2, `normalized_motion` alone for BFA
+  7.0.0's model.
+
+**The held state.**
+
+- **One per connection and stream**, changed only by a successful run: a run that fails leaves the held state and its
+  count as they were.
+- **Its count.** After a run with `past_frames` p, the next continue must carry min(p + F, W): F is the frames a run
+  produces (`normalized_motion`'s second dimension), W the state's window (`past_k`'s fourth dimension), both read
+  from the model's own shapes; 90 and 256 for 7.0.0's and 6.1.2's `performance.onnx`. BFA's own count is the same
+  (0, 90, 180, 256, 256...).
+- **Freed** when a start on the stream replaces it, when a later HELLO on the same connection no longer lists its
+  model, when the connection closes, when the model is unloaded, or when the server stops. Never on a timer.
+- **At most 8 held streams per connection.** A start beyond that frees the stream used least recently.
+- **END (type 11)** is left out: no client needs it, since the next start replaces the held state. A later version can
+  add it.
+
+**Error 8 (STATE).** A continue gets it when the server holds no state for the stream (after a restart, a reconnect
+or an eviction), when the held state belongs to another model, or when `past_frames` differs from the count above. It
+uses ERROR's version 2 layout (`u32` request id, `u16` code, `str` message), and the connection stays open, as after
+codes 3 and 4. What the bridge does next is in section 3: it replays the line from its start, within the run's own
+1000 ms, and a replay that can't finish in time is answered as a timeout; it never answers BFA with an error status.
+
+**Refused as malformed** (error 1, which closes the connection, as in version 2):
+
+- a mode other than 0, 1 or 2;
+- mode 1 or 2 for a model the server marked held 0;
+- mode 1 with `past_frames` other than 0, or mode 2 with `past_frames` 0;
+- mode 1 or 2 with `past_k` or `past_v` among the inputs, or `next_k` or `next_v` among the outputs asked for.
+
+The bridge never sends any of them: it uses modes 1 and 2 only for a model marked held 1, derives the mode from
+`past_frames`, and leaves every paired `past_X` and `next_X` out (its encoder refuses such a RUN in any case,
+`proto::HeldRunProblem`).
+
+**The version rule, from 2 to 3.** Each side still answers in the version the other opened with, and nothing of
+version 3 goes to a server that hasn't answered in 3.
+
+- **The bridge opens every connection with a version 3 HELLO**: the speech connection's, each model load's and each
+  status check's.
+- **An older server** answers ERROR 6 framed in its newest version. The bridge connects again at once in that version,
+  and stays on it for that server until the game restarts or the address changes. A version 2 panel's ERROR 6 reads
+  "protocol version 3 - this server speaks versions 1 and 2"; a version 1 server's is framed in version 1, and the
+  bridge goes straight to version 1.
+- **Every version 2 panel reads a version 3 HELLO whole**, up to 64 MiB, before it answers ERROR 6, then closes with
+  nothing unread, so the close is clean: v3.97 Beta patch8 to v3.98 Beta patch26 all keep patch7's read (its item 13g),
+  by PandorumLLM's side's reading of their code. The public v3.97 Beta has no lip-sync server at all.
+- **A version 3 HELLO that gets no frame back** (the connection reset, or closed before any answer) is sent once more in
+  version 3. If that also gets nothing back, the bridge tries version 2, where version 2's own rule applies: once more
+  in 2, then version 1. This is needed only after a lost connection, or with v3.97 Beta patch1 to patch6, which speak
+  version 1, read only the header, and were never public.
+- **NOTICE** goes only on a connection whose HELLO was answered in version 2 or 3.
+- Bridges 1.3.0 to 1.6.0 never open in version 3, so they never see a version 3 frame: a version 3 server answers them
+  in the version they opened with.
+
+**What the panel shows** (PandorumLLM, patch27): on Audio > Lip Sync, per bridge, the lines held and the memory they
+take, the starts, and the states found gone (error 8); the server's 5-minute report gives the same counts, beside the
+receive and send times patch27 adds.
+
+**The reference server** speaks version 3 as above (`tools/reference_server.py`): its held state per connection and
+stream, the count from the model's own shapes, error 8 in its three cases, the four refusals, the cap of 8 freeing the
+stream used least recently, and the states freed by a HELLO that drops their model and by the connection's close.
+`--no-held` marks every model held 0 (the panel's setting off), `--v2-only` answers as a released version 2 panel, and
+two test options drop held state to force error 8: `--drop-held-on FILE` (when the file appears) and
+`--drop-held-every N` (every Nth continue of a line not rebuilt after an error 8: a line rebuilt by a replay is spared
+for the rest of that line, until its next start).
+
 ### BFA 7.0.0
 
 From the files of BFA 7.0.0.1 (its DLL, INI, installer and model files, its README and its models' JSON files; read
@@ -353,12 +482,18 @@ is marked so.
 
   | File | BFA setting | What it is |
   |---|---|---|
-  | `a2f3_fp16.onnx` | V3 | named by the DLL; the file wasn't among those read |
+  | `a2f3_fp16.onnx` | V3 | 4.3.2.3's own file, byte for byte, by PandorumLLM's hashes (below) |
   | `performance.onnx` | Performance (its default) | **a new model under the old name**: 22,359,897 parameters, 48,157,105 bytes, SHA-256 922a69a7c022f2ec3433a66fd1606b5384398fd7a3aa13edc13a295dac941d22 |
-  | `ultra-performance.onnx` | Ultra Performance | the original Performance model by BFA's README and its JSON (Thin120, 80,729 parameters; not compared with 5.0.6's file): 329,557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff; `mel` [batch, frames, 80] f32, `identity` [batch] int64, `emotion` [batch, frames, 10] f32 in, `normalized_motion` [batch, frames, 73] f32 out |
-  | `network_fp16.onnx` | Legacy (`UseOldModel=1`) | named by the DLL, sized by `[General] Batch`; the file wasn't among those read |
-  | `emotion_fp16.onnx` | Audio2Emotion Full | named by the DLL; the file wasn't among those read |
-  | `emotion_performance.onnx` | Audio2Emotion Performance | named by the DLL; BFA's `emotion_performance.json` gives 5.0.6's SHA-256; the file wasn't among those read |
+  | `ultra-performance.onnx` | Ultra Performance | 4.3.2.3's `performance.onnx` (Thin120, 80,729 parameters) under a new name: the same file, by PandorumLLM's record of 4.3.2.3's set. 329,557 bytes, SHA-256 a47628fa281ea24771f758b5683ec8af3d182fff5c805c7f13cbdd4b82b1adff; `mel` [batch, frames, 80] f32, `identity` [batch] int64, `emotion` [batch, frames, 10] f32 in, `normalized_motion` [batch, frames, 73] f32 out |
+  | `network_fp16.onnx` | Legacy (`UseOldModel=1`) | sized by `[General] Batch`; 4.3.2.3's own file, byte for byte, by PandorumLLM's hashes |
+  | `emotion_fp16.onnx` | Audio2Emotion Full | 4.3.2.3's own file, byte for byte, by PandorumLLM's hashes |
+  | `emotion_performance.onnx` | Audio2Emotion Performance | 5.0.6's file (BFA's `emotion_performance.json` gives 5.0.6's SHA-256, and PandorumLLM's hash of the owner's copy matches it) |
+
+  PandorumLLM's side hashed the owner's 7.0.0.1 models against its record of the owner's 4.3.2.3 set (its answer to
+  bridge 1.6.0's notice). Only 7.0.0's `performance.onnx` and `emotion_performance.onnx` are new to its server, and its
+  runtime DLLs are 4.3.2.3's too. PandorumLLM v3.98 Beta patch26 and earlier don't serve `ultra-performance.onnx`,
+  `emotion_performance.onnx` or 7.0.0's `performance.onnx` (they answer "not allowed", or "different file" for the
+  last); patch27 does.
 
 - **The new Performance model carries state.** Every dimension is fixed. In: `mel` [1, 120, 80] f32, `identity` [1]
   int64, `emotion` [1, 120, 10] f32, `past_k` and `past_v` [6, 1, 4, 256, 152] f32, `past_frames` [1] int64. Out:
@@ -366,9 +501,27 @@ is marked so.
   `performance-model.json`, a line's runs pass each run's `next_k` and `next_v` into the next as `past_k` and
   `past_v`, keeping the last 256 frames' keys and values, with `past_frames` the frames kept (at most 256, 90 more
   each run) and none at each new line. So this model is **not stateless between calls**: its state travels in the
-  run's inputs and outputs, as V3's latents do, and the server still keeps nothing per line. A run moves `past_k` and
-  `past_v` in (933,888 floats, 3,735,552 bytes each) and `next_k` and `next_v` out, about 15.0 MB in all (15,011,704
-  bytes of tensor data) for 90 frames, 3 seconds at 30 frames a second, where V3's 30-frame window moves about 200 KB.
+  run's inputs and outputs, as V3's latents do, and in versions 1 and 2 the server keeps nothing per line. A run moves
+  `past_k` and `past_v` in (933,888 floats, 3,735,552 bytes each) and `next_k` and `next_v` out, about 15.0 MB in all
+  (15,011,704 bytes of tensor data) for 90 frames, 3 seconds at 30 frames a second, where V3's 30-frame window moves
+  about 200 KB. In version 3 the server can keep that state between a line's runs, and a run then moves about 70 KB
+  (["Version 3"](#version-3)).
+- **Its state, read from its DLL's code (7.0.0.1).** One inference worker thread runs every model, with one session
+  per loaded model; a line's windows run back to back, so two runs of a model are never in flight at once and two
+  lines never interleave. A line can be stopped between windows (for a line that goes first) and later starts again
+  from its first window. `past_frames` (int64 [1]) is 0 exactly on a line's first run (a start, or a restart) and on a
+  session's warm-up, never on a later window: 0, 90, 180, 256, 256... (min(previous + 90, 256)). At a start `past_k`
+  and `past_v` are all exactly 0.0. BFA makes every input and pre-binds every output over its own buffers
+  (`CreateTensorWithDataAsOrtValue`), unless an output buffer overlaps an input's: then it lets the runtime make the
+  outputs and copies them (read from the DLL, disassembled as data: the overlap check at about 0x180066f0e to
+  0x180067266, the outputs pre-bound at 0x1800672fa, a call skipped on an overlap). After a run it checks each output (its element count, float type,
+  every value finite; a failure ends the line, the model kept), then swaps its past and next state buffers whole and
+  passes them back unchanged; nothing else reads `next_k` or `next_v`. A run that returns an error status makes BFA
+  release the session, load the model again (a new warm-up) and run the line again, at most two attempts in all (read
+  from the DLL, disassembled as data: `NetKeeper::Run` at about 0x18006c664 to 0x18006c6bb, the failed flag set at
+  0x1800673e8). The model shifts its own state
+  (`next_k[..., :166, :]` is `past_k[..., 90:, :]`), and its answer at `past_frames` 0 ignores the state's contents
+  (for moderate finite values; checked with runs on ONNX Runtime 1.24.4).
 - **The overrides (read from its DLL's code).** The DLL calls `AddFreeDimensionOverrideByName` in one place, its GPU
   session builder, which applies a list of names and values that each model's caller gives it. The lists:
   `ultra-performance.onnx` `batch` = 1 and `frames` = 124; `performance.onnx` `batch` = 1; both emotion models
@@ -479,8 +632,9 @@ PandorumLLM's choice; the bridge reports it.
 
     The new `performance.onnx`'s run carries its line's state both ways (`past_k` and `past_v` in, `next_k` and
     `next_v` out): 15,011,704 bytes of tensor data in all, about 7.5 MB each way, under the 64 MiB payload limit, and,
-    like any run, bound by the run's one 1000 ms deadline. The bridge forwards them as any other inputs and outputs;
-    tested byte for byte against a local run, a second run fed the first's state included (`tests/ForwardTests.cpp`).
+    like any run, bound by the run's one 1000 ms deadline. Carried (versions 1 and 2, or a model held 0), the bridge
+    forwards them as any other inputs and outputs; tested byte for byte against a local run, a second run fed the
+    first's state included (`tests/ForwardTests.cpp`). Held (version 3), the state stays on the server, below.
   - Ready on the server: BFA gets a session handle of the bridge's own, with success. Nothing is loaded on the gaming
     PC. The main connection then gets a HELLO listing every live model (from the background thread, or the next run
     if it comes first), answered at once. A newer session of a model replaces older ones in HELLO (BFA can drop a
@@ -502,11 +656,49 @@ PandorumLLM's choice; the bridge reports it.
     a model not ready), the call still succeeds, with each requested output a one-element float tensor holding NaN.
     BFA's output check rejects it and that one line plays with the game's own lip sync; an error status would make
     BFA drop its model. Nothing runs on the gaming PC for it.
-- **The version rule** (["Version 2"](#version-2)): every connection, the main one, each model load's and each status
-  check's, opens with a version 2 HELLO. On ERROR 6 framed in version 1, the bridge connects again at once in version
-  1 (within a run's own deadline, for a run's connect), and opens every later connection to that server in version 1
-  until the game restarts or the address changes; the log says so once ("The server speaks protocol version 1
-  only ..."). The first status check's log line names the version the server answered in.
+- **A line's state held on the server** (version 3, ["Version 3"](#version-3)). A run is held when the main
+  connection's HELLO was answered in version 3, its row for the model says held 1, and the run's own names show a
+  state: every input `past_X` (but `past_frames`) has its `next_X` among the outputs asked, every `next_X` its
+  `past_X`, there is at least one pair, and `past_frames` is an int64 of one element, 0 or more
+  (`proto::DescribeLineState`). Anything else is carried as before: mode 0 in version 3, version 2's or 1's RUN to an
+  older server.
+  - **The mode** comes from `past_frames`: 0 sends a start (mode 1), above 0 a continue (mode 2). `past_frames` goes in
+    every run; the paired `past_X` stay out of the inputs and their `next_X` out of the outputs asked for. Each
+    stateful model has one stream on a connection, the same for every line of it (a new connection, new streams).
+  - **The answer** fills only the outputs asked (`normalized_motion`). BFA's pre-bound `next_k` and `next_v` buffers
+    are left as they are: finite values (zeros, then the state of two windows before), which BFA checks and passes back
+    as the next `past_k` and `past_v`, and which the bridge doesn't send. When the runtime makes the outputs instead
+    (BFA's way when an output overlaps an input), each `next_X` is a tensor of zeros of its `past_X`'s type and shape.
+  - **A line begun carried stays carried**, BFA's own state going with each run, even on a connection that later holds
+    state. A line begun held whose continue meets a connection that doesn't hold state (held 0 there, or an older
+    version: another server, or the setting turned off and the server restarted) can't be continued from BFA's
+    placeholders: that run gets the NaN answer, and the next line goes carried.
+  - **The replay.** For each stateful model the bridge keeps the inputs of its held line in progress (each window's
+    inputs but `past_k` and `past_v`: for BFA 7.0.0 `mel`, `identity`, `emotion` and `past_frames`, 43,216 bytes a
+    window), cleared at each start; at most 64 windows and 4 MiB a line (`kLineWindows`, `kLineBytes`: more than three
+    minutes of speech for BFA 7.0.0), beyond which the line stops being kept. A continue answered ERROR 8 is followed
+    at once, within that run's 1000 ms counted from the call's start, by window 0 as a start, each earlier window as a
+    continue with its answer discarded, then the current window again; each is a RUN of its own with a request id of
+    its own, read in order like any other. The log says so once a replay, at the normal level. The answers are then
+    byte for byte those of a carried line, since the server rebuilds exactly the state BFA would have sent.
+  - **A replay that can't finish** (the deadline passes, the line wasn't kept, or a replayed window gets an ERROR) is
+    answered as a timeout is: the NaN answer, never an error status, so BFA drops that line and keeps its model, and the
+    game's own lip sync plays it. It is counted and noted as any fallback is, and a version 2 or 3 server is told by
+    NOTICE. Its reason is a timeout's both when the deadline passed between two of the replay's runs and when the bridge
+    didn't keep the line for a replay (longer than `kLineWindows` or `kLineBytes`, or no window kept), and neither
+    counts toward the pause after two timeouts in a row, since nothing failed on the connection; a replayed window
+    answered with an ERROR gives that ERROR's reason, as any ERROR does. A replayed RUN that times out with no byte of
+    its answer arrived is owed like any other (its late answer discarded before the next), and a held run that falls
+    back ends its line: a continue of it gets the NaN answer too (BFA starts a new line instead).
+  - **A reconnect mid-line** (a connection the server closed, or a lost one) meets a connection that holds no state:
+    its continue gets ERROR 8, and the line is replayed there, within the same call.
+- **The version rule** (["Version 3"](#version-3), ["Version 2"](#version-2)): every connection, the main one, each
+  model load's and each status check's, opens with a version 3 HELLO. On ERROR 6 framed in an older version, the bridge
+  connects again at once in that version (within a run's own deadline, for a run's connect), and opens every later
+  connection to that server in it until the game restarts or the address changes; the log says so once ("The server
+  speaks protocol versions 1 and 2 only ..." or "The server speaks protocol version 1 only ..."). A HELLO with no
+  frame back goes once more in its version, then in the version below (3, 3, 2, 2, then 1 at most). The first status
+  check's log line names the version the server answered in.
 - **Finding the server** when the address setting is empty: FIND to the Port setting on each IPv4 adapter's broadcast
   address, at most one search every 5 seconds while none answers, the first FOUND taken, and its address kept with the
   Port setting. A search goes at start-up (the first status check's), at a model load when no server has been found,
@@ -518,12 +710,12 @@ PandorumLLM's choice; the bridge reports it.
   own. In PandorumLLM, set the A2F server's Remote IP to this PC and allow port N (UDP and TCP) through that PC's
   firewall, or enter its address on SkyrimNet's Settings > Plugins page.", N the port set on the page (7871 unless
   changed).
-- **NOTICE** (version 2 only): each line that falls back is counted, with its model, reason and detail. The
+- **NOTICE** (versions 2 and 3): each line that falls back is counted, with its model, reason and detail. The
   background thread sends a NOTICE on the main connection when one is due (at once for the first, then at most one a
-  minute), only once the connection's HELLO was answered in version 2, and only while no request there awaits an
+  minute), only once the connection's HELLO was answered in version 2 or 3, and only while no request there awaits an
   answer (it waits for a late answer to be read first, and gives way to runs). A NOTICE that can't be sent closes the
   connection, and waits for the next; a NOTICE that waits is sent once a run's answer clears the way, with no polling.
-  NOTICE names only a model the connection's last HELLO listed. To a server that answered in version 2, a line's
+  NOTICE names only a model the connection's last HELLO listed. To a server that answered in version 2 or 3, a line's
   fallback goes by NOTICE alone; a model load's refusal and a runtime entry the bridge can't serve are no line, and
   go by the status check (below) to every server.
 - **A connection the server closed or reset, or a send that failed** (a reused connection) is opened again within the
@@ -588,8 +780,8 @@ PandorumLLM's choice; the bridge reports it.
   GPU mode BFA still opens its own Direct3D 12 device before creating a session (its own code, its own setting), but
   no inference runs on it. The hardware the model runs on is chosen on PandorumLLM's side, so the bridge asks the
   player nothing about BFA's mode: with Log detail at Detailed it logs once that BFA is set to GPU, as a fact. It sets
-  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 this session, for BFA 4.3.2.3, 5.0.6
-  and 7.0.0 alone (the version the client string reports), it writes BFA's CPU mode under `[General]` in
+  the mode itself (`src/core/BfaMode.h`): once a server has answered in version 2 or 3 this session, for BFA 4.3.2.3,
+  5.0.6 and 7.0.0 alone (the version the client string reports), it writes BFA's CPU mode under `[General]` in
   `Data\SKSE\Plugins\BetterFacialAnimations.ini`, noting in its own `BFARemoteBridge.ini` (`[BfaMode]`) how to put
   it back, and writes it again at each game save (SKSE's save message), so a save of BFA's menu before that game save
   doesn't undo it (one after the last game save of a session is what BFA loads at the next start); BFA reads the file

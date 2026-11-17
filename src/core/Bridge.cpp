@@ -1014,7 +1014,7 @@ void Bridge::FallBack(const OrtApi* real, const std::string& model, const Fallba
     try {
         client_.RecordFallback(model, fallback, std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
         monitor_.Fallback(reason, model, words);
-        client_.ReportFallback(reason, model, fallback.text);  // a line: a NOTICE to a version 2 server
+        client_.ReportFallback(reason, model, fallback.text);  // a line: a NOTICE to a version 2 or 3 server
     } catch (...) {
     }
     NanAnswer(real, outputCount, outputs);
@@ -1109,19 +1109,28 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
             return nullptr;
         }
 
-        // the answer must fit the call exactly before anything is written
+        // the answer must fit the call exactly before anything is written. In a held run (protocol version 3) the
+        // server keeps next_X and answers the other outputs alone, in order: `at` maps each output to its answer
         std::string reason;
         const auto& got = reply.ok.outputs;
-        if (got.size() != outputCount) reason = "the server returned " + std::to_string(got.size()) + " outputs, not " + std::to_string(outputCount);
+        const auto heldFrom = [&](std::size_t i) { return reply.heldFrom.empty() ? -1 : reply.heldFrom[i]; };
+        std::vector<std::size_t> at(outputCount, 0);
+        std::size_t answered = 0;
+        for (std::size_t i = 0; i < outputCount; ++i)
+            if (heldFrom(i) < 0) at[i] = answered++;
+        if (got.size() != answered) reason = "the server returned " + std::to_string(got.size()) + " outputs, not " + std::to_string(answered);
         for (std::size_t i = 0; reason.empty() && i < outputCount; ++i) {
-            if (got[i].name != outputNames[i])
-                reason = "the server's output " + std::to_string(i) + " is " + got[i].name + ", not " + outputNames[i];
-            else if (outputs[i] && (got[i].dtype != given[i].dtype || got[i].dims != given[i].dims))
-                reason = "the server's " + got[i].name + " is " + proto::DTypeName(got[i].dtype) + " " + Dims(got[i].dims) + ", not " +
+            if (heldFrom(i) >= 0) continue;
+            const auto& g = got[at[i]];
+            if (g.name != outputNames[i])
+                reason = "the server's output " + std::to_string(at[i]) + " is " + g.name + ", not " + outputNames[i];
+            else if (outputs[i] && (g.dtype != given[i].dtype || g.dims != given[i].dims))
+                reason = "the server's " + g.name + " is " + proto::DTypeName(g.dtype) + " " + Dims(g.dims) + ", not " +
                          proto::DTypeName(given[i].dtype) + " " + Dims(given[i].dims) + " as the caller's";
         }
 
-        // new values made by the runtime for the outputs the caller left empty
+        // new values made by the runtime for the outputs the caller left empty; a held next_X the caller left empty is
+        // a finite placeholder, zeros of its past_X's type and shape, which BFA checks and passes back unread
         created.assign(outputCount, nullptr);
         OrtAllocator* allocator = nullptr;
         for (std::size_t i = 0; reason.empty() && i < outputCount; ++i) {
@@ -1130,20 +1139,28 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
                 reason = "the runtime's allocator isn't there";
                 break;
             }
+            const int past = heldFrom(i);
+            const std::string name = past >= 0 ? std::string(outputNames[i]) : got[at[i]].name;
+            const std::uint8_t dtype = past >= 0 ? in[static_cast<std::size_t>(past)].dtype : got[at[i]].dtype;
+            const std::vector<std::int64_t>& dims = past >= 0 ? in[static_cast<std::size_t>(past)].dims : got[at[i]].dims;
+            const std::size_t bytes = past >= 0 ? in[static_cast<std::size_t>(past)].bytes : got[at[i]].bytes;
             OrtValue* value = nullptr;
             void* data = nullptr;
-            if (!Ok(real, real->CreateTensorAsOrtValue(allocator, got[i].dims.data(), got[i].dims.size(),
-                                                        static_cast<ONNXTensorElementDataType>(got[i].dtype), &value)) ||
+            if (!Ok(real, real->CreateTensorAsOrtValue(allocator, dims.data(), dims.size(), static_cast<ONNXTensorElementDataType>(dtype), &value)) ||
                 !value) {
-                reason = "the runtime couldn't make " + got[i].name;
+                reason = "the runtime couldn't make " + name;
                 break;
             }
             created[i] = value;
-            if (!Ok(real, real->GetTensorMutableData(value, &data)) || (got[i].bytes && !data)) {
-                reason = "the runtime's " + got[i].name + " has no data";
+            if (!Ok(real, real->GetTensorMutableData(value, &data)) || (bytes && !data)) {
+                reason = "the runtime's " + name + " has no data";
                 break;
             }
-            if (got[i].bytes) std::memcpy(data, reply.payload.data() + got[i].offset, got[i].bytes);
+            if (past >= 0) {
+                if (bytes) std::memset(data, 0, bytes);
+            } else if (bytes) {
+                std::memcpy(data, reply.payload.data() + got[at[i]].offset, bytes);
+            }
         }
         if (!reason.empty()) {
             for (OrtValue*& v : created)
@@ -1156,7 +1173,9 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
         }
         for (std::size_t i = 0; i < outputCount; ++i) {
             if (outputs[i]) {
-                if (got[i].bytes) std::memcpy(given[i].data, reply.payload.data() + got[i].offset, got[i].bytes);
+                // a held next_X in the caller's own buffer is left as it is: BFA's finite values, which it passes back
+                if (heldFrom(i) < 0 && got[at[i]].bytes)
+                    std::memcpy(given[i].data, reply.payload.data() + got[at[i]].offset, got[at[i]].bytes);
             } else {
                 outputs[i] = created[i];
             }
@@ -1170,7 +1189,7 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
 
     // answered by the server: what follows only reports
     try {
-        const std::uint64_t down = proto::kHeaderSize + reply.payload.size();
+        const std::uint64_t down = reply.bytesBack;  // with bytesUp, the call's whole RUN traffic (Client::Reply)
         {
             std::lock_guard lock(statsMutex_);
             ++stats_.forwarded;
@@ -1181,10 +1200,16 @@ OrtStatus* Bridge::DoRun(const OrtApi* real, OrtSession* session, const OrtRunOp
         }
         client_.RecordAnswered(reply);
         monitor_.Answered(entry.name);
-        if (s.logDetail == LogDetail::Detailed)
+        if (s.logDetail == LogDetail::Detailed) {
+            const char* held = reply.mode == static_cast<std::uint8_t>(proto::RunMode::Start)      ? ", a start, its state held on the server"
+                               : reply.mode == static_cast<std::uint8_t>(proto::RunMode::Continue) ? ", a continue, its state held on the server"
+                                                                                                     : "";
             Log(Level::Info, "RUN " + entry.name + ": round trip " + Ms(static_cast<std::uint64_t>(reply.roundTrip.count())) + " ms, server " +
                                  Ms(reply.ok.serverMicros) + " ms, " + std::to_string(reply.bytesUp) + " bytes up, " + std::to_string(down) +
-                                 " bytes back");
+                                 " bytes back" + held +
+                                 (reply.replayed ? ", after " + std::to_string(reply.replayed) + (reply.replayed == 1 ? " window" : " windows") + " replayed"
+                                                 : std::string()));
+        }
     } catch (...) {
     }
     return nullptr;

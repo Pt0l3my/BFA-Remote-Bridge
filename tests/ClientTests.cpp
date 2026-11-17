@@ -4,6 +4,7 @@
 
 #include <climits>
 #include <functional>
+#include <map>
 #include <thread>
 
 #include "Scripted.h"
@@ -1361,7 +1362,7 @@ TEST(ClientBackgroundThreadEndsThePause) {
     r.c.StopBackground();
 }
 
-// ---- protocol version 2: the version rule, NOTICE and the search
+// ---- protocol versions 2 and 3: the version rule, NOTICE and the search
 
 namespace {
 
@@ -1379,7 +1380,7 @@ Settings Searching() {
 
 }  // namespace
 
-// Every connection opens in version 2. A version 1 server answers ERROR 6 framed in version 1: the bridge connects
+// Every connection opens in version 3. A version 1 server answers ERROR 6 framed in version 1: the bridge connects
 // again at once in version 1, logs it once, and opens every later connection to it in version 1, until the address
 // changes.
 TEST(ClientVersionOneServerIsSpokenToInVersionOne) {
@@ -1390,7 +1391,7 @@ TEST(ClientVersionOneServerIsSpokenToInVersionOne) {
     CHECK(r.c.Admit(m).Ready());
     auto cs = r.script->Connections();
     CHECK_EQ(cs.size(), std::size_t{2});
-    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));  // refused
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{3}));  // refused
     CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{1}));  // answered
     CHECK_EQ(r.c.ServerVersion(), 1);
     CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
@@ -1401,15 +1402,15 @@ TEST(ClientVersionOneServerIsSpokenToInVersionOne) {
     CHECK_EQ(cs.size(), std::size_t{4});
     CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1, 1}));  // the main connection: HELLO and RUN in version 1
     CHECK(VersionsOf(cs[3]) == (std::vector<std::uint16_t>{1}));     // the status check
-    CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
-    // another address: version 2 first again
+    CHECK_EQ(r.Logged("The server speaks protocol version 1 only (it answered the bridge's version 3 HELLO with ERROR 6)"), 1);
+    // another address: version 3 first again
     Settings s = On();
     s.serverAddress = "server.example";
     r.c.Configure(s);
     CHECK_EQ(r.c.ServerVersion(), 0);
     CHECK(r.c.Admit(m).Ready());
     cs = r.script->Connections();
-    CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{3}));
     CHECK(VersionsOf(cs[5]) == (std::vector<std::uint16_t>{1}));
     CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 2);
 }
@@ -1427,21 +1428,25 @@ TEST(ClientRunConnectsAgainInVersionOne) {
     CHECK_EQ(cs.size(), std::size_t{2});
     CHECK(r.script->ByConnection()[0] == (std::vector<std::uint16_t>{1}));
     CHECK(r.script->ByConnection()[1] == (std::vector<std::uint16_t>{1, 3}));
-    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{3}));
     CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{1, 1}));
     CHECK(!r.c.Paused());
     CHECK_EQ(r.c.ServerVersion(), 1);
 }
 
-// A version 2 server: every frame in version 2, and a line that falls back is told by NOTICE on the main connection
-// (its model, the reason's word, the detail on one line without a path, the lines since the last), at most one a
-// minute; no status check carries `fallback`. A model load's refusal (no line) sends none.
-TEST(ClientNoticeToAVersionTwoServer) {
+// A version 3 server, and a version 2 one (which refused the version 3 HELLO first): every frame in its version, and a
+// line that falls back is told by NOTICE on the main connection (its model, the reason's word, the detail on one line
+// without a path, the lines since the last), at most one a minute; no status check carries `fallback`. A model load's
+// refusal (no line) sends none.
+TEST(ClientNoticeToAVersionTwoOrThreeServer) {
+  for (const int speaks : {3, 2}) {
     Rig r;
+    r.script->speaks = speaks;
     const auto m = Model("a.onnx");
     r.Serving(m);
-    CHECK_EQ(r.c.ServerVersion(), 2);
-    for (const auto v : r.script->Versions()) CHECK_EQ(v, 2);
+    CHECK_EQ(r.c.ServerVersion(), speaks);
+    const auto sent = r.script->Versions();
+    for (std::size_t i = 0; i < sent.size(); ++i) CHECK_EQ(sent[i], i == 0 ? 3 : speaks);  // a version 2 server refused the first
     r.c.ReportFallback(Reason::ServerError, "a.onnx", "ERROR 4, inference failed: scripted\nat C:\\Games\\Skyrim\\Data\\a.onnx");
     r.c.Tick();
     auto notices = r.script->Notices();
@@ -1452,7 +1457,7 @@ TEST(ClientNoticeToAVersionTwoServer) {
     CHECK_EQ(notices[0].lines, 1u);
     CHECK_EQ(r.c.FallbackReports(), 0);
     // on the main connection, after the RUN's answer
-    const auto main = r.script->ByConnection()[1];
+    const auto main = r.script->ByConnection()[speaks == 3 ? 1 : 2];
     CHECK_EQ(main.back(), 10);
     CHECK_EQ(main[main.size() - 2], 3);
     // within the minute: held, the lines counted
@@ -1481,13 +1486,15 @@ TEST(ClientNoticeToAVersionTwoServer) {
     CHECK_EQ(r.c.FallbackReports(), 1);
     CHECK(checked.find("fallback refused") != std::string::npos);
     const auto versions = r.script->Versions();
-    CHECK_EQ(versions.back(), 2);
+    CHECK_EQ(versions.back(), speaks);
     r.c.ReportFallback(Reason::Incompatible);
     g_now += kFallbackReportEvery;
     r.c.Tick();
     CHECK_EQ(r.c.FallbackReports(), 2);
     CHECK(checked.find("fallback incompatible") != std::string::npos);
     CHECK_EQ(r.Logged("NOTICE: a.onnx, notready, 2 lines since the last"), 1);
+    g_now += std::chrono::minutes(5);
+  }
 }
 
 // NOTICE never comes between a request and its answer: after a RUN timed out, it waits until that late answer is read.
@@ -1545,7 +1552,7 @@ TEST(ClientNoNoticeToAVersionOneServer) {
     r.c.Tick();
     CHECK_EQ(r.c.NoticesSent(), 0);
     CHECK_EQ(r.script->Count(proto::MsgType::Notice), 0);
-    for (const auto v : r.script->Versions()) CHECK(v == 1 || v == 2);
+    for (const auto v : r.script->Versions()) CHECK(v == 1 || v == 3);
 }
 
 // No address: FIND (version 2, to the Port setting) finds the server, and the bridge connects to the address FOUND
@@ -1656,16 +1663,16 @@ TEST(ClientVersionRuleFollowsTheAddressFound) {
     CHECK(VersionsOf(cs.back()) == (std::vector<std::uint16_t>{1}));
     CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 1);
     net->from = Endpoint{2, {8, 8, 8, 8}};
-    lose();  // another address: version 2 first, then 1
+    lose();  // another address: version 3 first, then 1
     cs = r.script->Connections();
-    CHECK(VersionsOf(cs[cs.size() - 2]) == (std::vector<std::uint16_t>{2}));
+    CHECK(VersionsOf(cs[cs.size() - 2]) == (std::vector<std::uint16_t>{3}));
     CHECK(VersionsOf(cs.back()) == (std::vector<std::uint16_t>{1}));
     CHECK_EQ(r.Logged("The server speaks protocol version 1 only"), 2);
 }
 
 // The version the server answered in goes to the sink each time it changes (BFA's mode follows it, core/BfaMode.h):
-// nothing before an answer, 2 once however many answers, and again after the address changes; 1 from a version 1
-// server.
+// nothing before an answer, 3 once however many answers, and again after the address changes; 2 from a version 2
+// server, 1 from a version 1 server. A version learnt from HELLOs that got no frame back waits for a frame in a version.
 TEST(ClientTellsTheServersVersion) {
     Rig r;
     std::vector<std::uint16_t> told;
@@ -1676,33 +1683,77 @@ TEST(ClientTellsTheServersVersion) {
     r.script->refuseConnect = false;
     r.Serving(Model("a.onnx"));
     CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
-    CHECK(told == (std::vector<std::uint16_t>{2}));
+    CHECK(told == (std::vector<std::uint16_t>{3}));
     Settings s = On();
     s.serverAddress = "server.example";
     r.c.Configure(s);
     r.script->speaks = 1;
     CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
-    CHECK(told == (std::vector<std::uint16_t>{2, 1}));
+    CHECK(told == (std::vector<std::uint16_t>{3, 1}));
+    s.serverAddress = "other.example";
+    r.c.Configure(s);
+    r.script->speaks = 2;
+    CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+    CHECK(told == (std::vector<std::uint16_t>{3, 1, 2}));
     r.c.OnVersion(nullptr);
+    // a version learnt from HELLOs that got no frame back isn't told until a frame comes back in a version: a p6 server
+    // (3, 3, 2, 2, then version 1's HELLO_OK) is told 1 alone, never 2
+    {
+        Rig p6;
+        std::vector<std::uint16_t> heard;
+        p6.c.OnVersion([&](std::uint16_t v) { heard.push_back(v); });
+        p6.script->speaks = 1;
+        p6.script->p6 = true;
+        CHECK(p6.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK_EQ(p6.script->Connections().size(), std::size_t{5});
+        CHECK(heard == (std::vector<std::uint16_t>{1}));
+        p6.c.OnVersion(nullptr);
+    }
+    // two version 3 HELLOs reset (a server restarting, say), then version 2's HELLO_OK: 2 is told only once that answer
+    // came, on the third connection; four resets, then version 1's HELLO_OK: 1 alone
+    {
+        Rig reset;
+        std::vector<std::pair<std::uint16_t, std::size_t>> heard;  // the version, and the connections made by then
+        reset.c.OnVersion([&](std::uint16_t v) { heard.emplace_back(v, reset.script->Connections().size()); });
+        reset.script->resetHellos = 2;
+        CHECK(reset.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK(heard == (std::vector<std::pair<std::uint16_t, std::size_t>>{{2, 3}}));
+        CHECK(VersionsOf(reset.script->Connections().back()) == (std::vector<std::uint16_t>{2}));
+        reset.c.OnVersion(nullptr);
+    }
+    {
+        Rig reset;
+        std::vector<std::uint16_t> heard;
+        reset.c.OnVersion([&](std::uint16_t v) { heard.push_back(v); });
+        reset.script->resetHellos = 4;
+        CHECK(reset.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK(heard == (std::vector<std::uint16_t>{1}));
+        reset.c.OnVersion(nullptr);
+    }
 }
 
-// A version 2 HELLO that gets no frame back (the connection reset, as PandorumLLM v3.97-p6 and earlier can on Windows,
-// closing with the payload unread) is said once more in version 2; no frame again, and the server is taken as a
-// version 1 server, logged once. No frame once, then HELLO_OK in version 2, stays on version 2. ERROR 6 at once goes
-// straight to version 1 (ClientVersionOneServerIsSpokenToInVersionOne).
-TEST(ClientNoFrameTwiceIsVersionOne) {
+// A HELLO that gets no frame back (the connection reset, as PandorumLLM v3.97-p6 and earlier can on Windows, closing
+// with the payload unread, or a lost connection) is said once more in its version; no frame again, and the version
+// below is tried, where the same rule applies: 3, 3, 2, 2, then 1, each step logged once. No frame once, then HELLO_OK
+// in version 3, stays on version 3. ERROR 6 at once goes straight to the version it was framed in
+// (ClientVersionOneServerIsSpokenToInVersionOne, ClientVersionTwoServerIsSpokenToInVersionTwo).
+TEST(ClientNoFrameTwiceIsTheVersionBelow) {
     {
         Rig r;
         r.script->speaks = 1;
         r.script->p6 = true;
         CHECK(r.c.Admit(Model("a.onnx")).Ready());
         const auto cs = r.script->Connections();
-        CHECK_EQ(cs.size(), std::size_t{3});
-        CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{2}));
-        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
-        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1}));
+        CHECK_EQ(cs.size(), std::size_t{5});
+        CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{3}));
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{3}));
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[3]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{1}));
         CHECK_EQ(r.c.ServerVersion(), 1);
+        CHECK_EQ(r.Logged("The server speaks protocol versions 1 and 2 only (two version 3 HELLOs got no answer"), 1);
         CHECK_EQ(r.Logged("The server speaks protocol version 1 only (two version 2 HELLOs got no answer"), 1);
+        CHECK_EQ(r.Logged("The connection was reset before any answer to a version 3 HELLO"), 2);
         CHECK_EQ(r.Logged("The connection was reset before any answer to a version 2 HELLO"), 2);
         CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);  // version 1 at once from now on
         CHECK(VersionsOf(r.script->Connections().back()) == (std::vector<std::uint16_t>{1}));
@@ -1713,13 +1764,28 @@ TEST(ClientNoFrameTwiceIsVersionOne) {
         CHECK(r.c.Admit(Model("a.onnx")).Ready());
         const auto cs = r.script->Connections();
         CHECK_EQ(cs.size(), std::size_t{2});
-        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+        CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{3}));
+        CHECK_EQ(r.c.ServerVersion(), 3);
+        CHECK_EQ(r.Logged("speaks protocol version"), 0);
+    }
+    // a server that resets a version 3 HELLO twice without answering, then answers version 2: version 2 from then on
+    {
+        Rig r;
+        r.script->resetHellos = 2;
+        CHECK(r.c.Admit(Model("a.onnx")).Ready());
+        const auto cs = r.script->Connections();
+        CHECK_EQ(cs.size(), std::size_t{3});
+        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{2}));
         CHECK_EQ(r.c.ServerVersion(), 2);
-        CHECK_EQ(r.Logged("speaks protocol version 1 only"), 0);
+        CHECK_EQ(r.Logged("The server speaks protocol versions 1 and 2 only (two version 3 HELLOs got no answer"), 1);
+        CHECK(r.c.Probe().kind == ProbeResult::Kind::Answered);
+        CHECK(VersionsOf(r.script->Connections().back()) == (std::vector<std::uint16_t>{2}));
     }
     // a run that makes the main connection to such a server: all within its own call
     {
         Rig r;
+        std::vector<std::uint16_t> told;  // BFA's mode hears only the version a frame came back in
+        r.c.OnVersion([&](std::uint16_t v) { told.push_back(v); });
         r.script->speaks = 1;
         r.script->p6 = true;
         const auto m = Model("a.onnx");
@@ -1727,9 +1793,613 @@ TEST(ClientNoFrameTwiceIsVersionOne) {
         r.c.SetModels({m});
         CHECK(r.Run(m) == Client::Outcome::Forwarded);
         const auto cs = r.script->Connections();
-        CHECK_EQ(cs.size(), std::size_t{3});
-        CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{1, 1}));
+        CHECK_EQ(cs.size(), std::size_t{5});
+        CHECK(VersionsOf(cs[4]) == (std::vector<std::uint16_t>{1, 1}));
         CHECK_EQ(r.c.ServerVersion(), 1);
         CHECK(!r.c.Paused());
+        CHECK(told == (std::vector<std::uint16_t>{1}));
+        r.c.OnVersion(nullptr);
     }
+}
+
+// A version 2 server (a released version 2 panel) answers the version 3 HELLO with ERROR 6 framed in version 2: the
+// bridge connects again at once in version 2, logs it once, and speaks version 2 to it from then on, every model load,
+// run, PING and status check; a run that makes the main connection does all of it within its own call. Nothing of
+// version 3 reaches it: its runs are version 2's, carrying their state.
+TEST(ClientVersionTwoServerIsSpokenToInVersionTwo) {
+    Rig r;
+    r.script->speaks = 2;
+    const auto m = Model("a.onnx");
+    CHECK(r.c.Admit(m).Ready());
+    auto cs = r.script->Connections();
+    CHECK_EQ(cs.size(), std::size_t{2});
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{3}));
+    CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2}));
+    CHECK_EQ(r.c.ServerVersion(), 2);
+    CHECK_EQ(r.Logged("The server speaks protocol versions 1 and 2 only (it answered the bridge's version 3 HELLO with ERROR 6): the "
+                      "bridge speaks version 2 to it until the game restarts or the address changes"),
+             1);
+    r.c.SetModels({m});
+    CHECK(r.Run(m) == Client::Outcome::Forwarded);
+    g_now += kIdlePing;
+    r.c.Tick();  // the start-up status check, and a PING
+    cs = r.script->Connections();
+    CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{2, 2, 2}));  // HELLO, RUN, PING
+    CHECK(r.script->ByConnection()[2] == (std::vector<std::uint16_t>{1, 3, 6}));
+    CHECK(VersionsOf(cs[3]) == (std::vector<std::uint16_t>{2}));
+    CHECK(r.script->Runs().empty());  // no version 3 RUN
+    CHECK_EQ(r.Logged("speaks protocol versions 1 and 2 only"), 1);
+    // a run that connects to such a server, not yet known as one
+    Rig fresh;
+    fresh.script->speaks = 2;
+    CHECK(fresh.c.Resolve());
+    fresh.c.SetModels({m});
+    CHECK(fresh.Run(m) == Client::Outcome::Forwarded);
+    cs = fresh.script->Connections();
+    CHECK_EQ(cs.size(), std::size_t{2});
+    CHECK(VersionsOf(cs[0]) == (std::vector<std::uint16_t>{3}));
+    CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{2, 2}));
+    CHECK(!fresh.c.Paused());
+}
+
+// FIND stays a version 2 datagram, whatever version the server answers in on TCP.
+TEST(ClientFindStaysVersionTwo) {
+    Rig r(Searching());
+    auto net = std::make_shared<Network>();
+    net->answer = [](const std::vector<std::uint8_t>& find) {
+        CHECK_EQ(int(find[4]), 2);
+        auto three = FoundDatagram();
+        three[4] = 3;  // a FOUND framed in 3 isn't one
+        return std::vector<std::vector<std::uint8_t>>{three, FoundDatagram()};
+    };
+    r.c.SetDiscovery(ScriptedSearch(net));
+    CHECK(r.c.Admit(Model("a.onnx")).Ready());
+    CHECK_EQ(r.c.ServerVersion(), 3);
+    CHECK_EQ(net->Sent(), 1);
+    CHECK_EQ(r.Logged("Ignored a datagram that isn't FOUND"), 1);
+    std::lock_guard lock(net->mutex);
+    CHECK_EQ(int(net->sent[0][4]), 2);
+}
+
+// ---- protocol version 3: a line's state held on the server
+
+namespace {
+
+// A run laid out as BFA 7.0.0's Performance model's (its state small): mel, identity and emotion, past_k and past_v,
+// past_frames; normalized_motion, next_k and next_v asked for.
+struct Window {
+    std::vector<float> mel, emotion, k, v;
+    std::int64_t identity = 1;
+    std::int64_t frames = 0;
+    Window(int seed, std::int64_t pastFrames) : mel(8), emotion(4), k(12, 0.5f), v(12, -0.5f), frames(pastFrames) {
+        for (std::size_t i = 0; i < mel.size(); ++i) mel[i] = static_cast<float>(seed * 100 + static_cast<int>(i));
+        for (std::size_t i = 0; i < emotion.size(); ++i) emotion[i] = static_cast<float>(seed) / 10.f;
+    }
+    proto::RunRequest Request(const proto::ModelEntry& m) const {
+        proto::RunRequest r;
+        r.model = m.name;
+        r.inputs = {{"mel", 1, {1, 2, 4}, mel.data(), mel.size() * 4},
+                    {"identity", 7, {1}, &identity, 8},
+                    {"emotion", 1, {1, 2, 2}, emotion.data(), emotion.size() * 4},
+                    {"past_k", 1, {1, 1, 1, 4, 3}, k.data(), k.size() * 4},
+                    {"past_v", 1, {1, 1, 1, 4, 3}, v.data(), v.size() * 4},
+                    {"past_frames", 7, {1}, &frames, 8}};
+        r.outputs = {"normalized_motion", "next_k", "next_v"};
+        return r;
+    }
+};
+
+std::int64_t Frames(int window) { return std::min<std::int64_t>(4, 2 * window); }  // F 2, W 4: 0, 2, 4, 4, ...
+
+// RUN_OK with each output asked for, two floats each: the script's answer to any RUN.
+std::vector<std::uint8_t> RunOkAsked(const std::vector<std::uint8_t>& runPayload) {
+    proto::DecodedRun d;
+    std::string err;
+    proto::DecodeRun(runPayload.data(), runPayload.size(), d, err);
+    static const float two[2] = {0.25f, -0.25f};
+    proto::RunOk ok;
+    ok.requestId = d.requestId;
+    for (const auto& o : d.outputs) ok.outputs.push_back({o, 1, {2}, two, sizeof two});
+    std::vector<std::uint8_t> p;
+    proto::EncodeRunOk(ok, p, err);
+    return Frame(proto::MsgType::RunOk, p);
+}
+
+// A server holding line state as the agreement has it, by the RUNs the script recorded: ERROR 8 for a continue whose
+// stream holds nothing on this connection or whose count is off (F 2, W 4), and on demand (`lose`).
+struct HeldServer {
+    Script* script = nullptr;  // the rig's own, which outlives every call (a shared_ptr here would be a cycle)
+    std::map<std::pair<std::size_t, std::uint64_t>, std::int64_t> count;  // (connection, stream) -> the next continue's past_frames
+    bool lose = false;
+    int gone = 0;  // ERROR 8s answered
+    std::vector<std::uint8_t> operator()(std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type != 3) return Serve(type, p);
+        const Run3 run = script->Runs().back();
+        const auto key = std::make_pair(run.connection, run.stream);
+        if (run.mode == 2) {
+            if (lose) {
+                lose = false;
+                count.clear();
+            }
+            const auto it = count.find(key);
+            if (it == count.end() || it->second != run.pastFrames) {
+                ++gone;
+                return ErrorFrame(run.id, proto::ErrorCode::State);
+            }
+        }
+        if (run.mode != 0) count[key] = std::min<std::int64_t>(run.pastFrames + 2, 4);
+        return RunOkAsked(p);
+    }
+};
+
+struct HeldRig : Rig {
+    proto::ModelEntry m = Model("performance.onnx");
+    std::shared_ptr<HeldServer> server = std::make_shared<HeldServer>();
+    explicit HeldRig(bool held = true) {
+        if (held) script->Hold(m.name);
+        server->script = script.get();
+        script->answer = [s = server](std::uint16_t type, const std::vector<std::uint8_t>& p) { return (*s)(type, p); };
+        CHECK(c.Admit(m).Ready());
+        c.SetModels({m});
+    }
+    Client::Outcome RunWindow(int seed, std::int64_t frames, Client::Reply& reply, Fallback& fb) {
+        Window w(seed, frames);
+        auto req = w.Request(m);
+        return c.Run(m, req, reply, fb);
+    }
+    Client::Outcome RunWindow(int seed, std::int64_t frames) {
+        Client::Reply reply;
+        Fallback fb;
+        return RunWindow(seed, frames, reply, fb);
+    }
+};
+
+Run3 LastRun(const Script& script) { return script.Runs().back(); }  // a copy: Runs() is a copy of its own
+
+std::vector<int> Modes(const std::vector<Run3>& runs) {
+    std::vector<int> m;
+    for (const auto& r : runs) m.push_back(r.mode);
+    return m;
+}
+
+}  // namespace
+
+// A model the server marks held 1, on a version 3 connection: a line's first run is a start (mode 1), the others
+// continues (mode 2), all on one stream; past_k and past_v stay out of the inputs and next_k and next_v out of the
+// outputs asked for; past_frames goes with every run. The answer maps back to the call: its held outputs are left to
+// the bridge (heldFrom names their past_X). Every model the server marks held 0 runs carried (mode 0), as version 2.
+TEST(ClientHeldModeSendsStartsAndContinues) {
+    HeldRig r;
+    for (int w = 0; w < 5; ++w) {
+        Client::Reply reply;
+        Fallback fb;
+        CHECK(r.RunWindow(w, Frames(w), reply, fb) == Client::Outcome::Forwarded);
+        CHECK_EQ(int(reply.mode), w == 0 ? 1 : 2);
+        CHECK(reply.heldFrom == (std::vector<int>{-1, 3, 4}));
+        CHECK_EQ(reply.ok.outputs.size(), std::size_t{1});
+        CHECK_EQ(reply.ok.outputs[0].name, std::string("normalized_motion"));
+    }
+    const auto runs = r.script->Runs();
+    CHECK(Modes(runs) == (std::vector<int>{1, 2, 2, 2, 2}));
+    for (const auto& run : runs) {
+        CHECK_EQ(run.stream, runs[0].stream);
+        CHECK(run.inputs == (std::vector<std::string>{"mel", "identity", "emotion", "past_frames"}));
+        CHECK(run.outputs == (std::vector<std::string>{"normalized_motion"}));
+        CHECK(run.problem.empty());
+    }
+    CHECK((std::vector<std::int64_t>{runs[0].pastFrames, runs[1].pastFrames, runs[2].pastFrames, runs[4].pastFrames}) ==
+          (std::vector<std::int64_t>{0, 2, 4, 4}));
+    CHECK_EQ(r.script->refused.load(), 0);
+    CHECK_EQ(r.server->gone, 0);
+    CHECK(r.Logged("performance.onnx ready, its line's state kept on the server") > 0);
+    // a second line on the same stream, starting again
+    CHECK(r.RunWindow(9, 0) == Client::Outcome::Forwarded);
+    CHECK_EQ(LastRun(*r.script).mode, 1);
+    CHECK_EQ(LastRun(*r.script).stream, runs[0].stream);
+    // the line's window inputs kept for a replay: 8 + 4 floats and two int64 a window, past_X left out
+    CHECK_EQ(r.c.LineBytes(r.m.name), std::size_t{12 * 4 + 16});
+
+    // held 0: carried, the state both ways, every run mode 0
+    HeldRig carried(false);
+    for (int w = 0; w < 3; ++w) {
+        Client::Reply reply;
+        Fallback fb;
+        CHECK(carried.RunWindow(w, Frames(w), reply, fb) == Client::Outcome::Forwarded);
+        CHECK(reply.heldFrom.empty());
+        CHECK_EQ(int(reply.mode), 0);
+        CHECK_EQ(reply.ok.outputs.size(), std::size_t{3});
+    }
+    for (const auto& run : carried.script->Runs()) {
+        CHECK_EQ(int(run.mode), 0);
+        CHECK_EQ(run.stream, 0u);
+        CHECK_EQ(run.inputs.size(), std::size_t{6});
+        CHECK_EQ(run.outputs.size(), std::size_t{3});
+    }
+    CHECK_EQ(carried.c.LineBytes(carried.m.name), std::size_t{0});
+    CHECK_EQ(carried.script->refused.load(), 0);
+}
+
+// The payload sizes: a held run sends no past_k or past_v and asks for no next_k or next_v.
+TEST(ClientHeldModeSendsLess) {
+    HeldRig held;
+    HeldRig carried(false);
+    for (int w = 0; w < 3; ++w) {
+        Client::Reply a, b;
+        Fallback fa, fb;
+        CHECK(held.RunWindow(w, Frames(w), a, fa) == Client::Outcome::Forwarded);
+        CHECK(carried.RunWindow(w, Frames(w), b, fb) == Client::Outcome::Forwarded);
+        const auto h = held.script->Runs().back(), c = carried.script->Runs().back();
+        // two state tensors of 12 floats, each with its name, type, rank, 5 dims and length; two output names
+        const std::size_t tensors = 2 * (2 + 6 + 1 + 1 + 5 * 8 + 4 + 48), names = 2 * (2 + 6);
+        CHECK_EQ(c.bytes - h.bytes, tensors + names);
+        CHECK_EQ(b.bytesUp - a.bytesUp, tensors + names);
+        CHECK(a.payload.size() < b.payload.size());
+    }
+}
+
+// What the request alone shows decides the mode: inputs past_X without their next_X asked for, a past_frames that
+// isn't an int64 of one element, or none, make a run like any other, carried; none of the agreement's refusals ever
+// goes out, held 1 or not.
+TEST(ClientHeldModeOnlyForAPairedState) {
+    HeldRig r;
+    Window w(1, 0);
+    auto req = w.Request(r.m);
+    req.outputs = {"normalized_motion", "next_k"};  // past_v without next_v
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.c.Run(r.m, req, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(int(LastRun(*r.script).mode), 0);
+    req = w.Request(r.m);
+    req.inputs.pop_back();  // no past_frames
+    CHECK(r.c.Run(r.m, req, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(int(LastRun(*r.script).mode), 0);
+    // a model held 1 next to one held 0 on the same connection: only its runs are held
+    CHECK_EQ(r.script->refused.load(), 0);
+    CHECK(r.RunWindow(2, 0) == Client::Outcome::Forwarded);
+    CHECK_EQ(int(LastRun(*r.script).mode), 1);
+    CHECK_EQ(r.script->refused.load(), 0);
+}
+
+// A continue answered ERROR 8 (the state gone: a restart, an eviction): the line is replayed from its start within the
+// run's own deadline, window 0 as a start and the others as continues, each its own request with its answer
+// discarded, then the window that got ERROR 8 again; the inputs replayed are the ones first sent, byte for byte. The
+// run is answered, logged once at the normal level, and the line goes on.
+TEST(ClientReplaysALostState) {
+    HeldRig r;
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(reply.replayed, 4);
+    CHECK_EQ(reply.ok.requestId, LastRun(*r.script).id);
+    CHECK_EQ(r.c.Replays(), 1);
+    CHECK_EQ(r.server->gone, 1);
+    const auto runs = r.script->Runs();
+    CHECK(Modes(runs) == (std::vector<int>{1, 2, 2, 2, 2, 1, 2, 2, 2, 2}));
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(runs[static_cast<std::size_t>(5 + i)].pastFrames, runs[static_cast<std::size_t>(i)].pastFrames);
+        CHECK(runs[static_cast<std::size_t>(5 + i)].id > runs[4].id);
+    }
+    CHECK_EQ(runs[9].pastFrames, runs[4].pastFrames);
+    CHECK_EQ(r.Logged("performance.onnx: the server no longer held its line's state (ERROR 8, the line's state isn't held: scripted); "
+                      "its 4 earlier windows replayed from a start, then this one sent again"),
+             1);
+    CHECK(r.RunWindow(5, Frames(5)) == Client::Outcome::Forwarded);  // the line goes on
+    CHECK_EQ(int(LastRun(*r.script).mode), 2);
+    CHECK_EQ(r.server->gone, 1);
+    CHECK(!r.c.Paused());
+    CHECK_EQ(r.script->refused.load(), 0);
+}
+
+// The inputs a replay sends are the ones first sent: the script's own copy of each window's mel, compared.
+TEST(ClientReplaySendsTheWindowsAsFirstSent) {
+    HeldRig r;
+    std::vector<std::vector<std::uint8_t>> mels;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        if (type == 3) {
+            proto::DecodedRun d;
+            std::string err;
+            proto::DecodeRun(p.data(), p.size(), d, err);
+            mels.emplace_back(p.begin() + static_cast<std::ptrdiff_t>(d.inputs[0].offset),
+                              p.begin() + static_cast<std::ptrdiff_t>(d.inputs[0].offset + d.inputs[0].bytes));
+        }
+        return (*s)(type, p);
+    };
+    for (int w = 0; w < 3; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    CHECK(r.RunWindow(3, Frames(3)) == Client::Outcome::Forwarded);
+    CHECK_EQ(mels.size(), std::size_t{8});  // 3 windows, the continue refused, 3 replayed, then it again
+    for (int i = 0; i < 4; ++i) CHECK(mels[static_cast<std::size_t>(4 + i)] == mels[static_cast<std::size_t>(i)]);
+}
+
+// A reconnect in the middle of a line (the server closed the connection): the run connects again within its call, its
+// continue meets a connection that holds nothing (ERROR 8), and the line is replayed there.
+TEST(ClientReconnectMidLineReplays) {
+    HeldRig r;
+    for (int w = 0; w < 3; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    const auto before = r.script->Connections().size();
+    r.script->closeBeforeAnswer = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(3, Frames(3), reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.script->Connections().size(), before + 1);
+    CHECK_EQ(reply.replayed, 3);
+    CHECK_EQ(r.server->gone, 1);
+    const auto runs = r.script->Runs();
+    CHECK(Modes(runs) == (std::vector<int>{1, 2, 2, 2, 1, 2, 2, 2}));  // the first continue's send went into the closed one
+    CHECK(r.Logged("The server had closed the connection; reconnecting") > 0);
+    CHECK_EQ(r.script->refused.load(), 0);
+}
+
+// A replay that can't finish is answered as a timeout is: the line gets the NaN answer (RunTimedOut), the connection
+// stays and no pause starts; the next line starts again. Here the line is longer than the bridge keeps (kLineWindows),
+// then the run's time runs out mid-replay (the server takes 70 ms a run, the run 300 ms).
+TEST(ClientReplayThatCantFinishIsATimeout) {
+    {
+        HeldRig r;
+        for (int w = 0; w <= static_cast<int>(kLineWindows); ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+        CHECK_EQ(r.c.LineBytes(r.m.name), std::size_t{0});  // past the cap: nothing kept
+        r.server->lose = true;
+        Client::Reply reply;
+        Fallback fb;
+        CHECK(r.RunWindow(99, 4, reply, fb) == Client::Outcome::Failed);
+        CHECK(fb.why == Why::RunTimedOut);
+        CHECK(ReasonOf(fb) == Reason::TimedOut);
+        CHECK_EQ(fb.text, std::string("the server no longer held its line's state, and its line is longer than the bridge keeps for a replay"));
+        CHECK(!r.c.Paused());
+        CHECK(r.RunWindow(100, 4) == Client::Outcome::Failed);  // the line ended: a continue of it gets the NaN answer too
+        CHECK_EQ(r.server->gone, 1);
+        CHECK(r.RunWindow(101, 0) == Client::Outcome::Forwarded);  // the next line
+        CHECK(r.RunWindow(102, 2) == Client::Outcome::Forwarded);
+        CHECK_EQ(r.script->refused.load(), 0);
+    }
+    {
+        HeldRig r;
+        for (int w = 0; w < 6; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+        r.script->timed = true;
+        r.script->answerDelayMs = 70;
+        r.server->lose = true;
+        Client::Reply reply;
+        Fallback fb;
+        CHECK(r.RunWindow(6, 4, reply, fb) == Client::Outcome::Failed);
+        CHECK(fb.why == Why::RunTimedOut);
+        CHECK_EQ(r.c.Replays(), 1);
+        CHECK(!r.c.Paused());
+        CHECK(r.RunWindow(7, 0) == Client::Outcome::Forwarded);  // the late answer is discarded first
+        CHECK(!r.c.Paused());
+    }
+}
+
+// A run's bytes, up and back, count the same exchanges: every RUN the call sent (the window that got ERROR 8, each
+// replayed window and the window again; after a closed connection, the send that went nowhere too) and every answer
+// read to them (ERROR 8 and each replayed window's RUN_OK included).
+TEST(ClientReplayCountsEveryRunAndAnswer) {
+    HeldRig r;
+    std::vector<std::size_t> back;  // each RUN's answer frame, in order
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3) back.push_back(mine.size());
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Forwarded);
+    const auto runs = r.script->Runs();
+    CHECK_EQ(runs.size(), std::size_t{10});
+    std::size_t up = 0, down = 0;
+    for (std::size_t i = 4; i < 10; ++i) {
+        up += proto::kHeaderSize + runs[i].bytes;
+        down += back[i];
+    }
+    CHECK_EQ(reply.bytesUp, up);
+    CHECK_EQ(reply.bytesBack, down);
+    CHECK(reply.bytesBack > proto::kHeaderSize + reply.payload.size());  // more than the last answer alone
+    // a send into a connection the server had closed counts up, with no answer back; then the new connection's
+    HeldRig c;
+    std::vector<std::size_t> cback;  // each RUN's answer frame the server sent, in order
+    c.script->answer = [&, s = c.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3) cback.push_back(mine.size());
+        return mine;
+    };
+    for (int w = 0; w < 3; ++w) CHECK(c.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    const std::size_t before = cback.size();
+    c.script->closeBeforeAnswer = true;
+    CHECK(c.RunWindow(3, Frames(3), reply, fb) == Client::Outcome::Forwarded);
+    const auto again = c.script->Runs();
+    CHECK_EQ(again.size(), std::size_t{8});
+    up = proto::kHeaderSize + again[3].bytes;  // the send that went nowhere: the same RUN but its request id
+    for (std::size_t i = 3; i < 8; ++i) up += proto::kHeaderSize + again[i].bytes;
+    CHECK_EQ(reply.bytesUp, up);
+    std::size_t cdown = 0;  // only answers that came back: the send that went nowhere has none
+    for (std::size_t i = before; i < cback.size(); ++i) cdown += cback[i];
+    CHECK_EQ(reply.bytesBack, cdown);
+    CHECK_EQ(reply.replayed, 3);
+}
+
+// An ERROR answered to a replayed window ends the replay as the run's answer: BFA gets the NaN answer, as after a
+// timeout, the reason is the ERROR's (ServerError), the connection stays, and it doesn't count toward the pause after
+// two timeouts in a row (a timeout right after it pauses nothing).
+TEST(ClientReplayedWindowAnsweredWithAnError) {
+    HeldRig r;
+    bool timeOut = false;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type != 3) return mine;
+        const auto runs = r.script->Runs();
+        if (runs.size() == 7) return ErrorFrame(runs.back().id, proto::ErrorCode::InferenceFailed);  // the second replayed window
+        if (timeOut) return std::vector<std::uint8_t>{};
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    const int connects = r.c.Reconnects();
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::ServerError);
+    CHECK(ReasonOf(fb) == Reason::ServerError);
+    CHECK(fb.text.find("ERROR 4") != std::string::npos);
+    CHECK(fb.text.find("replaying its line after ERROR 8") != std::string::npos);
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});  // nothing more sent after the ERROR
+    CHECK(!r.c.Paused());
+    CHECK_EQ(r.c.Reconnects(), connects);
+    // the next line's start times out: the first timeout in a row, so no pause
+    timeOut = true;
+    CHECK(r.RunWindow(5, 0, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK(!r.c.Paused());
+}
+
+// The deadline is checked between a replay's runs, not only while one is awaited: a replayed window answered in full
+// but after the run's time has run out (the server took 320 ms of the run's 300) ends the replay there, answered as a
+// timeout, with nothing more sent; nothing failed on the connection, so it doesn't count toward the pause after two
+// timeouts in a row.
+TEST(ClientReplayDeadlineBetweenItsRuns) {
+    HeldRig r;
+    bool timeOut = false;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type != 3) return mine;
+        if (r.script->Runs().size() == 7) std::this_thread::sleep_for(std::chrono::milliseconds(320));  // the second replayed window
+        if (timeOut) return std::vector<std::uint8_t>{};
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK_EQ(fb.text, std::string("the server no longer held its line's state, and its line's replay couldn't finish within the run's "
+                                  "time (2 of 5 runs answered)"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});
+    CHECK(!r.c.Paused());
+    timeOut = true;
+    CHECK(r.RunWindow(5, 0, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK(!r.c.Paused());
+}
+
+// The 4 MiB cap on a line's kept windows (kLineBytes), reached before the 64 windows' (kLineWindows): windows of a
+// little over 1 MiB each are kept three at a time, and the fourth stops the line being kept; its lost state then can't
+// be replayed, and the run is answered as a timeout.
+TEST(ClientLineBytesCap) {
+    HeldRig r;
+    constexpr std::size_t kMel = 1024 * 1024 / 4;  // 1 MiB of floats a window
+    std::vector<float> big(kMel);
+    const auto run = [&](int w, Client::Reply& reply, Fallback& fb) {
+        Window win(w, Frames(w));
+        std::fill(big.begin(), big.end(), static_cast<float>(w));
+        auto req = win.Request(r.m);
+        req.inputs[0] = {"mel", 1, {1, 2, static_cast<std::int64_t>(kMel / 2)}, big.data(), big.size() * 4};
+        return r.c.Run(r.m, req, reply, fb);
+    };
+    const std::size_t window = kMel * 4 + 8 + 16 + 8;  // mel, identity, emotion and past_frames
+    Client::Reply reply;
+    Fallback fb;
+    for (int w = 0; w < 3; ++w) CHECK(run(w, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.c.LineBytes(r.m.name), 3 * window);
+    CHECK(run(3, reply, fb) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.c.LineBytes(r.m.name), std::size_t{0});  // over 4 MiB: nothing kept
+    r.server->lose = true;
+    CHECK(run(4, reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK_EQ(fb.text, std::string("the server no longer held its line's state, and its line is longer than the bridge keeps for a replay"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{5});
+    CHECK(!r.c.Paused());
+}
+
+// A replayed window's RUN_OK must answer that window's own request: one with another request id ends the replay as a
+// malformed answer (the connection closed, and a pause), never taken as the replay going on.
+TEST(ClientReplayedAnswerToAnotherRequest) {
+    HeldRig r;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3 && r.script->Runs().size() == 7) return RunOkWithId(RunId(p) + 1000);  // the second replayed window
+        return mine;
+    };
+    for (int w = 0; w < 4; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    r.server->lose = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(4, Frames(4), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::Other);
+    CHECK_EQ(fb.text, std::string("the server's answer to a replayed RUN is malformed or answers another request"));
+    CHECK_EQ(r.script->Runs().size(), std::size_t{7});
+    CHECK(r.c.Paused());
+}
+
+// A late answer to a held run (the existing in-order discard) desynchronises nothing: BFA ends the line at the timeout's
+// NaN answer, its next run is a start, and the late RUN_OK is read and discarded before that start's own answer.
+TEST(ClientHeldLateAnswerIsDiscarded) {
+    HeldRig r;
+    for (int w = 0; w < 2; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    std::vector<std::uint8_t> late;
+    bool first = true;
+    r.script->answer = [&, s = r.server](std::uint16_t type, const std::vector<std::uint8_t>& p) {
+        auto mine = (*s)(type, p);
+        if (type == 3 && first) {
+            first = false;
+            late = mine;
+            return std::vector<std::uint8_t>{};
+        }
+        auto back = std::move(late);
+        late.clear();
+        back.insert(back.end(), mine.begin(), mine.end());
+        return back;
+    };
+    Fallback fb;
+    Client::Reply reply;
+    CHECK(r.RunWindow(2, Frames(2), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.why == Why::RunTimedOut);
+    CHECK(r.RunWindow(3, Frames(3)) == Client::Outcome::Failed);  // not BFA's way: a continue of the ended line goes nowhere
+    CHECK(r.RunWindow(10, 0, reply, fb) == Client::Outcome::Forwarded);
+    CHECK(r.Logged("Discarded the late answer to request") > 0);
+    CHECK(r.RunWindow(11, 2) == Client::Outcome::Forwarded);
+    CHECK_EQ(r.server->gone, 0);
+    CHECK_EQ(r.script->refused.load(), 0);
+}
+
+// A held line meets a connection that holds no state (the server restarted with Keep line state off: held 0): BFA's own
+// next_X are placeholders, so the run can't be carried, and gets the NaN answer; the next line goes carried.
+TEST(ClientHeldLineOnAConnectionThatHoldsNothing) {
+    HeldRig r;
+    for (int w = 0; w < 2; ++w) CHECK(r.RunWindow(w, Frames(w)) == Client::Outcome::Forwarded);
+    {
+        std::lock_guard lock(r.script->mutex);
+        r.script->held.clear();
+    }
+    r.script->closeBeforeAnswer = true;
+    Client::Reply reply;
+    Fallback fb;
+    CHECK(r.RunWindow(2, Frames(2), reply, fb) == Client::Outcome::Failed);
+    CHECK(fb.text.find("its line's state was held on the server, and this connection doesn't hold it (held 0)") != std::string::npos);
+    CHECK(r.RunWindow(3, 0) == Client::Outcome::Forwarded);
+    CHECK_EQ(int(LastRun(*r.script).mode), 0);
+    CHECK(r.RunWindow(4, 2) == Client::Outcome::Forwarded);
+    CHECK_EQ(int(LastRun(*r.script).mode), 0);
+    CHECK_EQ(r.script->refused.load(), 0);
+}
+
+// PING, NOTICE and the status check on a version 3 connection: each in version 3, with version 2's payloads.
+TEST(ClientPingNoticeAndStatusOnVersionThree) {
+    HeldRig r;
+    CHECK(r.RunWindow(0, 0) == Client::Outcome::Forwarded);
+    r.c.Tick();  // the start-up status check
+    r.c.ReportFallback(Reason::TimedOut, r.m.name, "no answer within 300 ms");
+    r.c.Tick();
+    CHECK_EQ(r.script->Notices().size(), std::size_t{1});
+    g_now += kIdlePing;
+    r.c.Tick();
+    CHECK_EQ(r.c.Pings(), 1);
+    CHECK_EQ(r.c.FallbackReports(), 0);
+    const auto cs = r.script->Connections();
+    CHECK(VersionsOf(cs[1]) == (std::vector<std::uint16_t>{3, 3, 3, 3}));  // HELLO, RUN, NOTICE, PING
+    CHECK(r.script->ByConnection()[1] == (std::vector<std::uint16_t>{1, 3, 10, 6}));
+    CHECK(VersionsOf(cs[2]) == (std::vector<std::uint16_t>{3}));
+    CHECK(!r.c.Paused());
 }
