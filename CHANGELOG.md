@@ -66,6 +66,8 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
 - **BFA's mode** counts a version 3 answer as a version 2 one (`BfaCpuMode::OnServerVersion`): a version 3 server
   speaks version 2 too. It keeps version 2's sizes rule, which BFA 4.3.2.3's CPU mode relies on: PandorumLLM's side
   confirmed it on 2026-11-17 against v3.98 Beta patch27 (PROTOCOL, "Version 2").
+  Its log lines now say the server answered in protocol version 2 or 3 (setting BFA's mode), and that the bridge sets it
+  only for a server that speaks version 2 or 3 (putting values back for a version 1 server).
 - **The reference server** (`tools/reference_server.py`) speaks version 3 as agreed: held state per connection and
   stream, its count min(p + F, W) from the model's own shapes, error 8 in its three cases, the four refusals as ERROR
   1, at most 8 held streams freeing the one used least recently, and the states freed by a start, by a HELLO that no

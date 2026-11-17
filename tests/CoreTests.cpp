@@ -960,7 +960,7 @@ TEST(BfaModeRestoredOnVersionOne) {
     CHECK_EQ(r.ini->forceCpu, 0);
     CHECK(r.ini->SetByBridge());
     CHECK_EQ(r.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
-                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from "
+                      "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2 or 3. It applies from "
                       "the next game start."),
              1);
     r.mode.OnGameSave();
@@ -1419,7 +1419,7 @@ TEST(Bfa5ModePutBackOnVersionOne) {
     CHECK_EQ(held.Logged("Put BFA's [General] ForceCPU back to 0 in BetterFacialAnimations.ini, as it was: the server speaks protocol version 1"),
              1);
     CHECK_EQ(held.Logged("Put BFA's [General] EmotionDevice back to 1 in BetterFacialAnimations.ini, as it was: the server speaks protocol "
-                         "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2. It applies from the "
+                         "version 1 only, and the bridge sets BFA's CPU mode only for a server that speaks version 2 or 3. It applies from the "
                          "next game start."),
              1);
     const int writes = held.ini->iniWrites;
@@ -1468,7 +1468,7 @@ TEST(Bfa5ModeFailuresKeepWhatTheyCant) {
     CHECK_EQ(big.ini->Own("EmotionDevice"), std::string("1000"));
     CHECK_EQ(big.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
     CHECK_EQ(big.Logged("BFA's EmotionDevice is left as it is: the bridge couldn't record that it sets it (card 1000 is out of range)"), 1);
-    CHECK_EQ(big.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) in BetterFacialAnimations.ini: the server speaks protocol version 2, "
+    CHECK_EQ(big.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) in BetterFacialAnimations.ini: the server answered in protocol version 2 or 3, "
                         "so BFA runs Audio2Face in its CPU mode from the next game start. The model"),
              1);
     // EmotionDevice=-1 can't be written: the line names ForceCPU and Audio2Face alone
@@ -1575,7 +1575,7 @@ TEST(BfaModeFor4323IgnoresBfa5sKeys) {
     CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("(none)"));
     CHECK_EQ(r.ini->iniWrites, 1);
     CHECK_EQ(r.ini->recordWrites, 1);
-    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0): the server speaks protocol version 2, "
+    CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 in BetterFacialAnimations.ini (it was 0): the server answered in protocol version 2 or 3, "
                       "so BFA uses its CPU mode from the next game start"),
              1);
     r.mode.OnServerVersion(1);
@@ -1708,7 +1708,7 @@ TEST(Bfa700ModeSetsBothKeysAndPutsThemBack) {
     CHECK_EQ(r.ini->Record(kForceCpuRecord), std::string("added"));
     CHECK_EQ(r.ini->Record(kEmotionDeviceRecord), std::string("added"));
     CHECK_EQ(r.Logged("Set BFA's [General] ForceCPU to 1 (it was 0) and EmotionDevice to -1 (it was 0) in BetterFacialAnimations.ini: the "
-                      "server speaks protocol version 2, so BFA runs Audio2Face and Audio2Emotion in its CPU mode from the next game "
+                      "server answered in protocol version 2 or 3, so BFA runs Audio2Face and Audio2Emotion in its CPU mode from the next game "
                       "start. The model still runs on the server."),
              1);
     CHECK_EQ(r.Logged("graphics device"), 0);
