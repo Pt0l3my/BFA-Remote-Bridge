@@ -4,11 +4,13 @@
 
 Protocol version 3: a line's state kept on the server, as agreed between the bridge's side and PandorumLLM's: the owner
 sent the agreement's text, and the bridge confirmed it on 2026-11-16 ([docs/AGREEMENT-1.7.md](docs/AGREEMENT-1.7.md),
-written into [docs/PROTOCOL.md](docs/PROTOCOL.md), "Version 3"). PandorumLLM's side is in v3.98 Beta patch27, not public
-until the owner has tried the two together in game; versions 1 and 2 are unchanged, and older servers are served as by
-1.6.0.
+written into [docs/PROTOCOL.md](docs/PROTOCOL.md), "Version 3"). PandorumLLM's side is in v3.98 Beta patch27; versions 1
+and 2 are unchanged, and older servers are served as by 1.6.0.
 BFA 7.0.0.1's facts behind it were read from its DLL's code (disassembled as data, for facts only) and checked with
-runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
+runs of its `performance.onnx` on ONNX Runtime 1.24.4. Tried in game on 2026-11-16 and 17 with patch27 and BFA 7.0.0.1
+(PandorumLLM's report from its server's log): version 3 on every connection, `performance.onnx` held (90 starts, no
+error 8), 2,454 runs with no fallback, timeout or malformed run, and the bridge's counts equal to the server's. A replay
+after error 8 hasn't been seen in game yet.
 
 - **Version 3 on the wire** (`src/core/Protocol.h`). HELLO_OK's rows gain `u8 held` after the detail, and RUN gains
   `u64 stream` and `u8 mode` after the request id; every other message keeps its version 2 payload, and only the
