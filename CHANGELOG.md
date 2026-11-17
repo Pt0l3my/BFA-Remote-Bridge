@@ -64,8 +64,8 @@ runs of its `performance.onnx` on ONNX Runtime 1.24.4. Not yet tried in game.
   is 69,758 bytes of frames and payloads both ways (43,407 up, 26,351 back), a carried run 15,012,198 (7,514,635 up,
   7,497,563 back); every motion the same as a local run's, byte for byte, a lost state replayed included.
 - **BFA's mode** counts a version 3 answer as a version 2 one (`BfaCpuMode::OnServerVersion`): a version 3 server
-  speaks version 2 too. That it keeps version 2's sizes rule, which BFA 4.3.2.3's CPU mode relies on, is the bridge's
-  assumption (the agreement doesn't say), stated as such in PROTOCOL; PandorumLLM's side is asked to confirm.
+  speaks version 2 too. It keeps version 2's sizes rule, which BFA 4.3.2.3's CPU mode relies on: PandorumLLM's side
+  confirmed it on 2026-11-17 against v3.98 Beta patch27 (PROTOCOL, "Version 2").
 - **The reference server** (`tools/reference_server.py`) speaks version 3 as agreed: held state per connection and
   stream, its count min(p + F, W) from the model's own shapes, error 8 in its three cases, the four refusals as ERROR
   1, at most 8 held streams freeing the one used least recently, and the states freed by a start, by a HELLO that no

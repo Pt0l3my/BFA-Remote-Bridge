@@ -197,8 +197,8 @@ void BfaCpuMode::OnStart() {
 void BfaCpuMode::OnServerVersion(std::uint16_t version) {
     std::lock_guard lock(mutex_);
     if (!store_ || version < 1 || version > 3) return;
-    // a version 3 server speaks version 2 too: the same as a version 2 answer (that it keeps version 2's sizes rule is the
-    // bridge's assumption, docs/PROTOCOL.md, "Version 2")
+    // a version 3 server speaks version 2 too: the same as a version 2 answer (it keeps version 2's sizes rule, as
+    // PandorumLLM's side confirmed: docs/PROTOCOL.md, "Version 2")
     answered_ = version >= 2 ? 2 : 1;
     if (answered_ == 2)
         SetLocked();

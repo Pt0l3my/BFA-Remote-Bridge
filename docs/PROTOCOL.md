@@ -266,9 +266,11 @@ override, and PandorumLLM's server accepts them (tested in game with BFA 5.0.6).
 reaches BFA 7.0.0's `a2f3_fp16.onnx` and `emotion_fp16.onnx` too: they are 4.3.2.3's files, byte for byte (PandorumLLM's
 hashes of the owner's 7.0.0.1 copies against its record of 4.3.2.3's set). Bridges 1.6.0 and later list their own sizes
 for BFA 7.0.0 (section 3), so the rule, which applies only to a HELLO that lists none, isn't used with them; it would be
-with bridge 1.5.0 and BFA 7.0.0. **In version 3** the bridge assumes the same: a version 3 server keeps version 2's
-sizes rule, which BFA 4.3.2.3's CPU mode relies on. The agreement doesn't say so (it changes only HELLO_OK's rows and
-RUN), so this is the bridge's assumption, not a fact of the agreement: PandorumLLM's side is asked to confirm.
+with bridge 1.5.0 and BFA 7.0.0. **In version 3** the rule is unchanged: a version 3 server keeps version 2's sizes
+rule, which BFA 4.3.2.3's CPU mode relies on. PandorumLLM's side confirmed it on 2026-11-17: its server reads and serves
+a HELLO with the same code in versions 1, 2 and 3 (only HELLO_OK's rows gain the held byte), checked against v3.98 Beta
+patch27 with 4.3.2.3's two files, a HELLO listing no sizes answered ready with "built with BFA 4.3.2.3's sizes" in each
+version; its patch28 adds a version 3 check to the panel's gate.
 
 **The version rule.** Each side answers in the version the other opened with.
 

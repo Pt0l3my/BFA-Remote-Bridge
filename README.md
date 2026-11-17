@@ -294,8 +294,8 @@ The hardware the model runs on is chosen in PandorumLLM, never in Skyrim: you se
   version and a server answers.
 - In its CPU mode BFA sets none of the fixed input sizes its GPU mode gives the runtime. For BFA 4.3.2.3 a version 2
   server fills in its own for V3 (`a2f3_fp16.onnx`) and the emotion model (`emotion_fp16.onnx`), part of protocol
-  version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5); the bridge
-  takes it that a server that speaks version 3 does the same, which PandorumLLM's side is asked to confirm. For BFA
+  version 2, agreed with PandorumLLM's side ([docs/AGREEMENT-1.2.md](docs/AGREEMENT-1.2.md), measurement 5); a server
+  that speaks version 3 does the same, as PandorumLLM's side confirmed on 17 November 2026. For BFA
   5.0.6 the bridge sends its GPU mode's sizes itself, for every 5.0.6 build alike, by the model's file name. The
   protocol is unchanged, so PandorumLLM's server needs nothing new for it. That includes a size for a dimension the
   model lacks (the emotion models get such sizes, as BFA's own GPU mode sets them): PandorumLLM's server accepts them,

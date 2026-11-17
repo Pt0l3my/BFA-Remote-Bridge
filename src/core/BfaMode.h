@@ -3,9 +3,9 @@
 // 1.6.0, and to version 3 servers in 1.7.0): with a server that answered in protocol version 2 or 3 this session, BFA
 // 4.3.2.3, 5.0.6 and 7.0.0 run in their CPU modes from the next game start (BFA 4.3.2.3 opening nothing on this PC's
 // graphics card, BFA 5.0.6 creating no graphics device there; BFA 7.0.0 is set the same way as 5.0.6); the model runs on
-// the server either way. A version 2 server fills in BFA 4.3.2.3's sizes (the sizes rule, docs/PROTOCOL.md), and the
-// bridge assumes a version 3 server keeps that rule (the agreement doesn't say; PandorumLLM's side is asked to
-// confirm); for BFA 5.0.6 and 7.0.0 the bridge lists them itself (core/BfaSizes.h). A version 1 server (every
+// the server either way. A version 2 or 3 server fills in BFA 4.3.2.3's sizes (the sizes rule, docs/PROTOCOL.md; that
+// version 3 keeps it, PandorumLLM's side confirmed on 2026-11-17); for BFA 5.0.6 and 7.0.0 the bridge lists them itself
+// (core/BfaSizes.h). A version 1 server (every
 // PandorumLLM release before the one that speaks version 2, patch7 included) gets BFA's own values back: the bridge
 // tells a server's version by its frames alone, and sets BFA's CPU mode only for a version 2 or 3 server.
 //
